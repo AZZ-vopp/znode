@@ -1,6 +1,7 @@
 package cmd
 
 import (
+	"context"
 	"fmt"
 	"net/http"
 	_ "net/http/pprof"
@@ -8,13 +9,15 @@ import (
 	"os/signal"
 	"runtime"
 	"syscall"
+	"time"
 
 	log "github.com/sirupsen/logrus"
 	"github.com/spf13/cobra"
-	"github.com/wyx2685/v2node/conf"
-	"github.com/wyx2685/v2node/core"
-	"github.com/wyx2685/v2node/limiter"
-	"github.com/wyx2685/v2node/node"
+	"github.com/wyx2685/znode/agent"
+	"github.com/wyx2685/znode/conf"
+	"github.com/wyx2685/znode/core"
+	"github.com/wyx2685/znode/limiter"
+	"github.com/wyx2685/znode/node"
 )
 
 var (
@@ -24,7 +27,7 @@ var (
 
 var serverCommand = cobra.Command{
 	Use:   "server",
-	Short: "Run v2node server",
+	Short: "Run znode server",
 	Run:   serverHandle,
 	Args:  cobra.NoArgs,
 }
@@ -32,7 +35,7 @@ var serverCommand = cobra.Command{
 func init() {
 	serverCommand.PersistentFlags().
 		StringVarP(&config, "config", "c",
-			"/etc/v2node/config.json", "config file path")
+			"/etc/znode/config.json", "config file path")
 	serverCommand.PersistentFlags().
 		BoolVarP(&watch, "watch", "w",
 			true, "watch file path change")
@@ -41,124 +44,215 @@ func init() {
 
 func serverHandle(_ *cobra.Command, _ []string) {
 	showVersion()
-	c := conf.New()
-	err := c.LoadFromPath(config)
 	log.SetFormatter(&log.TextFormatter{
 		DisableTimestamp: true,
 		DisableQuote:     true,
 		PadLevelText:     false,
 	})
+
+	prepared, err := prepareRuntime(config)
 	if err != nil {
-		log.WithField("err", err).Error("Load config file failed")
+		log.WithField("err", err).Error("Prepare node runtime failed")
 		return
 	}
-	switch c.LogConfig.Level {
-	case "debug":
-		log.SetLevel(log.DebugLevel)
-	case "info":
-		log.SetLevel(log.InfoLevel)
-	case "warn", "warning":
-		log.SetLevel(log.WarnLevel)
-	case "error":
-		log.SetLevel(log.ErrorLevel)
-	}
-	if c.LogConfig.Output != "" {
-		f, err := os.OpenFile(c.LogConfig.Output, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
-		if err != nil {
-			log.WithField("err", err).Error("Open log file failed, using stdout instead")
-		}
-		log.SetOutput(f)
-	}
-	// Enable pprof if configured
-	if c.PprofPort != 0 {
+	applyLogConfig(prepared.config)
+
+	if prepared.config.PprofPort != 0 {
+		port := prepared.config.PprofPort
 		go func() {
-			log.Infof("Starting pprof server on :%d", c.PprofPort)
-			if err := http.ListenAndServe(fmt.Sprintf("127.0.0.1:%d", c.PprofPort), nil); err != nil {
+			log.Infof("Starting pprof server on :%d", port)
+			if err := http.ListenAndServe(fmt.Sprintf("127.0.0.1:%d", port), nil); err != nil {
 				log.WithField("err", err).Error("pprof server failed")
 			}
 		}()
 	}
-	//init limiter
+
 	limiter.Init()
-	//get node info
-	nodes, err := node.New(c.NodeConfigs)
+	reloadCh := make(chan struct{}, 1)
+	running, err := startPreparedRuntime(prepared, reloadCh)
 	if err != nil {
-		log.WithField("err", err).Error("Get node info failed")
+		log.WithField("err", err).Error("Start runtime failed")
 		return
 	}
-	log.Info("Got nodes info from server")
-	//core
-	var reloadCh = make(chan struct{}, 1)
-	v2core := core.New(c)
-	v2core.ReloadCh = reloadCh
-	err = v2core.Start(nodes.NodeInfos)
-	if err != nil {
-		log.WithField("err", err).Error("Start core failed")
+	defer func() { running.Close() }()
+	logRevokedAssignment(running.assignment)
+	log.WithField("nodes", len(running.config.NodeConfigs)).Info("Nodes started")
+
+	agentMonitor := agent.NewMonitor(reloadCh)
+	if err := agentMonitor.MarkApplied(running.config.AgentConfig, running.assignment); err != nil {
+		log.WithField("err", err).Error("Start agent manifest monitor failed")
 		return
 	}
-	defer v2core.Close()
-	//node
-	err = nodes.Start(c.NodeConfigs, v2core)
-	if err != nil {
-		log.WithField("err", err).Error("Run nodes failed")
-		return
-	}
-	log.Info("Nodes started")
+	agentMonitor.Start()
+	defer agentMonitor.Close()
+
 	if watch {
-		// On file change, just signal reload; do not run reload concurrently here
-		err = c.Watch(config, func() {
+		// Do not let the watcher mutate the config used by the live core. The
+		// reload path loads and validates a fresh snapshot first.
+		watchConfig := conf.New()
+		if err := watchConfig.Watch(config, func() {
 			select {
 			case reloadCh <- struct{}{}:
-			default: // drop if a reload is already queued
+			default:
 			}
-		})
-		if err != nil {
-			log.WithField("err", err).Error("start watch failed")
+		}); err != nil {
+			log.WithField("err", err).Error("Start config watcher failed")
 			return
 		}
 	}
-	// clear memory
-	runtime.GC()
 
+	runtime.GC()
 	osSignals := make(chan os.Signal, 1)
 	signal.Notify(osSignals, syscall.SIGINT, syscall.SIGTERM)
+	defer signal.Stop(osSignals)
 
 	for {
 		select {
 		case <-osSignals:
-			log.Info("收到退出信号，正在关闭程序...")
-			os.Exit(0)
+			log.Info("Shutdown signal received")
+			return
 		case <-reloadCh:
-			log.Info("收到重启信号，正在重新加载配置...")
-			if err := reload(config, &nodes, &v2core); err != nil {
-				log.WithField("err", err).Panic("重启失败")
+			log.Info("Reload signal received; reconciling assigned nodes")
+			newRuntime, err := reloadRuntime(config, running, reloadCh)
+			if err != nil {
+				log.WithField("err", err).Error("Reload failed; keeping current runtime when possible")
+				continue
 			}
-			log.Info("重启成功")
+			running = newRuntime
+			logRevokedAssignment(running.assignment)
+			if err := agentMonitor.MarkApplied(running.config.AgentConfig, running.assignment); err != nil {
+				log.WithField("err", err).Warn("Update agent manifest monitor failed")
+			}
+			log.WithField("nodes", len(running.config.NodeConfigs)).Info("Reload successful")
 		}
 	}
 }
 
-func reload(config string, nodes **node.Node, v2core **core.V2Core) error {
-	// Preserve old reload channel so new core continues to receive signals
-	var oldReloadCh chan struct{}
-	if *v2core != nil {
-		oldReloadCh = (*v2core).ReloadCh
+func logRevokedAssignment(assignment agent.Assignment) {
+	if assignment.AuthorizationRevoked {
+		log.Warn("Agent authorization was revoked; all assigned logical nodes are stopped until valid credentials are installed")
 	}
+}
 
-	if err := (*nodes).Close(); err != nil {
-		return err
-	}
+type preparedRuntime struct {
+	config     *conf.Conf
+	nodes      *node.Node
+	assignment agent.Assignment
+}
 
-	if err := (*v2core).Close(); err != nil {
-		return err
-	}
+type runningRuntime struct {
+	*preparedRuntime
+	core *core.V2Core
+}
 
+func prepareRuntime(configPath string) (*preparedRuntime, error) {
 	newConf := conf.New()
-	if err := newConf.LoadFromPath(config); err != nil {
-		return err
+	if err := newConf.LoadFromPath(configPath); err != nil {
+		return nil, err
 	}
 
-	switch newConf.LogConfig.Level {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	defer cancel()
+	assignment, err := agent.Resolve(ctx, newConf)
+	if err != nil {
+		return nil, fmt.Errorf("resolve agent assignment: %w", err)
+	}
+	newNodes, err := node.NewContext(ctx, newConf.NodeConfigs)
+	if err != nil {
+		return nil, err
+	}
+	if err := newNodes.Prepare(ctx, newConf.NodeConfigs); err != nil {
+		return nil, err
+	}
+	return &preparedRuntime{config: newConf, nodes: newNodes, assignment: assignment}, nil
+}
+
+func startPreparedRuntime(prepared *preparedRuntime, reloadCh chan struct{}) (*runningRuntime, error) {
+	newCore := core.New(prepared.config)
+	newCore.ReloadCh = reloadCh
+	if err := newCore.Start(prepared.nodes.NodeInfos); err != nil {
+		return nil, err
+	}
+	if err := prepared.nodes.Start(prepared.config.NodeConfigs, newCore); err != nil {
+		_ = prepared.nodes.Close()
+		_ = newCore.Close()
+		return nil, err
+	}
+	return &runningRuntime{preparedRuntime: prepared, core: newCore}, nil
+}
+
+func reloadRuntime(configPath string, old *runningRuntime, reloadCh chan struct{}) (*runningRuntime, error) {
+	// Manifest fetch, NodeInfo fetch and duplicate-port validation all happen
+	// before the healthy old runtime is stopped.
+	prepared, err := prepareRuntime(configPath)
+	if err != nil {
+		return nil, err
+	}
+
+	// The base core has no inbounds yet, so this is also safe to preflight while
+	// old ports are still listening.
+	newCore := core.New(prepared.config)
+	newCore.ReloadCh = reloadCh
+	if err := newCore.Start(prepared.nodes.NodeInfos); err != nil {
+		return nil, err
+	}
+
+	if err := old.nodes.Close(); err != nil {
+		_ = newCore.Close()
+		return nil, fmt.Errorf("close old nodes: %w", err)
+	}
+	if err := old.core.Close(); err != nil {
+		_ = newCore.Close()
+		if restoreErr := restorePreviousRuntime(old, reloadCh); restoreErr != nil {
+			return nil, fmt.Errorf("close old core: %w; restore previous runtime: %v", err, restoreErr)
+		}
+		return nil, fmt.Errorf("close old core: %w; previous runtime restored", err)
+	}
+	if err := prepared.nodes.Start(prepared.config.NodeConfigs, newCore); err != nil {
+		_ = prepared.nodes.Close()
+		_ = newCore.Close()
+		if restoreErr := restorePreviousRuntime(old, reloadCh); restoreErr != nil {
+			return nil, fmt.Errorf("start replacement nodes: %w; restore previous runtime: %v", err, restoreErr)
+		}
+		return nil, fmt.Errorf("start replacement nodes: %w; previous runtime restored", err)
+	}
+
+	applyLogConfig(prepared.config)
+	runtime.GC()
+	return &runningRuntime{preparedRuntime: prepared, core: newCore}, nil
+}
+
+// restorePreviousRuntime is the final rollback barrier for errors that can
+// only surface after the old listeners have been released (for example a
+// port being claimed by another process between preflight and replacement).
+// The caller keeps its original runningRuntime pointer, so update its core in
+// place after the previous controllers have been started again.
+func restorePreviousRuntime(old *runningRuntime, reloadCh chan struct{}) error {
+	if old == nil || old.preparedRuntime == nil {
+		return fmt.Errorf("previous runtime is unavailable")
+	}
+	restored, err := startPreparedRuntime(old.preparedRuntime, reloadCh)
+	if err != nil {
+		return err
+	}
+	old.core = restored.core
+	return nil
+}
+
+func (r *runningRuntime) Close() {
+	if r == nil {
+		return
+	}
+	if r.nodes != nil {
+		_ = r.nodes.Close()
+	}
+	if r.core != nil {
+		_ = r.core.Close()
+	}
+}
+
+func applyLogConfig(config *conf.Conf) {
+	switch config.LogConfig.Level {
 	case "debug":
 		log.SetLevel(log.DebugLevel)
 	case "info":
@@ -168,38 +262,17 @@ func reload(config string, nodes **node.Node, v2core **core.V2Core) error {
 	case "error":
 		log.SetLevel(log.ErrorLevel)
 	}
-	if newConf.LogConfig.Output != "" {
-		f, err := os.OpenFile(newConf.LogConfig.Output, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
-		if err != nil {
-			log.WithField("err", err).Error("Open log file failed, using stdout instead")
-		} else {
-			// 关闭旧的日志文件（如果是文件）
-			if oldWriter, ok := log.StandardLogger().Out.(*os.File); ok && oldWriter != os.Stdout && oldWriter != os.Stderr {
-				oldWriter.Close()
-			}
-			log.SetOutput(f)
-		}
+	if config.LogConfig.Output == "" {
+		return
 	}
-
-	newNodes, err := node.New(newConf.NodeConfigs)
+	f, err := os.OpenFile(config.LogConfig.Output, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
 	if err != nil {
-		return err
+		log.WithField("err", err).Error("Open log file failed, using current output instead")
+		return
 	}
-
-	newCore := core.New(newConf)
-	// Reattach reload channel
-	newCore.ReloadCh = oldReloadCh
-	if err := newCore.Start(newNodes.NodeInfos); err != nil {
-		return err
+	oldWriter, oldIsFile := log.StandardLogger().Out.(*os.File)
+	log.SetOutput(f)
+	if oldIsFile && oldWriter != os.Stdout && oldWriter != os.Stderr && oldWriter != f {
+		_ = oldWriter.Close()
 	}
-
-	if err := newNodes.Start(newConf.NodeConfigs, newCore); err != nil {
-		return err
-	}
-
-	*nodes = newNodes
-	*v2core = newCore
-
-	runtime.GC()
-	return nil
 }

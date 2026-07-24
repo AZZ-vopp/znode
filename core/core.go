@@ -4,10 +4,10 @@ import (
 	"sync"
 
 	log "github.com/sirupsen/logrus"
-	panel "github.com/wyx2685/v2node/api/v2board"
-	"github.com/wyx2685/v2node/conf"
-	"github.com/wyx2685/v2node/core/app/dispatcher"
-	_ "github.com/wyx2685/v2node/core/distro/all"
+	panel "github.com/wyx2685/znode/api/v2board"
+	"github.com/wyx2685/znode/conf"
+	"github.com/wyx2685/znode/core/app/dispatcher"
+	_ "github.com/wyx2685/znode/core/distro/all"
 	"github.com/xtls/xray-core/app/proxyman"
 	"github.com/xtls/xray-core/app/stats"
 	"github.com/xtls/xray-core/common/serial"
@@ -79,6 +79,7 @@ func (v *V2Core) Close() error {
 }
 
 func getCore(c *conf.Conf, infos []*panel.NodeInfo) *core.Instance {
+	dispatcher.ConfigureUDPContentSniffing(c.ConnectionConfig.DisableUDPContentSniffing)
 	// Log Config
 	coreLogConfig := &coreConf.LogConfig{
 		LogLevel:  c.LogConfig.Level,
@@ -97,11 +98,11 @@ func getCore(c *conf.Conf, infos []*panel.NodeInfo) *core.Instance {
 	levelPolicyConfig := &coreConf.Policy{
 		StatsUserUplink:   true,
 		StatsUserDownlink: true,
-		Handshake:         proto.Uint32(4),
-		ConnectionIdle:    proto.Uint32(120),
-		UplinkOnly:        proto.Uint32(2),
-		DownlinkOnly:      proto.Uint32(4),
-		BufferSize:        proto.Int32(128),
+		Handshake:         proto.Uint32(c.ConnectionConfig.Handshake),
+		ConnectionIdle:    proto.Uint32(c.ConnectionConfig.ConnIdle),
+		UplinkOnly:        proto.Uint32(c.ConnectionConfig.UplinkOnly),
+		DownlinkOnly:      proto.Uint32(c.ConnectionConfig.DownlinkOnly),
+		BufferSize:        proto.Int32(c.ConnectionConfig.BufferSize),
 	}
 	corePolicyConfig := &coreConf.PolicyConfig{}
 	corePolicyConfig.Levels = map[uint32]*coreConf.Policy{0: levelPolicyConfig}

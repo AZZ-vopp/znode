@@ -6,9 +6,9 @@ import (
 	"time"
 
 	log "github.com/sirupsen/logrus"
-	panel "github.com/wyx2685/v2node/api/v2board"
-	"github.com/wyx2685/v2node/common/task"
-	vCore "github.com/wyx2685/v2node/core"
+	panel "github.com/wyx2685/znode/api/v2board"
+	"github.com/wyx2685/znode/common/task"
+	vCore "github.com/wyx2685/znode/core"
 )
 
 func (c *Controller) startTasks(node *panel.NodeInfo) {
@@ -76,6 +76,20 @@ func (c *Controller) nodeInfoMonitor(ctx context.Context) (err error) {
 	}
 	log.WithField("tag", c.tag).Debug("Node info no change")
 
+	return c.syncUsers(ctx)
+}
+
+func (c *Controller) refreshUsersImmediately() {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	if err := c.syncUsers(ctx); err != nil && !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
+		log.WithFields(log.Fields{"tag": c.tag, "err": err}).Warn("Fast device sync failed")
+	}
+}
+
+func (c *Controller) syncUsers(ctx context.Context) (err error) {
+	c.userSyncMu.Lock()
+	defer c.userSyncMu.Unlock()
 	// get user info
 	newU, err := c.apiClient.GetUserList(ctx)
 	if err != nil {
@@ -103,10 +117,10 @@ func (c *Controller) nodeInfoMonitor(ctx context.Context) (err error) {
 
 	// update alive list
 	if newA != nil {
-		c.limiter.AliveList = newA
+		c.limiter.UpdateAliveList(newA)
 	}
 	// node no changed, check users
-	if len(newU) == 0 {
+	if newU == nil {
 		log.WithField("tag", c.tag).Debug("User list no change")
 		return nil
 	}

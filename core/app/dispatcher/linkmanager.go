@@ -22,25 +22,39 @@ func (w *ManagedWriter) Close() error {
 }
 
 type LinkManager struct {
-	links  map[*ManagedWriter]buf.Reader
-	mu     sync.RWMutex
-	closed bool
+	links   map[*ManagedWriter]buf.Reader
+	mu      sync.RWMutex
+	closed  bool
+	onEmpty func(*LinkManager)
 }
 
-func (m *LinkManager) AddLink(writer *ManagedWriter, reader buf.Reader) {
+func (m *LinkManager) AddLink(writer *ManagedWriter, reader buf.Reader) bool {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if !m.closed {
 		m.links[writer] = reader
+		return true
 	}
+	return false
 }
 
 func (m *LinkManager) RemoveWriter(writer *ManagedWriter) {
 	m.mu.Lock()
-	defer m.mu.Unlock()
-	if !m.closed {
-		delete(m.links, writer)
+	if m.closed {
+		m.mu.Unlock()
+		return
 	}
+	delete(m.links, writer)
+	if len(m.links) == 0 {
+		m.closed = true
+		onEmpty := m.onEmpty
+		m.mu.Unlock()
+		if onEmpty != nil {
+			onEmpty(m)
+		}
+		return
+	}
+	m.mu.Unlock()
 }
 
 func (m *LinkManager) CloseAll() {

@@ -2,7 +2,7 @@
 // versions:
 // 	protoc-gen-go v1.35.1
 // 	protoc        v3.21.12
-// source: core/app/dispatcher/v2node_dispatcher_config.proto
+// source: core/app/dispatcher/znode_dispatcher_config.proto
 
 package dispatcher
 
@@ -28,7 +28,7 @@ type SessionConfig struct {
 
 func (x *SessionConfig) Reset() {
 	*x = SessionConfig{}
-	mi := &file_core_app_dispatcher_v2node_dispatcher_config_proto_msgTypes[0]
+	mi := &file_core_app_dispatcher_znode_dispatcher_config_proto_msgTypes[0]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -40,7 +40,7 @@ func (x *SessionConfig) String() string {
 func (*SessionConfig) ProtoMessage() {}
 
 func (x *SessionConfig) ProtoReflect() protoreflect.Message {
-	mi := &file_core_app_dispatcher_v2node_dispatcher_config_proto_msgTypes[0]
+	mi := &file_core_app_dispatcher_znode_dispatcher_config_proto_msgTypes[0]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -53,7 +53,7 @@ func (x *SessionConfig) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use SessionConfig.ProtoReflect.Descriptor instead.
 func (*SessionConfig) Descriptor() ([]byte, []int) {
-	return file_core_app_dispatcher_v2node_dispatcher_config_proto_rawDescGZIP(), []int{0}
+	return file_core_app_dispatcher_znode_dispatcher_config_proto_rawDescGZIP(), []int{0}
 }
 
 type Config struct {
@@ -66,7 +66,7 @@ type Config struct {
 
 func (x *Config) Reset() {
 	*x = Config{}
-	mi := &file_core_app_dispatcher_v2node_dispatcher_config_proto_msgTypes[1]
+	mi := &file_core_app_dispatcher_znode_dispatcher_config_proto_msgTypes[1]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -78,7 +78,7 @@ func (x *Config) String() string {
 func (*Config) ProtoMessage() {}
 
 func (x *Config) ProtoReflect() protoreflect.Message {
-	mi := &file_core_app_dispatcher_v2node_dispatcher_config_proto_msgTypes[1]
+	mi := &file_core_app_dispatcher_znode_dispatcher_config_proto_msgTypes[1]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -91,7 +91,7 @@ func (x *Config) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use Config.ProtoReflect.Descriptor instead.
 func (*Config) Descriptor() ([]byte, []int) {
-	return file_core_app_dispatcher_v2node_dispatcher_config_proto_rawDescGZIP(), []int{1}
+	return file_core_app_dispatcher_znode_dispatcher_config_proto_rawDescGZIP(), []int{1}
 }
 
 func (x *Config) GetSettings() *SessionConfig {
@@ -101,9 +101,9 @@ func (x *Config) GetSettings() *SessionConfig {
 	return nil
 }
 
-var File_core_app_dispatcher_v2node_dispatcher_config_proto protoreflect.FileDescriptor
+var File_core_app_dispatcher_znode_dispatcher_config_proto protoreflect.FileDescriptor
 
-var file_core_app_dispatcher_v2node_dispatcher_config_proto_rawDesc = []byte{
+var file_core_app_dispatcher_znode_dispatcher_config_proto_rawDesc = []byte{
 	0x0a, 0x32, 0x63, 0x6f, 0x72, 0x65, 0x2f, 0x61, 0x70, 0x70, 0x2f, 0x64, 0x69, 0x73, 0x70, 0x61,
 	0x74, 0x63, 0x68, 0x65, 0x72, 0x2f, 0x76, 0x32, 0x6e, 0x6f, 0x64, 0x65, 0x5f, 0x64, 0x69, 0x73,
 	0x70, 0x61, 0x74, 0x63, 0x68, 0x65, 0x72, 0x5f, 0x63, 0x6f, 0x6e, 0x66, 0x69, 0x67, 0x2e, 0x70,
@@ -126,24 +126,24 @@ var file_core_app_dispatcher_v2node_dispatcher_config_proto_rawDesc = []byte{
 }
 
 var (
-	file_core_app_dispatcher_v2node_dispatcher_config_proto_rawDescOnce sync.Once
-	file_core_app_dispatcher_v2node_dispatcher_config_proto_rawDescData = file_core_app_dispatcher_v2node_dispatcher_config_proto_rawDesc
+	file_core_app_dispatcher_znode_dispatcher_config_proto_rawDescOnce sync.Once
+	file_core_app_dispatcher_znode_dispatcher_config_proto_rawDescData = file_core_app_dispatcher_znode_dispatcher_config_proto_rawDesc
 )
 
-func file_core_app_dispatcher_v2node_dispatcher_config_proto_rawDescGZIP() []byte {
-	file_core_app_dispatcher_v2node_dispatcher_config_proto_rawDescOnce.Do(func() {
-		file_core_app_dispatcher_v2node_dispatcher_config_proto_rawDescData = protoimpl.X.CompressGZIP(file_core_app_dispatcher_v2node_dispatcher_config_proto_rawDescData)
+func file_core_app_dispatcher_znode_dispatcher_config_proto_rawDescGZIP() []byte {
+	file_core_app_dispatcher_znode_dispatcher_config_proto_rawDescOnce.Do(func() {
+		file_core_app_dispatcher_znode_dispatcher_config_proto_rawDescData = protoimpl.X.CompressGZIP(file_core_app_dispatcher_znode_dispatcher_config_proto_rawDescData)
 	})
-	return file_core_app_dispatcher_v2node_dispatcher_config_proto_rawDescData
+	return file_core_app_dispatcher_znode_dispatcher_config_proto_rawDescData
 }
 
-var file_core_app_dispatcher_v2node_dispatcher_config_proto_msgTypes = make([]protoimpl.MessageInfo, 2)
-var file_core_app_dispatcher_v2node_dispatcher_config_proto_goTypes = []any{
-	(*SessionConfig)(nil), // 0: v2node.core.app.dispatcher.SessionConfig
-	(*Config)(nil),        // 1: v2node.core.app.dispatcher.Config
+var file_core_app_dispatcher_znode_dispatcher_config_proto_msgTypes = make([]protoimpl.MessageInfo, 2)
+var file_core_app_dispatcher_znode_dispatcher_config_proto_goTypes = []any{
+	(*SessionConfig)(nil), // 0: znode.core.app.dispatcher.SessionConfig
+	(*Config)(nil),        // 1: znode.core.app.dispatcher.Config
 }
-var file_core_app_dispatcher_v2node_dispatcher_config_proto_depIdxs = []int32{
-	0, // 0: v2node.core.app.dispatcher.Config.settings:type_name -> v2node.core.app.dispatcher.SessionConfig
+var file_core_app_dispatcher_znode_dispatcher_config_proto_depIdxs = []int32{
+	0, // 0: znode.core.app.dispatcher.Config.settings:type_name -> znode.core.app.dispatcher.SessionConfig
 	1, // [1:1] is the sub-list for method output_type
 	1, // [1:1] is the sub-list for method input_type
 	1, // [1:1] is the sub-list for extension type_name
@@ -151,27 +151,27 @@ var file_core_app_dispatcher_v2node_dispatcher_config_proto_depIdxs = []int32{
 	0, // [0:1] is the sub-list for field type_name
 }
 
-func init() { file_core_app_dispatcher_v2node_dispatcher_config_proto_init() }
-func file_core_app_dispatcher_v2node_dispatcher_config_proto_init() {
-	if File_core_app_dispatcher_v2node_dispatcher_config_proto != nil {
+func init() { file_core_app_dispatcher_znode_dispatcher_config_proto_init() }
+func file_core_app_dispatcher_znode_dispatcher_config_proto_init() {
+	if File_core_app_dispatcher_znode_dispatcher_config_proto != nil {
 		return
 	}
 	type x struct{}
 	out := protoimpl.TypeBuilder{
 		File: protoimpl.DescBuilder{
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
-			RawDescriptor: file_core_app_dispatcher_v2node_dispatcher_config_proto_rawDesc,
+			RawDescriptor: file_core_app_dispatcher_znode_dispatcher_config_proto_rawDesc,
 			NumEnums:      0,
 			NumMessages:   2,
 			NumExtensions: 0,
 			NumServices:   0,
 		},
-		GoTypes:           file_core_app_dispatcher_v2node_dispatcher_config_proto_goTypes,
-		DependencyIndexes: file_core_app_dispatcher_v2node_dispatcher_config_proto_depIdxs,
-		MessageInfos:      file_core_app_dispatcher_v2node_dispatcher_config_proto_msgTypes,
+		GoTypes:           file_core_app_dispatcher_znode_dispatcher_config_proto_goTypes,
+		DependencyIndexes: file_core_app_dispatcher_znode_dispatcher_config_proto_depIdxs,
+		MessageInfos:      file_core_app_dispatcher_znode_dispatcher_config_proto_msgTypes,
 	}.Build()
-	File_core_app_dispatcher_v2node_dispatcher_config_proto = out.File
-	file_core_app_dispatcher_v2node_dispatcher_config_proto_rawDesc = nil
-	file_core_app_dispatcher_v2node_dispatcher_config_proto_goTypes = nil
-	file_core_app_dispatcher_v2node_dispatcher_config_proto_depIdxs = nil
+	File_core_app_dispatcher_znode_dispatcher_config_proto = out.File
+	file_core_app_dispatcher_znode_dispatcher_config_proto_rawDesc = nil
+	file_core_app_dispatcher_znode_dispatcher_config_proto_goTypes = nil
+	file_core_app_dispatcher_znode_dispatcher_config_proto_depIdxs = nil
 }

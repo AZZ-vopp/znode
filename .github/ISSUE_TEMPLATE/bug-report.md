@@ -1,25 +1,25 @@
 ---
-name: "Bug 反馈"
-about: 创建一个报告以帮助我们修复并改进v2node
+name: "Báo lỗi"
+about: Tạo báo cáo để giúp chúng tôi sửa lỗi và cải thiện znode
 title: ''
 labels: 
 assignees: ''
 ---
 
-**描述该错误**
-简单地描述一下这个bug是什么
+**Mô tả lỗi**
+Mô tả ngắn gọn lỗi bạn gặp phải.
 
 
 
-**复现**
-请自行复现，并贴出详细步骤操作过程
+**Cách tái hiện**
+Vui lòng thử tái hiện và cung cấp đầy đủ các bước thực hiện.
 
 
 
-**日志和错误**
-请使用`v2node log`查看并添加日志，没有日志的issue不会得到答复并且会被直接关闭
+**Nhật ký và thông báo lỗi**
+Hãy dùng `znode log` và đính kèm nhật ký. Báo cáo không có nhật ký có thể bị đóng vì không đủ dữ liệu xử lý.
 
 
 
-**额外的内容**
-在这里添加关于问题的任何其他内容
+**Thông tin bổ sung**
+Thêm mọi thông tin khác liên quan đến sự cố tại đây.

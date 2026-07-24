@@ -117,22 +117,22 @@ jobs:
         if: ${{ github.event_name != 'release' }}
         run: |
           echo "version=${{ github.sha }}" >> $GITHUB_ENV
-      - name: Build v2node
+      - name: Build znode
         run: |
           echo "version: $version"
           mkdir -p build_assets
-          GOEXPERIMENT=jsonv2 go build -v -o build_assets/v2node -trimpath -ldflags "-X 'github.com/wyx2685/v2node/cmd.version=$version' -s -w -buildid="
+          GOEXPERIMENT=jsonv2 go build -v -o build_assets/znode -trimpath -ldflags "-X 'github.com/wyx2685/znode/cmd.version=$version' -s -w -buildid="
 
-      - name: Build Mips softfloat v2node
+      - name: Build Mips softfloat znode
         if: matrix.goarch == 'mips' || matrix.goarch == 'mipsle'
         run: |
           echo "version: $version"
-          GOEXPERIMENT=jsonv2 GOMIPS=softfloat go build -v -o build_assets/v2node_softfloat -trimpath -ldflags "-X 'github.com/wyx2685/v2node/cmd.version=$version' -s -w -buildid="
-      - name: Rename Windows v2node
+          GOEXPERIMENT=jsonv2 GOMIPS=softfloat go build -v -o build_assets/znode_softfloat -trimpath -ldflags "-X 'github.com/wyx2685/znode/cmd.version=$version' -s -w -buildid="
+      - name: Rename Windows znode
         if: matrix.goos == 'windows'
         run: |
           cd ./build_assets || exit 1
-          mv v2node v2node.exe
+          mv znode znode.exe
       - name: Prepare to release
         run: |
           cp ${GITHUB_WORKSPACE}/README.md ./build_assets/README.md
@@ -150,9 +150,9 @@ jobs:
         run: |
           pushd build_assets || exit 1
           touch -mt $(date +%Y01010000) *
-          zip -9vr ../v2node-$ASSET_NAME.zip .
+          zip -9vr ../znode-$ASSET_NAME.zip .
           popd || exit 1
-          FILE=./v2node-$ASSET_NAME.zip
+          FILE=./znode-$ASSET_NAME.zip
           DGST=$FILE.dgst
           for METHOD in {"md5","sha1","sha256","sha512"}
           do
@@ -160,18 +160,18 @@ jobs:
           done
       - name: Change the name
         run: |
-          mv build_assets v2node-$ASSET_NAME
+          mv build_assets znode-$ASSET_NAME
       - name: Upload files to Artifacts
         uses: actions/upload-artifact@v6
         with:
-          name: v2node-${{ steps.get_filename.outputs.ASSET_NAME }}
+          name: znode-${{ steps.get_filename.outputs.ASSET_NAME }}
           path: |
-            ./v2node-${{ steps.get_filename.outputs.ASSET_NAME }}/*
+            ./znode-${{ steps.get_filename.outputs.ASSET_NAME }}/*
       - name: Upload binaries to release
         uses: svenstaro/upload-release-action@v2
         if: github.event_name == 'release'
         with:
           repo_token: ${{ secrets.GITHUB_TOKEN }}
-          file: ./v2node-${{ steps.get_filename.outputs.ASSET_NAME }}.zip*
+          file: ./znode-${{ steps.get_filename.outputs.ASSET_NAME }}.zip*
           tag: ${{ github.ref }}
           file_glob: true

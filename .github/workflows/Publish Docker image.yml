@@ -10,7 +10,7 @@ on:
 
 env:
   REGISTRY: ghcr.io
-  IMAGE_NAME: ${{ github.repository_owner }}/v2node
+  IMAGE_NAME: ${{ github.repository_owner }}/znode
 
 jobs:
   build:

@@ -3,12 +3,19 @@ package node
 import (
 	"context"
 	"errors"
+	"time"
 
 	log "github.com/sirupsen/logrus"
-	panel "github.com/wyx2685/v2node/api/v2board"
+	panel "github.com/wyx2685/znode/api/v2board"
 )
 
 func (c *Controller) reportUserTrafficTask(ctx context.Context) (err error) {
+	if statusErr := c.reportNodeStatus(ctx); statusErr != nil {
+		if errors.Is(statusErr, context.Canceled) || errors.Is(statusErr, context.DeadlineExceeded) {
+			return statusErr
+		}
+	}
+
 	var reportmin = 0
 	var devicemin = 0
 	if c.info.Common.BaseConfig != nil {
@@ -74,6 +81,24 @@ func (c *Controller) reportUserTrafficTask(ctx context.Context) (err error) {
 	return nil
 }
 
+func (c *Controller) reportNodeStatus(ctx context.Context) error {
+	if c.metrics == nil {
+		return nil
+	}
+	status := c.metrics.Collect(c.info)
+	if err := c.apiClient.ReportNodeStatus(ctx, status); err != nil {
+		log.WithFields(log.Fields{"tag": c.tag, "err": err}).Info("Report node metrics failed")
+		return err
+	}
+	return nil
+}
+
+func (c *Controller) reportNodeStatusImmediately() {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	_ = c.reportNodeStatus(ctx)
+}
+
 func compareUserList(old, new []panel.UserInfo) (deleted, added, modified []panel.UserInfo) {
 	oldMap := make(map[string]panel.UserInfo, len(old))
 	for _, u := range old {
@@ -84,7 +109,13 @@ func compareUserList(old, new []panel.UserInfo) (deleted, added, modified []pane
 		if o, ok := oldMap[u.Uuid]; !ok {
 			added = append(added, u)
 		} else {
-			if o.SpeedLimit != u.SpeedLimit || o.DeviceLimit != u.DeviceLimit {
+			// A changed reporting ID must also refresh the core UUID -> ID map.
+			// Treat it as remove/add because limiter-only modification does not
+			// touch the core traffic ownership map.
+			if o.Id != u.Id {
+				deleted = append(deleted, o)
+				added = append(added, u)
+			} else if o.SpeedLimit != u.SpeedLimit || o.DeviceLimit != u.DeviceLimit {
 				modified = append(modified, u)
 			}
 			delete(oldMap, u.Uuid)

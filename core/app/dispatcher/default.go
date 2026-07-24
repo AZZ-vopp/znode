@@ -6,11 +6,12 @@ import (
 	"context"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
-	"github.com/wyx2685/v2node/common/counter"
-	"github.com/wyx2685/v2node/common/rate"
-	"github.com/wyx2685/v2node/limiter"
+	"github.com/wyx2685/znode/common/counter"
+	"github.com/wyx2685/znode/common/rate"
+	"github.com/wyx2685/znode/limiter"
 
 	"github.com/xtls/xray-core/app/dispatcher"
 	"github.com/xtls/xray-core/common"
@@ -100,13 +101,20 @@ func (r *cachedReader) Interrupt() {
 
 // DefaultDispatcher is a default implementation of Dispatcher.
 type DefaultDispatcher struct {
-	ohm          outbound.Manager
-	router       routing.Router
-	policy       policy.Manager
-	stats        stats.Manager
-	fdns         dns.FakeDNSEngine
-	Counter      sync.Map
-	LinkManagers sync.Map // map[string]*LinkManager
+	ohm                       outbound.Manager
+	router                    routing.Router
+	policy                    policy.Manager
+	stats                     stats.Manager
+	fdns                      dns.FakeDNSEngine
+	Counter                   sync.Map
+	LinkManagers              sync.Map // map[string]*LinkManager
+	disableUDPContentSniffing bool
+}
+
+var runtimeDisableUDPContentSniffing atomic.Bool
+
+func ConfigureUDPContentSniffing(disabled bool) {
+	runtimeDisableUDPContentSniffing.Store(disabled)
 }
 
 func init() {
@@ -130,7 +138,26 @@ func (d *DefaultDispatcher) Init(config *Config, om outbound.Manager, router rou
 	d.router = router
 	d.policy = pm
 	d.stats = sm
+	d.disableUDPContentSniffing = runtimeDisableUDPContentSniffing.Load()
 	return nil
+}
+
+func (d *DefaultDispatcher) addManagedLink(user string, writer *ManagedWriter, reader buf.Reader) {
+	for {
+		candidate := &LinkManager{
+			links: make(map[*ManagedWriter]buf.Reader),
+		}
+		candidate.onEmpty = func(empty *LinkManager) {
+			d.LinkManagers.CompareAndDelete(user, empty)
+		}
+		value, _ := d.LinkManagers.LoadOrStore(user, candidate)
+		manager := value.(*LinkManager)
+		writer.manager = manager
+		if manager.AddLink(writer, reader) {
+			return
+		}
+		d.LinkManagers.CompareAndDelete(user, manager)
+	}
 }
 
 // Type implements common.HasType.
@@ -144,7 +171,18 @@ func (*DefaultDispatcher) Start() error {
 }
 
 // Close implements common.Closable.
-func (*DefaultDispatcher) Close() error { return nil }
+func (d *DefaultDispatcher) Close() error {
+	d.LinkManagers.Range(func(key, value interface{}) bool {
+		value.(*LinkManager).CloseAll()
+		d.LinkManagers.Delete(key)
+		return true
+	})
+	d.Counter.Range(func(key, _ interface{}) bool {
+		d.Counter.Delete(key)
+		return true
+	})
+	return nil
+}
 
 func (d *DefaultDispatcher) getLink(ctx context.Context) (*transport.Link, *transport.Link, *limiter.Limiter, error) {
 	opt := pipe.OptionsFromContext(ctx)
@@ -180,9 +218,8 @@ func (d *DefaultDispatcher) getLink(ctx context.Context) (*transport.Link, *tran
 			return nil, nil, nil, errors.New("get limiter ", sessionInbound.Tag, " error: ", err)
 		}
 		// Speed Limit and Device Limit
-		w, reject := limit.CheckLimit(user.Email,
-			sessionInbound.Source.Address.IP().String(),
-			sessionInbound.Source.Network == net.Network_TCP)
+		w, reject := limit.CheckLimit(ctx, user.Email,
+			sessionInbound.Source.Address.IP().String())
 		if reject {
 			errors.LogInfo(ctx, "Limited ", user.Email, " by conn or ip")
 			common.Close(outboundLink.Writer)
@@ -191,26 +228,20 @@ func (d *DefaultDispatcher) getLink(ctx context.Context) (*transport.Link, *tran
 			common.Interrupt(inboundLink.Reader)
 			return nil, nil, nil, errors.New("Limited ", user.Email, " by conn or ip")
 		}
-		var lm *LinkManager
-		if lmloaded, ok := d.LinkManagers.Load(user.Email); !ok {
-			lm = &LinkManager{
-				links: make(map[*ManagedWriter]buf.Reader),
-			}
-			d.LinkManagers.Store(user.Email, lm)
-		} else {
-			lm = lmloaded.(*LinkManager)
-		}
 		managedWriter := &ManagedWriter{
-			writer:  uplinkWriter,
-			manager: lm,
+			writer: uplinkWriter,
 		}
-		lm.AddLink(managedWriter, outboundLink.Reader)
+		d.addManagedLink(user.Email, managedWriter, outboundLink.Reader)
 		inboundLink.Writer = managedWriter
 		if w != nil {
 			sessionInbound.CanSpliceCopy = 3
 			inboundLink.Writer = rate.NewRateLimitWriter(inboundLink.Writer, w)
 			outboundLink.Writer = rate.NewRateLimitWriter(outboundLink.Writer, w)
 		}
+		deviceIP := limiter.NormalizeIP(sessionInbound.Source.Address.IP().String())
+		touch := func() { limit.TouchDevice(user.Email, deviceIP) }
+		inboundLink.Writer = &deviceTouchWriter{writer: inboundLink.Writer, touch: touch}
+		outboundLink.Writer = &deviceTouchWriter{writer: outboundLink.Writer, touch: touch}
 		var t *counter.TrafficCounter
 		if c, ok := d.Counter.Load(sessionInbound.Tag); !ok {
 			t = counter.NewTrafficCounter()
@@ -300,7 +331,8 @@ func (d *DefaultDispatcher) Dispatch(ctx context.Context, destination net.Destin
 				reader: outbound.Reader.(*pipe.Reader),
 			}
 			outbound.Reader = cReader
-			result, err := sniffer(ctx, cReader, sniffingRequest.MetadataOnly, destination.Network)
+			metadataOnly := sniffingRequest.MetadataOnly || (destination.Network == net.Network_UDP && d.disableUDPContentSniffing)
+			result, err := sniffer(ctx, cReader, metadataOnly, destination.Network)
 			if err == nil {
 				content.Protocol = result.Protocol()
 			}
@@ -364,32 +396,27 @@ func (d *DefaultDispatcher) DispatchLink(ctx context.Context, destination net.De
 			return errors.New("get limiter ", sessionInbound.Tag, " error: ", err)
 		}
 		// Speed Limit and Device Limit
-		w, reject := limit.CheckLimit(user.Email,
-			sessionInbound.Source.Address.IP().String(),
-			sessionInbound.Source.Network == net.Network_TCP)
+		w, reject := limit.CheckLimit(ctx, user.Email,
+			sessionInbound.Source.Address.IP().String())
 		if reject {
 			errors.LogInfo(ctx, "Limited ", user.Email, " by conn or ip")
 			common.Close(outbound.Writer)
 			common.Interrupt(outbound.Reader)
 			return errors.New("Limited ", user.Email, " by conn or ip")
 		}
-		var lm *LinkManager
-		if lmloaded, ok := d.LinkManagers.Load(user.Email); !ok {
-			lm = &LinkManager{
-				links: make(map[*ManagedWriter]buf.Reader),
-			}
-			d.LinkManagers.Store(user.Email, lm)
-		} else {
-			lm = lmloaded.(*LinkManager)
-		}
 		managedWriter := &ManagedWriter{
-			writer:  outbound.Writer,
-			manager: lm,
+			writer: outbound.Writer,
 		}
+		d.addManagedLink(user.Email, managedWriter, outbound.Reader)
 		outbound.Writer = managedWriter
 		if w != nil {
 			sessionInbound.CanSpliceCopy = 3
 			outbound.Writer = rate.NewRateLimitWriter(outbound.Writer, w)
+		}
+		deviceIP := limiter.NormalizeIP(sessionInbound.Source.Address.IP().String())
+		outbound.Writer = &deviceTouchWriter{
+			writer: outbound.Writer,
+			touch:  func() { limit.TouchDevice(user.Email, deviceIP) },
 		}
 		var t *counter.TrafficCounter
 		if c, ok := d.Counter.Load(sessionInbound.Tag); !ok {
@@ -405,7 +432,6 @@ func (d *DefaultDispatcher) DispatchLink(ctx context.Context, destination net.De
 			Reader:  &buf.TimeoutWrapperReader{Reader: outbound.Reader},
 			Counter: &ts.UpCounter,
 		}
-		lm.AddLink(managedWriter, outbound.Reader)
 		outbound.Writer = &dispatcher.SizeStatWriter{
 			Counter: downcounter,
 			Writer:  outbound.Writer,
@@ -420,7 +446,8 @@ func (d *DefaultDispatcher) DispatchLink(ctx context.Context, destination net.De
 			reader: outbound.Reader.(buf.TimeoutReader),
 		}
 		outbound.Reader = cReader
-		result, err := sniffer(ctx, cReader, sniffingRequest.MetadataOnly, destination.Network)
+		metadataOnly := sniffingRequest.MetadataOnly || (destination.Network == net.Network_UDP && d.disableUDPContentSniffing)
+		result, err := sniffer(ctx, cReader, metadataOnly, destination.Network)
 		if err == nil {
 			content.Protocol = result.Protocol()
 		}
@@ -449,7 +476,7 @@ func (d *DefaultDispatcher) DispatchLink(ctx context.Context, destination net.De
 }
 
 func sniffer(ctx context.Context, cReader *cachedReader, metadataOnly bool, network net.Network) (SniffResult, error) {
-	payload := buf.NewWithSize(32767)
+	payload := buf.New()
 	defer payload.Release()
 
 	sniffer := NewSniffer(ctx)

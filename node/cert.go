@@ -9,11 +9,13 @@ import (
 	"encoding/pem"
 	"fmt"
 	"math/big"
+	"net"
 	"os"
+	"path/filepath"
 	"time"
 
 	log "github.com/sirupsen/logrus"
-	"github.com/wyx2685/v2node/common/file"
+	"github.com/wyx2685/znode/common/file"
 )
 
 func (c *Controller) renewCertTask(_ context.Context) error {
@@ -74,45 +76,75 @@ func (c *Controller) requestCert() error {
 }
 
 func generateSelfSslCertificate(domain, certPath, keyPath string) error {
-	key, _ := rsa.GenerateKey(rand.Reader, 2048)
+	key, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		return fmt.Errorf("generate private key: %w", err)
+	}
+	now := time.Now()
 	tmpl := &x509.Certificate{
 		Version:      3,
-		SerialNumber: big.NewInt(time.Now().Unix()),
+		SerialNumber: big.NewInt(now.UnixNano()),
 		Subject: pkix.Name{
 			CommonName: domain,
 		},
-		DNSNames:              []string{domain},
 		BasicConstraintsValid: true,
 		KeyUsage:              x509.KeyUsageDigitalSignature | x509.KeyUsageKeyEncipherment,
 		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
-		NotBefore:             time.Now(),
-		NotAfter:              time.Now().AddDate(30, 0, 0),
+		NotBefore:             now.Add(-5 * time.Minute),
+		NotAfter:              now.AddDate(10, 0, 0),
+	}
+	if ip := net.ParseIP(domain); ip != nil {
+		tmpl.IPAddresses = []net.IP{ip}
+	} else if domain != "" {
+		tmpl.DNSNames = []string{domain}
 	}
 	cert, err := x509.CreateCertificate(rand.Reader, tmpl, tmpl, key.Public(), key)
 	if err != nil {
 		return err
 	}
-	f, err := os.OpenFile(certPath, os.O_CREATE|os.O_RDWR, 0644)
-	if err != nil {
-		return err
-	}
-	err = pem.Encode(f, &pem.Block{
+	certPEM := pem.EncodeToMemory(&pem.Block{
 		Type:  "CERTIFICATE",
 		Bytes: cert,
 	})
-	if err != nil {
-		return err
-	}
-	f, err = os.OpenFile(keyPath, os.O_CREATE|os.O_RDWR, 0644)
-	if err != nil {
-		return err
-	}
-	err = pem.Encode(f, &pem.Block{
-		Type:  "EC PRIVATE KEY",
+	keyPEM := pem.EncodeToMemory(&pem.Block{
+		Type:  "RSA PRIVATE KEY",
 		Bytes: x509.MarshalPKCS1PrivateKey(key),
 	})
+	if err := writeCertificateFile(certPath, certPEM, 0o644); err != nil {
+		return fmt.Errorf("write certificate: %w", err)
+	}
+	if err := writeCertificateFile(keyPath, keyPEM, 0o600); err != nil {
+		_ = os.Remove(certPath)
+		return fmt.Errorf("write private key: %w", err)
+	}
+	return nil
+}
+
+func writeCertificateFile(path string, content []byte, mode os.FileMode) error {
+	dir := filepath.Dir(path)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return err
+	}
+	temporary, err := os.CreateTemp(dir, ".znode-cert-*")
 	if err != nil {
 		return err
 	}
-	return nil
+	temporaryPath := temporary.Name()
+	defer os.Remove(temporaryPath)
+	if err := temporary.Chmod(mode); err != nil {
+		temporary.Close()
+		return err
+	}
+	if _, err := temporary.Write(content); err != nil {
+		temporary.Close()
+		return err
+	}
+	if err := temporary.Sync(); err != nil {
+		temporary.Close()
+		return err
+	}
+	if err := temporary.Close(); err != nil {
+		return err
+	}
+	return os.Rename(temporaryPath, path)
 }

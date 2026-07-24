@@ -9,7 +9,7 @@ import (
 	"github.com/sirupsen/logrus"
 
 	"github.com/go-resty/resty/v2"
-	"github.com/wyx2685/v2node/conf"
+	"github.com/wyx2685/znode/conf"
 )
 
 // Panel is the interface for different panel's api.
@@ -33,7 +33,7 @@ func New(c *conf.NodeConfig) (*Client, error) {
 		retryCount = *c.RetryCount
 	}
 	client.SetRetryCount(retryCount)
-	client.SetHeader("User-Agent", fmt.Sprintf("v2node go-resty/%s (https://github.com/go-resty/resty)", resty.Version))
+	client.SetHeader("User-Agent", fmt.Sprintf("znode go-resty/%s (https://github.com/go-resty/resty)", resty.Version))
 	if c.Timeout > 0 {
 		client.SetTimeout(time.Duration(c.Timeout) * time.Second)
 	} else {
@@ -49,11 +49,21 @@ func New(c *conf.NodeConfig) (*Client, error) {
 	})
 	client.SetBaseURL(c.APIHost)
 	// set params
-	client.SetQueryParams(map[string]string{
-		"node_type": "v2node",
+	query := map[string]string{
+		"node_type": "znode",
 		"node_id":   strconv.Itoa(c.NodeID),
-		"token":     c.Key,
-	})
+	}
+	if c.AgentID != "" {
+		query["agent_id"] = c.AgentID
+		client.SetHeader("X-ZNode-Agent-ID", c.AgentID)
+		client.SetHeader("X-ZNode-Instance-ID", effectiveInstanceID(c.AgentInstanceID))
+		client.SetHeader("X-ZNode-Agent-Token", c.Key)
+		client.SetAuthToken(c.Key)
+		setAddressHeaders(client)
+	} else {
+		query["token"] = c.Key
+	}
+	client.SetQueryParams(query)
 	return &Client{
 		client:   client,
 		Token:    c.Key,
