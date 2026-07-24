@@ -5,10 +5,10 @@ import (
 	"errors"
 	"time"
 
+	panel "github.com/AZZ-vopp/znode/api/v2board"
+	"github.com/AZZ-vopp/znode/common/task"
+	vCore "github.com/AZZ-vopp/znode/core"
 	log "github.com/sirupsen/logrus"
-	panel "github.com/wyx2685/znode/api/v2board"
-	"github.com/wyx2685/znode/common/task"
-	vCore "github.com/wyx2685/znode/core"
 )
 
 func (c *Controller) startTasks(node *panel.NodeInfo) {

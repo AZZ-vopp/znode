@@ -4,8 +4,8 @@ import (
 	"context"
 	"testing"
 
-	panel "github.com/wyx2685/znode/api/v2board"
-	"github.com/wyx2685/znode/conf"
+	panel "github.com/AZZ-vopp/znode/api/v2board"
+	"github.com/AZZ-vopp/znode/conf"
 )
 
 type fakeManifestFetcher struct {

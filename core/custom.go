@@ -5,7 +5,7 @@ import (
 	"net"
 	"strings"
 
-	panel "github.com/wyx2685/znode/api/v2board"
+	panel "github.com/AZZ-vopp/znode/api/v2board"
 	"github.com/xtls/xray-core/app/dns"
 	"github.com/xtls/xray-core/app/router"
 	xnet "github.com/xtls/xray-core/common/net"

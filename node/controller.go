@@ -5,12 +5,12 @@ import (
 	"fmt"
 	"sync"
 
+	panel "github.com/AZZ-vopp/znode/api/v2board"
+	"github.com/AZZ-vopp/znode/common/task"
+	"github.com/AZZ-vopp/znode/conf"
+	"github.com/AZZ-vopp/znode/core"
+	"github.com/AZZ-vopp/znode/limiter"
 	log "github.com/sirupsen/logrus"
-	panel "github.com/wyx2685/znode/api/v2board"
-	"github.com/wyx2685/znode/common/task"
-	"github.com/wyx2685/znode/conf"
-	"github.com/wyx2685/znode/core"
-	"github.com/wyx2685/znode/limiter"
 )
 
 type Controller struct {

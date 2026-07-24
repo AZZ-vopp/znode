@@ -7,7 +7,7 @@ import (
 	"net/http/httptest"
 	"testing"
 
-	"github.com/wyx2685/znode/conf"
+	"github.com/AZZ-vopp/znode/conf"
 )
 
 func TestReportNodeStatusSendsResourceTelemetryToAssignedNode(t *testing.T) {

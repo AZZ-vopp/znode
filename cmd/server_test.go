@@ -10,9 +10,9 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/wyx2685/znode/conf"
-	"github.com/wyx2685/znode/limiter"
-	"github.com/wyx2685/znode/node"
+	"github.com/AZZ-vopp/znode/conf"
+	"github.com/AZZ-vopp/znode/limiter"
+	"github.com/AZZ-vopp/znode/node"
 )
 
 func TestStartPreparedRuntimeWithZeroAssignedNodes(t *testing.T) {

@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
   push:
     branches:
-      - master
+      - main
     paths:
       - "**/*.go"
       - "go.mod"
@@ -121,13 +121,13 @@ jobs:
         run: |
           echo "version: $version"
           mkdir -p build_assets
-          GOEXPERIMENT=jsonv2 go build -v -o build_assets/znode -trimpath -ldflags "-X 'github.com/wyx2685/znode/cmd.version=$version' -s -w -buildid="
+          GOEXPERIMENT=jsonv2 go build -v -o build_assets/znode -trimpath -ldflags "-X 'github.com/AZZ-vopp/znode/cmd.version=$version' -s -w -buildid="
 
       - name: Build Mips softfloat znode
         if: matrix.goarch == 'mips' || matrix.goarch == 'mipsle'
         run: |
           echo "version: $version"
-          GOEXPERIMENT=jsonv2 GOMIPS=softfloat go build -v -o build_assets/znode_softfloat -trimpath -ldflags "-X 'github.com/wyx2685/znode/cmd.version=$version' -s -w -buildid="
+          GOEXPERIMENT=jsonv2 GOMIPS=softfloat go build -v -o build_assets/znode_softfloat -trimpath -ldflags "-X 'github.com/AZZ-vopp/znode/cmd.version=$version' -s -w -buildid="
       - name: Rename Windows znode
         if: matrix.goos == 'windows'
         run: |

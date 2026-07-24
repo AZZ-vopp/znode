@@ -5,7 +5,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/wyx2685/znode/conf"
+	"github.com/AZZ-vopp/znode/conf"
 )
 
 func TestDeviceSyncEventDecodesPanelPayload(t *testing.T) {

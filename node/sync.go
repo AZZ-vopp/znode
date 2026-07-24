@@ -8,9 +8,9 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/AZZ-vopp/znode/conf"
 	"github.com/redis/go-redis/v9"
 	log "github.com/sirupsen/logrus"
-	"github.com/wyx2685/znode/conf"
 )
 
 type deviceSyncEvent struct {

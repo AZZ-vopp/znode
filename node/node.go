@@ -4,10 +4,10 @@ import (
 	"context"
 	"fmt"
 
+	panel "github.com/AZZ-vopp/znode/api/v2board"
+	"github.com/AZZ-vopp/znode/conf"
+	"github.com/AZZ-vopp/znode/core"
 	log "github.com/sirupsen/logrus"
-	panel "github.com/wyx2685/znode/api/v2board"
-	"github.com/wyx2685/znode/conf"
-	"github.com/wyx2685/znode/core"
 )
 
 type Node struct {

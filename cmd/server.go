@@ -11,13 +11,13 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/AZZ-vopp/znode/agent"
+	"github.com/AZZ-vopp/znode/conf"
+	"github.com/AZZ-vopp/znode/core"
+	"github.com/AZZ-vopp/znode/limiter"
+	"github.com/AZZ-vopp/znode/node"
 	log "github.com/sirupsen/logrus"
 	"github.com/spf13/cobra"
-	"github.com/wyx2685/znode/agent"
-	"github.com/wyx2685/znode/conf"
-	"github.com/wyx2685/znode/core"
-	"github.com/wyx2685/znode/limiter"
-	"github.com/wyx2685/znode/node"
 )
 
 var (

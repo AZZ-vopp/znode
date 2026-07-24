@@ -12,7 +12,7 @@ import (
 	"strings"
 	"time"
 
-	panel "github.com/wyx2685/znode/api/v2board"
+	panel "github.com/AZZ-vopp/znode/api/v2board"
 	"github.com/xtls/xray-core/common/net"
 	"github.com/xtls/xray-core/core"
 	"github.com/xtls/xray-core/features/inbound"

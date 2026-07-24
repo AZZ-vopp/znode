@@ -8,10 +8,10 @@ import (
 	"testing"
 	"time"
 
-	panel "github.com/wyx2685/znode/api/v2board"
-	"github.com/wyx2685/znode/conf"
-	vcore "github.com/wyx2685/znode/core"
-	"github.com/wyx2685/znode/limiter"
+	panel "github.com/AZZ-vopp/znode/api/v2board"
+	"github.com/AZZ-vopp/znode/conf"
+	vcore "github.com/AZZ-vopp/znode/core"
+	"github.com/AZZ-vopp/znode/limiter"
 )
 
 func TestControllerPrepareAllowsEmptyUserList(t *testing.T) {

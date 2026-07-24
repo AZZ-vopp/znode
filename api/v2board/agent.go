@@ -11,8 +11,8 @@ import (
 	"strings"
 	"time"
 
+	"github.com/AZZ-vopp/znode/conf"
 	"github.com/go-resty/resty/v2"
-	"github.com/wyx2685/znode/conf"
 )
 
 const agentManifestPath = "/api/v2/server/agent/config"

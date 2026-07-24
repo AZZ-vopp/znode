@@ -10,8 +10,8 @@ import (
 	"sync"
 	"time"
 
+	"github.com/AZZ-vopp/znode/conf"
 	"github.com/redis/go-redis/v9"
-	"github.com/wyx2685/znode/conf"
 )
 
 // The Lua script makes remove-expired, capacity-check, touch and TTL refresh

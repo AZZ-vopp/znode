@@ -3,11 +3,11 @@ package core
 import (
 	"sync"
 
+	panel "github.com/AZZ-vopp/znode/api/v2board"
+	"github.com/AZZ-vopp/znode/conf"
+	"github.com/AZZ-vopp/znode/core/app/dispatcher"
+	_ "github.com/AZZ-vopp/znode/core/distro/all"
 	log "github.com/sirupsen/logrus"
-	panel "github.com/wyx2685/znode/api/v2board"
-	"github.com/wyx2685/znode/conf"
-	"github.com/wyx2685/znode/core/app/dispatcher"
-	_ "github.com/wyx2685/znode/core/distro/all"
 	"github.com/xtls/xray-core/app/proxyman"
 	"github.com/xtls/xray-core/app/stats"
 	"github.com/xtls/xray-core/common/serial"

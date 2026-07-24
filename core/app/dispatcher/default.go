@@ -9,9 +9,9 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/wyx2685/znode/common/counter"
-	"github.com/wyx2685/znode/common/rate"
-	"github.com/wyx2685/znode/limiter"
+	"github.com/AZZ-vopp/znode/common/counter"
+	"github.com/AZZ-vopp/znode/common/rate"
+	"github.com/AZZ-vopp/znode/limiter"
 
 	"github.com/xtls/xray-core/app/dispatcher"
 	"github.com/xtls/xray-core/common"

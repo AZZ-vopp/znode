@@ -6,9 +6,9 @@ import (
 	"sync"
 	"time"
 
+	panel "github.com/AZZ-vopp/znode/api/v2board"
+	"github.com/AZZ-vopp/znode/conf"
 	log "github.com/sirupsen/logrus"
-	panel "github.com/wyx2685/znode/api/v2board"
-	"github.com/wyx2685/znode/conf"
 )
 
 // Assignment is a fetched, validated snapshot of the logical nodes assigned

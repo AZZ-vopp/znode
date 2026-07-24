@@ -6,7 +6,7 @@ yellow='\033[0;33m'
 plain='\033[0m'
 
 cur_dir=$(pwd)
-release_repo="wyx2685/znode"
+release_repo="AZZ-vopp/znode"
 release_branch="main"
 [[ -s /etc/znode/release-repo ]] && release_repo=$(tr -d '\r\n' < /etc/znode/release-repo)
 [[ -s /etc/znode/release-branch ]] && release_branch=$(tr -d '\r\n' < /etc/znode/release-branch)
@@ -545,7 +545,7 @@ show_usage() {
 show_menu() {
     echo -e "
   ${green}Script quản lý znode, ${plain}${red}không dùng cho Docker${plain}
---- https://github.com/wyx2685/znode ---
+--- https://github.com/AZZ-vopp/znode ---
   ${green}0.${plain} Chỉnh sửa cấu hình
 ————————————————
   ${green}1.${plain} Cài đặt znode

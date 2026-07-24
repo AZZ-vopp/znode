@@ -9,11 +9,11 @@ import (
 	"sync/atomic"
 	"time"
 
+	panel "github.com/AZZ-vopp/znode/api/v2board"
+	"github.com/AZZ-vopp/znode/common/format"
+	"github.com/AZZ-vopp/znode/common/rate"
+	"github.com/AZZ-vopp/znode/conf"
 	log "github.com/sirupsen/logrus"
-	panel "github.com/wyx2685/znode/api/v2board"
-	"github.com/wyx2685/znode/common/format"
-	"github.com/wyx2685/znode/common/rate"
-	"github.com/wyx2685/znode/conf"
 )
 
 var limitLock sync.RWMutex

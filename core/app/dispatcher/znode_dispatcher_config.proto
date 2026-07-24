@@ -2,7 +2,7 @@ syntax = "proto3";
 
 package znode.core.app.dispatcher;
 option csharp_namespace = "Znode.core.app.dispatcher";
-option go_package = "github.com/wyx2685/znode/core/app/dispatcher";
+option go_package = "github.com/AZZ-vopp/znode/core/app/dispatcher";
 option java_package = "com.znode.core.app.dispatcher";
 option java_multiple_files = true;
 

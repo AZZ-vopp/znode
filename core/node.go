@@ -3,7 +3,7 @@ package core
 import (
 	"fmt"
 
-	panel "github.com/wyx2685/znode/api/v2board"
+	panel "github.com/AZZ-vopp/znode/api/v2board"
 )
 
 func (v *V2Core) AddNode(tag string, info *panel.NodeInfo) error {

@@ -14,8 +14,8 @@ import (
 	"path/filepath"
 	"time"
 
+	"github.com/AZZ-vopp/znode/common/file"
 	log "github.com/sirupsen/logrus"
-	"github.com/wyx2685/znode/common/file"
 )
 
 func (c *Controller) renewCertTask(_ context.Context) error {

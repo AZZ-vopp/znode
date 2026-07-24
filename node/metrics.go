@@ -11,7 +11,7 @@ import (
 	"sync"
 	"time"
 
-	panel "github.com/wyx2685/znode/api/v2board"
+	panel "github.com/AZZ-vopp/znode/api/v2board"
 )
 
 type platformSnapshot struct {

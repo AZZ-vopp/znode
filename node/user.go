@@ -5,8 +5,8 @@ import (
 	"errors"
 	"time"
 
+	panel "github.com/AZZ-vopp/znode/api/v2board"
 	log "github.com/sirupsen/logrus"
-	panel "github.com/wyx2685/znode/api/v2board"
 )
 
 func (c *Controller) reportUserTrafficTask(ctx context.Context) (err error) {

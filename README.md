@@ -1,51 +1,73 @@
-# znode
+# ZNode
 
-Znode hỗ trợ giới hạn IP/thiết bị phân tán qua Redis và profile giảm RAM cho
-UDP. Xem [hướng dẫn Redis và UDP bằng tiếng Việt](docs/ZNODE_REDIS_UDP_VI.md).
+ZNode là agent dành cho [AZZ-vopp/zboard](https://github.com/AZZ-vopp/zboard),
+hỗ trợ chạy nhiều logical node trên một VPS và giới hạn thiết bị phân tán qua
+Redis.
 
-Một VPS có thể chạy nhiều logical node bằng chế độ agent. Cài đúng một lần với
-thông tin do V2Board cấp:
+## Tính năng
 
-```bash
-bash install.sh --api-host https://panel.example.com --agent-id AGENT_ID --agent-token AGENT_TOKEN
-```
+- Một agent quản lý nhiều logical node trên cùng VPS.
+- Từ chối node trùng port trước khi áp dụng cấu hình.
+- Giới hạn IP/HWID/UUID thiết bị qua Redis.
+- Pub/Sub đồng bộ thay đổi thiết bị gần như tức thời.
+- Chia sẻ Redis connection pool giữa các logical node.
+- Tối ưu bộ đếm traffic và UDP để giảm CPU/RAM.
+- Gửi CPU, RAM, disk và tốc độ mạng về ZBoard.
+- TLS tự ký và SHA-256 certificate pinning.
+- Hỗ trợ cấu hình node thủ công cũ khi Agent bị tắt.
 
-Nếu binary được phát hành từ fork riêng, thêm `--release-repo OWNER/REPO`.
-Installer ghi nhớ repository/branch để lệnh `znode update` sau này không quay
-về binary upstream. Chạy lại lệnh của cùng agent sau khi rotate token sẽ cập
-nhật riêng `AgentToken`; lệnh mang Agent ID khác bị từ chối.
-
-Installer không gửi thống kê cài đặt hoặc call-home tới dịch vụ bên thứ ba.
-
-Agent tự lấy danh sách node được gán từ V2Board; cấu hình `Nodes` thủ công cũ
-vẫn được hỗ trợ khi `Agent.Enable` là `false`. Lệnh cài agent sinh sẵn
-`Agent.GlobalDeviceLimitConfig`, vì vậy giới hạn thiết bị Redis và kênh
-fast-sync vẫn áp dụng cho mọi logical node. Nếu manifest có hai node trùng
-`server_port`, agent từ chối cấu hình mới và giữ runtime cũ; chạy lệnh cài của
-một agent khác trên VPS đã enroll cũng bị từ chối để tránh gắn nhầm máy.
-Các logical node cùng cấu hình dùng chung Redis connection pool và Pub/Sub
-hub, nên số kết nối nền không tăng tuyến tính theo số node.
-Agent không đặt hard limit số logical node; giới hạn thực tế phụ thuộc CPU,
-RAM, băng thông và số port listener còn trống trên VPS.
-
-A v2board backend base on moddified xray-core.
-Máy chủ node V2Board sử dụng phiên bản Xray core đã được tùy chỉnh.
-
-**Lưu ý: Dự án này cần sử dụng cùng [V2Board đã được tùy chỉnh](https://github.com/wyx2685/v2board).**
+Xem thêm [tài liệu Redis và tối ưu UDP](docs/ZNODE_REDIS_UDP_VI.md).
 
 ## Cài đặt
 
-### Cài đặt bằng một lệnh
+Khuyến nghị tạo Agent/VPS trong ZBoard rồi sử dụng đúng lệnh cài đặt được sinh
+trên màn hình Admin. Cài thủ công installer:
 
+```bash
+wget -N https://raw.githubusercontent.com/AZZ-vopp/znode/main/script/install.sh
+bash install.sh
 ```
-wget -N https://raw.githubusercontent.com/wyx2685/znode/main/script/install.sh && bash install.sh
+
+Cài agent bằng thông tin do ZBoard cấp:
+
+```bash
+bash install.sh \
+  --api-host https://panel.example.com \
+  --agent-id AGENT_ID \
+  --agent-token AGENT_TOKEN \
+  --release-repo AZZ-vopp/znode \
+  --release-branch main
 ```
+
+Installer lưu repository phát hành trong `/etc/znode/release-repo`; lệnh
+`znode update` sau này tiếp tục tải đúng binary từ `AZZ-vopp/znode`.
 
 ## Biên dịch
-``` bash
-GOEXPERIMENT=jsonv2 go build -v -o build_assets/znode -trimpath -ldflags "-X 'github.com/wyx2685/znode/cmd.version=$version' -s -w -buildid="
+
+Yêu cầu Go 1.26.1 và experiment JSON v2:
+
+```bash
+GOEXPERIMENT=jsonv2 go test ./...
+GOEXPERIMENT=jsonv2 go build -v -o build_assets/znode \
+  -trimpath \
+  -ldflags "-X 'github.com/AZZ-vopp/znode/cmd.version=dev' -s -w -buildid="
 ```
 
-## Lịch sử tăng trưởng Stars
+## Phát hành
 
-[![Stargazers over time](https://starchart.cc/wyx2685/znode.svg?variant=adaptive)](https://starchart.cc/wyx2685/znode)
+GitHub Actions build binary theo kiến trúc khi push mã Go lên nhánh `main` hoặc
+khi tạo Release. Để installer hoạt động, repository cần có ít nhất một GitHub
+Release chứa các tệp `znode-linux-<arch>.zip` do workflow tạo ra.
+
+## Cấu hình Redis
+
+ZBoard và ZNode phải dùng cùng Redis nếu bật đồng bộ thiết bị thời gian thực.
+Giữ cùng channel đã cấu hình trên panel, mặc định `v2board:device-sync`.
+
+Thông tin Agent được lưu tại `/etc/znode/config.json` với quyền `0600`. Không
+chia sẻ Agent token hoặc sao chép file này sang VPS khác.
+
+## Giấy phép
+
+Xem [LICENSE](LICENSE). Dự án sử dụng Xray core đã tùy chỉnh theo khai báo trong
+`go.mod`.

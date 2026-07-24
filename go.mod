@@ -1,4 +1,4 @@
-module github.com/wyx2685/znode
+module github.com/AZZ-vopp/znode
 
 go 1.26.1
 

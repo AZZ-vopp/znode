@@ -20,10 +20,10 @@ import (
 	"github.com/go-acme/lego/v4/providers/dns"
 	"github.com/go-acme/lego/v4/registration"
 
+	panel "github.com/AZZ-vopp/znode/api/v2board"
+	"github.com/AZZ-vopp/znode/common/file"
 	"github.com/go-acme/lego/v4/certcrypto"
 	"github.com/go-acme/lego/v4/lego"
-	panel "github.com/wyx2685/znode/api/v2board"
-	"github.com/wyx2685/znode/common/file"
 )
 
 type Lego struct {

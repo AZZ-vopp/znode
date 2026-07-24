@@ -1,7 +1,7 @@
 package main
 
 import (
-	"github.com/wyx2685/znode/cmd"
+	"github.com/AZZ-vopp/znode/cmd"
 )
 
 func main() {

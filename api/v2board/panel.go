@@ -8,8 +8,8 @@ import (
 
 	"github.com/sirupsen/logrus"
 
+	"github.com/AZZ-vopp/znode/conf"
 	"github.com/go-resty/resty/v2"
-	"github.com/wyx2685/znode/conf"
 )
 
 // Panel is the interface for different panel's api.
