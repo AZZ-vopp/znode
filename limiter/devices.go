@@ -32,8 +32,8 @@ func newDeviceTracker(c *conf.GlobalDeviceLimitConfig) *deviceTracker {
 	t := &deviceTracker{
 		users:         make(map[string]map[string]*deviceEntry),
 		alive:         make(map[int]int),
-		ttl:           120 * time.Second,
-		refresh:       40 * time.Second,
+		ttl:           60 * time.Second,
+		refresh:       20 * time.Second,
 		maxIPsPerUser: 256,
 	}
 	if c != nil {

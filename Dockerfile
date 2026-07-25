@@ -6,6 +6,16 @@ ENV CGO_ENABLED=0
 RUN GOEXPERIMENT=jsonv2 go mod download
 RUN GOEXPERIMENT=jsonv2 go build -v -o znode
 
+FROM alpine AS geodata
+RUN apk --update --no-cache add ca-certificates curl \
+    && mkdir -p /assets \
+    && curl --fail --location --silent --show-error --retry 3 \
+       https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download/geoip.dat -o /assets/geoip.dat \
+    && curl --fail --location --silent --show-error --retry 3 \
+       https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download/geosite.dat -o /assets/geosite.dat \
+    && test "$(wc -c < /assets/geoip.dat)" -ge 1024 \
+    && test "$(wc -c < /assets/geosite.dat)" -ge 1024
+
 # Release
 FROM  alpine
 # Cài đặt các gói công cụ cần thiết
@@ -13,5 +23,8 @@ RUN  apk --update --no-cache add tzdata ca-certificates \
     && cp /usr/share/zoneinfo/Asia/Shanghai /etc/localtime
 RUN mkdir /etc/znode/
 COPY --from=builder /app/znode /usr/local/bin
+COPY --from=geodata /assets/geoip.dat /assets/geosite.dat /etc/znode/
+
+ENV XRAY_LOCATION_ASSET=/etc/znode
 
 ENTRYPOINT [ "znode", "server", "--config", "/etc/znode/config.json"]

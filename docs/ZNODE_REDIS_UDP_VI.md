@@ -31,9 +31,9 @@ Redis; key được băm SHA-256):
         "RedisUsername": "",
         "RedisPassword": "CHANGE_ME",
         "RedisDB": 0,
-        "Timeout": 2,
-        "Expiry": 120,
-        "RefreshInterval": 40,
+        "Timeout": 1,
+        "Expiry": 60,
+        "RefreshInterval": 20,
         "MaxIPsPerUser": 256,
         "KeyPrefix": "znode:device",
         "FailClosed": false
@@ -61,6 +61,12 @@ giống nhau giữa panel và từng node.
 `RefreshInterval` nhỏ hơn `Expiry` (thường bằng một phần ba). Lua script trên
 Redis thực hiện xoá IP hết hạn, kiểm tra số lượng, thêm IP và refresh TTL trong
 một thao tác nguyên tử, nên hai node đồng thời không thể cùng vượt slot.
+
+Profile khuyến nghị để đồng bộ nhanh nhưng vẫn nhẹ cho VPS là `Expiry=60`,
+`RefreshInterval=20`, `Timeout=1`, `FailClosed=false`. Redis chỉ được chạm tối
+đa một lần mỗi 20 giây cho mỗi IP đang hoạt động, không ghi theo từng packet.
+Không nên hạ refresh dưới 5 giây; mức quá thấp chỉ tăng IOPS và CPU Redis mà
+không làm Pub/Sub nhanh hơn. Redis nên nằm cùng private network với ZNode.
 
 - `FailClosed=false`: khi Redis tạm thời lỗi, node dùng tracker local có TTL để
   giữ dịch vụ hoạt động.

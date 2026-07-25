@@ -71,3 +71,14 @@ chia sẻ Agent token hoặc sao chép file này sang VPS khác.
 
 Xem [LICENSE](LICENSE). Dự án sử dụng Xray core đã tùy chỉnh theo khai báo trong
 `go.mod`.
+
+## Dữ liệu GeoIP và GeoSite
+
+Các rule Xray dùng `geoip:` và `geosite:` cần đồng thời hai file
+`geoip.dat` và `geosite.dat`. Bản phát hành tự tải dữ liệu mới nhất từ
+Loyalsoldier, trình cài đặt xác thực file không rỗng rồi đặt chúng tại
+`/etc/znode`. Znode tự đặt `XRAY_LOCATION_ASSET` về thư mục chứa đủ hai file;
+Docker image cũng đóng gói sẵn dữ liệu vào `/etc/znode`.
+
+Có thể đổi nguồn tải khi cài bằng biến `ZNODE_GEODATA_URL`, ví dụ một mirror
+nội bộ có cấu trúc `.../geoip.dat` và `.../geosite.dat`.

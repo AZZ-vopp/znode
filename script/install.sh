@@ -45,6 +45,34 @@ AGENT_TOKEN_ARG=""
 POLL_INTERVAL_ARG="15"
 RELEASE_REPO_ARG="${ZNODE_RELEASE_REPO:-AZZ-vopp/znode}"
 RELEASE_BRANCH_ARG="${ZNODE_RELEASE_BRANCH:-main}"
+GEODATA_BASE_URL="${ZNODE_GEODATA_URL:-https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download}"
+
+install_geodata() (
+    local destination="/etc/znode"
+    local temporary
+    temporary=$(mktemp -d) || return 1
+    trap 'rm -rf "$temporary"' EXIT
+
+    mkdir -p "$destination"
+    for file in geoip.dat geosite.dat; do
+        if [[ -s "/usr/local/znode/$file" ]] && [[ $(wc -c < "/usr/local/znode/$file") -ge 1024 ]]; then
+            install -m 0644 "/usr/local/znode/$file" "$destination/$file"
+            continue
+        fi
+        echo -e "${yellow}Không có $file trong gói phát hành, đang tải dữ liệu định tuyến mới nhất...${plain}"
+        if ! curl --fail --location --silent --show-error --retry 3 --connect-timeout 15 \
+            "$GEODATA_BASE_URL/$file" -o "$temporary/$file"; then
+            echo -e "${red}Không thể tải $file.${plain}"
+            return 1
+        fi
+        if [[ $(wc -c < "$temporary/$file") -lt 1024 ]]; then
+            echo -e "${red}$file tải về không hợp lệ hoặc đã bị cắt ngắn.${plain}"
+            return 1
+        fi
+        install -m 0644 "$temporary/$file" "$destination/$file"
+    done
+    echo -e "${green}Đã cài geoip.dat và geosite.dat vào $destination.${plain}"
+)
 
 parse_args() {
     while [[ $# -gt 0 ]]; do
@@ -505,8 +533,10 @@ install_znode() {
     rm znode-linux.zip -f
     chmod +x znode
     mkdir /etc/znode/ -p
-    cp geoip.dat /etc/znode/
-    cp geosite.dat /etc/znode/
+    if ! install_geodata; then
+        echo -e "${red}Cài dữ liệu GeoIP/GeoSite thất bại; dừng để tránh chạy rule định tuyến sai.${plain}"
+        exit 1
+    fi
     if [[ x"${release}" == x"alpine" ]]; then
         rm /etc/init.d/znode -f
         cat <<EOF > /etc/init.d/znode
@@ -518,6 +548,7 @@ description="znode"
 command="/usr/local/znode/znode"
 command_args="server"
 command_user="root"
+export XRAY_LOCATION_ASSET="/etc/znode"
 
 pidfile="/run/znode.pid"
 command_background="yes"
@@ -541,6 +572,7 @@ Wants=network.target
 User=root
 Group=root
 Type=simple
+Environment=XRAY_LOCATION_ASSET=/etc/znode
 LimitAS=infinity
 LimitRSS=infinity
 LimitCORE=infinity

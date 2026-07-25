@@ -49,6 +49,11 @@ func serverHandle(_ *cobra.Command, _ []string) {
 		DisableQuote:     true,
 		PadLevelText:     false,
 	})
+	if assetDirectory := configureAssetLocation(config); assetDirectory != "" {
+		log.WithField("directory", assetDirectory).Info("Xray geodata loaded")
+	} else {
+		log.Warn("geoip.dat and geosite.dat were not found together; geoip:/geosite: routing rules may fail")
+	}
 
 	prepared, err := prepareRuntime(config)
 	if err != nil {

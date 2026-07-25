@@ -140,10 +140,11 @@ jobs:
           LIST=('geoip' 'geosite')
           for i in "${LIST[@]}"
           do
-            DOWNLOAD_URL="https://raw.githubusercontent.com/Loyalsoldier/v2ray-rules-dat/release/${i}.dat"
+            DOWNLOAD_URL="https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download/${i}.dat"
             FILE_NAME="${i}.dat"
             echo -e "Downloading ${DOWNLOAD_URL}..."
-            curl -L "${DOWNLOAD_URL}" -o ./build_assets/${FILE_NAME}
+            curl --fail --location --silent --show-error --retry 3 "${DOWNLOAD_URL}" -o ./build_assets/${FILE_NAME}
+            test "$(wc -c < ./build_assets/${FILE_NAME})" -ge 1024
           done
       - name: Create ZIP archive
         shell: bash

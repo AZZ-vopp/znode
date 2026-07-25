@@ -183,19 +183,22 @@ func (c *GlobalDeviceLimitConfig) applyDefaults() {
 		c.RedisAddr = "127.0.0.1:6379"
 	}
 	if c.Timeout <= 0 {
-		c.Timeout = 2
+		c.Timeout = 1
 	}
 	if c.Expiry <= 0 {
-		c.Expiry = 120
+		c.Expiry = 60
 	}
 	if c.Expiry < 10 {
 		c.Expiry = 10
 	}
 	if c.RefreshInterval <= 0 || c.RefreshInterval >= c.Expiry {
 		c.RefreshInterval = c.Expiry / 3
-		if c.RefreshInterval < 1 {
-			c.RefreshInterval = 1
+		if c.RefreshInterval < 5 {
+			c.RefreshInterval = 5
 		}
+	}
+	if c.RefreshInterval < 5 {
+		c.RefreshInterval = 5
 	}
 	if c.MaxIPsPerUser <= 0 {
 		c.MaxIPsPerUser = 256

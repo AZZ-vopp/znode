@@ -31,12 +31,15 @@ func TestLoadDefaultsAndRedisConfig(t *testing.T) {
 		t.Fatalf("unexpected connection defaults: %+v", c.ConnectionConfig)
 	}
 	device := c.NodeConfigs[0].GlobalDeviceLimitConfig
-	if device == nil || device.RedisNetwork != "tcp" || device.Timeout != 2 || device.RefreshInterval != 30 || device.MaxIPsPerUser != 256 || device.SyncEnabled == nil || !*device.SyncEnabled {
+	if device == nil || device.RedisNetwork != "tcp" || device.Timeout != 1 || device.RefreshInterval != 30 || device.MaxIPsPerUser != 256 || device.SyncEnabled == nil || !*device.SyncEnabled {
 		t.Fatalf("unexpected Redis defaults: %+v", device)
 	}
 	disabled := false
 	custom := &GlobalDeviceLimitConfig{SyncEnabled: &disabled}
 	custom.applyDefaults()
+	if custom.Expiry != 60 || custom.RefreshInterval != 20 || custom.Timeout != 1 {
+		t.Fatalf("unexpected balanced Redis defaults: %+v", custom)
+	}
 	if custom.SyncEnabled == nil || *custom.SyncEnabled {
 		t.Fatalf("explicit SyncEnabled=false was not preserved")
 	}
