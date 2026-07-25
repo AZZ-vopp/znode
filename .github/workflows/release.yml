@@ -5,6 +5,8 @@ on:
   push:
     branches:
       - main
+    tags:
+      - "v*"
     paths:
       - "**/*.go"
       - "go.mod"
@@ -17,8 +19,9 @@ on:
       - "go.mod"
       - "go.sum"
       - ".github/workflows/release.yml"
-  release:
-    types: [published]
+
+permissions:
+  contents: write
 
 jobs:
 
@@ -110,11 +113,11 @@ jobs:
         run: |
           go mod download
       - name: Get release version
-        if: ${{ github.event_name == 'release' }}
+        if: ${{ github.ref_type == 'tag' }}
         run: |
-          echo "version=$(echo $GITHUB_REF | cut -d / -f 3)" >> $GITHUB_ENV
+          echo "version=${{ github.ref_name }}" >> $GITHUB_ENV
       - name: Get other version
-        if: ${{ github.event_name != 'release' }}
+        if: ${{ github.ref_type != 'tag' }}
         run: |
           echo "version=${{ github.sha }}" >> $GITHUB_ENV
       - name: Build znode
@@ -167,12 +170,27 @@ jobs:
         with:
           name: znode-${{ steps.get_filename.outputs.ASSET_NAME }}
           path: |
-            ./znode-${{ steps.get_filename.outputs.ASSET_NAME }}/*
-      - name: Upload binaries to release
-        uses: svenstaro/upload-release-action@v2
-        if: github.event_name == 'release'
+            ./znode-${{ steps.get_filename.outputs.ASSET_NAME }}.zip
+            ./znode-${{ steps.get_filename.outputs.ASSET_NAME }}.zip.dgst
+
+  release:
+    name: Publish GitHub Release
+    if: ${{ github.ref_type == 'tag' }}
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download all build artifacts
+        uses: actions/download-artifact@v7
         with:
-          repo_token: ${{ secrets.GITHUB_TOKEN }}
-          file: ./znode-${{ steps.get_filename.outputs.ASSET_NAME }}.zip*
-          tag: ${{ github.ref }}
-          file_glob: true
+          path: release-assets
+          pattern: znode-*
+          merge-multiple: true
+      - name: Publish release and checksums
+        uses: softprops/action-gh-release@v3
+        with:
+          name: ZNode ${{ github.ref_name }}
+          generate_release_notes: true
+          fail_on_unmatched_files: true
+          files: |
+            release-assets/*.zip
+            release-assets/*.zip.dgst
