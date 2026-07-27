@@ -149,6 +149,12 @@ rollback() {
         echo -e "${red}Chưa có bản trước để quay lại. Hãy cập nhật thành công ít nhất một lần trước.${plain}"
         return 1
     fi
+    local previous_version
+    previous_version=$(/usr/local/znode.previous/znode version 2>/dev/null | awk 'NR==1 {print $2}')
+    if [[ ! "$previous_version" =~ ^v?([0-9]+)\.([0-9]+) ]] || (( ${BASH_REMATCH[1]} < 1 )) || (( ${BASH_REMATCH[1]} == 1 && ${BASH_REMATCH[2]} < 2 )); then
+        echo -e "${red}Bản dự phòng ${previous_version:-không xác định} chưa hỗ trợ điều khiển Agent tự động; từ chối rollback để tránh mất kết nối quản trị.${plain}"
+        return 1
+    fi
     echo -e "${yellow}Đang quay lại bản ZNode trước...${plain}"
     if [[ x"${release}" == x"alpine" ]]; then
         service znode stop >/dev/null 2>&1 || true
