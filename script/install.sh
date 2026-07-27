@@ -389,6 +389,23 @@ generate_znode_config() {
         }
     ]
 }
+EOF
+        chmod 600 /etc/znode/config.json
+        echo -e "${green}Đã tạo xong tệp cấu hình znode, đang khởi động lại dịch vụ.${plain}"
+        if [[ x"${release}" == x"alpine" ]]; then
+            service znode restart
+        else
+            systemctl restart znode
+        fi
+        sleep 2
+        check_status
+        echo -e ""
+        if [[ $? == 0 ]]; then
+            echo -e "${green}Khởi động lại znode thành công${plain}"
+        else
+            echo -e "${red}Có thể znode khởi động thất bại. Hãy dùng znode log để xem nhật ký.${plain}"
+        fi
+}
 
 migrate_legacy_v2node() {
     if [[ ! -f /etc/v2node/config.json || -f /etc/znode/config.json ]]; then
@@ -410,23 +427,6 @@ migrate_legacy_v2node() {
         systemctl disable v2node >/dev/null 2>&1 || true
     fi
     echo -e "${green}Đã giữ nguyên cấu hình và danh tính agent trong /etc/znode/config.json.${plain}"
-}
-EOF
-        chmod 600 /etc/znode/config.json
-        echo -e "${green}Đã tạo xong tệp cấu hình znode, đang khởi động lại dịch vụ.${plain}"
-        if [[ x"${release}" == x"alpine" ]]; then
-            service znode restart
-        else
-            systemctl restart znode
-        fi
-        sleep 2
-        check_status
-        echo -e ""
-        if [[ $? == 0 ]]; then
-            echo -e "${green}Khởi động lại znode thành công${plain}"
-        else
-            echo -e "${red}Có thể znode khởi động thất bại. Hãy dùng znode log để xem nhật ký.${plain}"
-        fi
 }
 
 generate_znode_agent_config() {
