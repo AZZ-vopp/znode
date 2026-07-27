@@ -74,6 +74,43 @@ install_geodata() (
     echo -e "${green}Đã cài geoip.dat và geosite.dat vào $destination.${plain}"
 )
 
+install_log_cleanup() {
+    local cleanup_script="/usr/local/znode/cleanup-logs.sh"
+    local schedule_dir="/etc/cron.daily"
+    [[ x"${release}" == x"alpine" ]] && schedule_dir="/etc/periodic/daily"
+    mkdir -p /usr/local/znode "$schedule_dir" /var/log/znode
+    cat > "$cleanup_script" <<'EOF'
+#!/bin/sh
+# Keep ZNode file logs from growing without touching other services.
+set -u
+
+truncate_log() {
+    case "$1" in
+        /var/log/*|/usr/local/znode/*)
+            [ -f "$1" ] && : > "$1" 2>/dev/null || true
+            ;;
+    esac
+}
+
+for log_file in /var/log/znode.log /var/log/znode-maintenance.log /var/log/znode/*.log; do
+    [ -e "$log_file" ] && truncate_log "$log_file"
+done
+
+if [ -r /etc/znode/config.json ]; then
+    output=$(sed -n 's/.*"Output"[[:space:]]*:[[:space:]]*"\([^"\\]*\)".*/\1/p' /etc/znode/config.json | sed -n '1p')
+    [ -n "$output" ] && truncate_log "$output"
+fi
+
+find /var/log/znode -type f -name '*.log' -mtime +1 -delete 2>/dev/null || true
+EOF
+    chmod 700 "$cleanup_script"
+    cat > "$schedule_dir/znode-log-cleanup" <<EOF
+#!/bin/sh
+exec "$cleanup_script"
+EOF
+    chmod 755 "$schedule_dir/znode-log-cleanup"
+}
+
 parse_args() {
     while [[ $# -gt 0 ]]; do
         case "$1" in
@@ -633,6 +670,7 @@ EOF
     chmod 644 /etc/znode/release-repo /etc/znode/release-branch
     curl -o /usr/bin/znode -Ls "https://raw.githubusercontent.com/${RELEASE_REPO_ARG}/${RELEASE_BRANCH_ARG}/script/znode.sh"
     chmod +x /usr/bin/znode
+    install_log_cleanup
 
     cd $cur_dir
     rm -f install.sh
