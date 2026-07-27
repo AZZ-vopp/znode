@@ -676,7 +676,9 @@ EOF
 parse_args "$@"
 validate_release_source
 validate_agent_args
-migrate_legacy_v2node
+if declare -F migrate_legacy_v2node >/dev/null 2>&1; then
+    migrate_legacy_v2node
+fi
 validate_existing_agent_binding
 echo -e "${green}Bắt đầu cài đặt${plain}"
 install_base
