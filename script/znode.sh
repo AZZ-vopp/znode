@@ -144,6 +144,35 @@ update() {
     fi
 }
 
+rollback() {
+    if [[ ! -x /usr/local/znode.previous/znode ]]; then
+        echo -e "${red}Chưa có bản trước để quay lại. Hãy cập nhật thành công ít nhất một lần trước.${plain}"
+        return 1
+    fi
+    echo -e "${yellow}Đang quay lại bản ZNode trước...${plain}"
+    if [[ x"${release}" == x"alpine" ]]; then
+        service znode stop >/dev/null 2>&1 || true
+    else
+        systemctl stop znode >/dev/null 2>&1 || true
+    fi
+    local failed_dir="/usr/local/znode.rollback.$(date +%s)"
+    mv /usr/local/znode "$failed_dir"
+    mv /usr/local/znode.previous /usr/local/znode
+    mv "$failed_dir" /usr/local/znode.previous
+    chmod +x /usr/local/znode/znode
+    if [[ x"${release}" == x"alpine" ]]; then
+        service znode start
+    else
+        systemctl start znode
+    fi
+    if [[ $? == 0 ]]; then
+        echo -e "${green}Đã quay lại bản trước. Dùng znode version và znode log để kiểm tra.${plain}"
+        return 0
+    fi
+    echo -e "${red}Không thể khởi động lại ZNode sau rollback. Hãy dùng znode log.${plain}"
+    return 1
+}
+
 config() {
     echo "znode sẽ tự khởi động lại sau khi bạn chỉnh sửa cấu hình"
     nano /etc/znode/config.json
@@ -536,6 +565,7 @@ show_usage() {
     echo "znode generate     - Tạo tệp cấu hình znode"
     echo "znode update       - Cập nhật znode"
     echo "znode update x.x.x - Cài phiên bản znode chỉ định"
+    echo "znode rollback     - Quay lại bản znode trước đó"
     echo "znode install      - Cài đặt znode"
     echo "znode uninstall    - Gỡ cài đặt znode"
     echo "znode version      - Xem phiên bản znode"
@@ -603,6 +633,7 @@ if [[ $# > 0 ]]; then
         "disable") check_install 0 && disable 0 ;;
         "log") check_install 0 && show_log 0 ;;
         "update") check_install 0 && update 0 $2 ;;
+        "rollback") check_install 0 && rollback 0 ;;
         "config") config $* ;;
         "generate") generate_config_file ;;
         "install") check_uninstall 0 && install 0 ;;

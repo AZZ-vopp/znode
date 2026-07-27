@@ -500,6 +500,11 @@ EOF
 install_znode() {
     local version_param="$1"
     if [[ -e /usr/local/znode/ ]]; then
+        # Keep one known-good binary for an instant rollback after an update.
+        # Configuration lives in /etc/znode and is intentionally not copied.
+        rm -rf /usr/local/znode.previous/
+        mkdir -p /usr/local/znode.previous/
+        cp -a /usr/local/znode/. /usr/local/znode.previous/
         rm -rf /usr/local/znode/
     fi
 
@@ -645,6 +650,7 @@ EOF
     echo "znode generate     - Tạo tệp cấu hình znode"
     echo "znode update       - Cập nhật znode"
     echo "znode update x.x.x - Cập nhật znode lên phiên bản chỉ định"
+    echo "znode rollback     - Quay lại bản znode trước đó"
     echo "znode install      - Cài đặt znode"
     echo "znode uninstall    - Gỡ cài đặt znode"
     echo "znode version      - Xem phiên bản znode"
