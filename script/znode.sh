@@ -480,11 +480,11 @@ generate_znode_config() {
     },
     "ConnectionConfig": {
         "Handshake": 4,
-        "ConnIdle": 30,
+        "ConnIdle": 120,
         "UplinkOnly": 2,
         "DownlinkOnly": 4,
-        "BufferSize": 16,
-        "DisableUDPContentSniffing": true
+        "BufferSize": 128,
+        "DisableUDPContentSniffing": false
     },
     "Nodes": [
         {

@@ -111,6 +111,28 @@ EOF
     chmod 755 "$schedule_dir/znode-log-cleanup"
 }
 
+# Upgrade only the previous low-memory defaults. Values that the operator has
+# customized are intentionally left untouched.
+migrate_tiktok_compat_profile() {
+    local config_file="/etc/znode/config.json"
+    local temporary
+    [[ -f "$config_file" ]] || return 0
+    if ! grep -Eq '"ConnIdle"[[:space:]]*:[[:space:]]*30([[:space:]]*,)|"BufferSize"[[:space:]]*:[[:space:]]*16([[:space:]]*,)|"DisableUDPContentSniffing"[[:space:]]*:[[:space:]]*true' "$config_file"; then
+        return 0
+    fi
+    temporary=$(mktemp "${config_file}.XXXXXX") || return 1
+
+    sed -E \
+        -e 's/"ConnIdle"[[:space:]]*:[[:space:]]*30[[:space:]]*,/"ConnIdle": 120,/' \
+        -e 's/"BufferSize"[[:space:]]*:[[:space:]]*16[[:space:]]*,/"BufferSize": 128,/' \
+        -e 's/"DisableUDPContentSniffing"[[:space:]]*:[[:space:]]*true/"DisableUDPContentSniffing": false/' \
+        "$config_file" > "$temporary"
+
+    chmod 600 "$temporary"
+    mv -f "$temporary" "$config_file"
+    echo -e "${green}Đã nâng cấu hình UDP/QUIC để ổn định TikTok và video.${plain}"
+}
+
 parse_args() {
     while [[ $# -gt 0 ]]; do
         case "$1" in
@@ -397,11 +419,11 @@ generate_znode_config() {
     },
     "ConnectionConfig": {
         "Handshake": 4,
-        "ConnIdle": 30,
+        "ConnIdle": 120,
         "UplinkOnly": 2,
         "DownlinkOnly": 4,
-        "BufferSize": 16,
-        "DisableUDPContentSniffing": true
+        "BufferSize": 128,
+        "DisableUDPContentSniffing": false
     },
     "Nodes": [
         {
@@ -487,11 +509,11 @@ generate_znode_agent_config() {
     },
     "ConnectionConfig": {
         "Handshake": 4,
-        "ConnIdle": 30,
+        "ConnIdle": 120,
         "UplinkOnly": 2,
         "DownlinkOnly": 4,
-        "BufferSize": 16,
-        "DisableUDPContentSniffing": true
+        "BufferSize": 128,
+        "DisableUDPContentSniffing": false
     },
     "Agent": {
         "Enable": true,
@@ -645,9 +667,11 @@ EOF
             first_install=false
         else
             cp config.json /etc/znode/
+            migrate_tiktok_compat_profile
             first_install=true
         fi
     else
+        migrate_tiktok_compat_profile
         if [[ x"${release}" == x"alpine" ]]; then
             service znode start
         else
