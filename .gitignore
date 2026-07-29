@@ -1,0 +1,9 @@
+.DS_Store
+.env*
+config.json
+*.pem
+*.key
+*.p12
+*.log
+*.zip
+*.rar

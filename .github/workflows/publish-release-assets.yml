@@ -6,19 +6,65 @@ on:
       - 'v*'
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
   release:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - name: Verify release archives and generate checksums
+        shell: bash
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          archives=(release-assets/znode-linux-*.zip)
+          [[ ${#archives[@]} -eq 2 ]]
+          expected_files=$'LICENSE\nREADME.md\ngeoip.dat\ngeosite.dat\nznode'
+          for archive in "${archives[@]}"; do
+            size=$(wc -c < "$archive")
+            [[ "$size" =~ ^[0-9]+$ && "$size" -ge 1048576 && "$size" -le 268435456 ]]
+            if unzip -Z1 "$archive" | grep -Eq '(^/|(^|/)\.\.(/|$)|\\)'; then
+              echo "Unsafe archive path in $archive" >&2
+              exit 1
+            fi
+            files=$(unzip -Z1 "$archive" | sed 's#^\./##' | LC_ALL=C sort)
+            [[ "$files" == "$expected_files" ]]
+            work=$(mktemp -d)
+            unzip -q "$archive" -d "$work"
+            [[ -f "$work/znode" && ! -L "$work/znode" ]]
+            if find "$work" -type l -print -quit | grep -q .; then
+              echo "Symlink in $archive" >&2
+              exit 1
+            fi
+            [[ $(wc -c < "$work/geoip.dat") -ge 1024 ]]
+            [[ $(wc -c < "$work/geosite.dat") -ge 1024 ]]
+            if [[ "$archive" == *linux-64.zip ]]; then
+              chmod 0755 "$work/znode"
+              reported=$("$work/znode" version | awk 'NR==1 {print $2}')
+              [[ "${reported#v}" == "${GITHUB_REF_NAME#v}" ]]
+            fi
+            {
+              openssl dgst -md5 "$archive" | sed 's/([^)]*)//g'
+              openssl dgst -sha1 "$archive" | sed 's/([^)]*)//g'
+              openssl dgst -sha256 "$archive" | sed 's/([^)]*)//g'
+              openssl dgst -sha512 "$archive" | sed 's/([^)]*)//g'
+            } > "${archive}.dgst"
+          done
       - name: Publish binary archives
         env:
           GH_TOKEN: ${{ github.token }}
-        run: >-
-          gh release create "$GITHUB_REF_NAME"
-          release-assets/znode-linux-64.zip
-          release-assets/znode-linux-arm64-v8a.zip
-          --title "$GITHUB_REF_NAME"
-          --generate-notes
+        run: |
+          gh release create "$GITHUB_REF_NAME" \
+            release-assets/znode-linux-64.zip \
+            release-assets/znode-linux-64.zip.dgst \
+            release-assets/znode-linux-arm64-v8a.zip \
+            release-assets/znode-linux-arm64-v8a.zip.dgst \
+            --title "$GITHUB_REF_NAME" \
+            --generate-notes \
+            --verify-tag
