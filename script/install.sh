@@ -133,6 +133,59 @@ migrate_tiktok_compat_profile() {
     echo -e "${green}Đã nâng cấu hình UDP/QUIC để ổn định TikTok và video.${plain}"
 }
 
+# Bind every installed runtime to ZBoard. Existing ZNode configs are upgraded
+# in place, while an explicit incompatible type is never overwritten.
+ensure_zboard_config_type() {
+    local config_file="/etc/znode/config.json"
+    local temporary
+    [[ -f "$config_file" ]] || return 0
+
+    if grep -Eqi '"type"[[:space:]]*:' "$config_file"; then
+        if grep -Eqi '"type"[[:space:]]*:[[:space:]]*"zboard"' "$config_file"; then
+            return 0
+        fi
+        echo -e "${red}Cấu hình ZNode có type không tương thích; yêu cầu type=zboard.${plain}"
+        return 1
+    fi
+
+    temporary=$(mktemp "${config_file}.XXXXXX") || return 1
+    if ! awk '
+        BEGIN { inserted = 0 }
+        !inserted {
+            position = index($0, "{")
+            if (position > 0) {
+                print substr($0, 1, position)
+                print "    \"type\": \"zboard\","
+                remainder = substr($0, position + 1)
+                if (length(remainder) > 0) print remainder
+                inserted = 1
+                next
+            }
+        }
+        { print }
+        END { if (!inserted) exit 2 }
+    ' "$config_file" > "$temporary"; then
+        rm -f "$temporary"
+        echo -e "${red}Không thể thêm type=zboard vào cấu hình hiện tại.${plain}"
+        return 1
+    fi
+    if ! grep -Eqi '"type"[[:space:]]*:[[:space:]]*"zboard"' "$temporary"; then
+        rm -f "$temporary"
+        echo -e "${red}Không thể xác nhận type=zboard trong cấu hình mới.${plain}"
+        return 1
+    fi
+    chmod 600 "$temporary"
+    mv -f "$temporary" "$config_file"
+    echo -e "${green}Đã khóa cấu hình ZNode với type=zboard.${plain}"
+}
+
+reject_legacy_v2node_config() {
+    if [[ -f /etc/v2node/config.json && ! -f /etc/znode/config.json ]]; then
+        echo -e "${red}Không nhập cấu hình v2node cũ. Hãy cài mới bằng lệnh Agent do ZBoard cung cấp.${plain}"
+        return 1
+    fi
+}
+
 parse_args() {
     while [[ $# -gt 0 ]]; do
         case "$1" in
@@ -412,6 +465,7 @@ generate_znode_config() {
         mkdir -p /etc/znode >/dev/null 2>&1
         cat > /etc/znode/config.json <<EOF
 {
+    "type": "zboard",
     "Log": {
         "Level": "warning",
         "Output": "",
@@ -466,28 +520,6 @@ EOF
         fi
 }
 
-migrate_legacy_v2node() {
-    if [[ ! -f /etc/v2node/config.json || -f /etc/znode/config.json ]]; then
-        return 0
-    fi
-
-    echo -e "${yellow}Phát hiện cấu hình v2node cũ, đang chuyển sang ZNode...${plain}"
-    mkdir -p /etc/znode
-    cp -p /etc/v2node/config.json /etc/znode/config.json
-    chmod 600 /etc/znode/config.json
-    [[ -f /etc/v2node/release-repo ]] && cp -p /etc/v2node/release-repo /etc/znode/release-repo
-    [[ -f /etc/v2node/release-branch ]] && cp -p /etc/v2node/release-branch /etc/znode/release-branch
-
-    if [[ x"${release}" == x"alpine" ]]; then
-        service v2node stop >/dev/null 2>&1 || true
-        rc-update del v2node >/dev/null 2>&1 || true
-    else
-        systemctl stop v2node >/dev/null 2>&1 || true
-        systemctl disable v2node >/dev/null 2>&1 || true
-    fi
-    echo -e "${green}Đã giữ nguyên cấu hình và danh tính agent trong /etc/znode/config.json.${plain}"
-}
-
 generate_znode_agent_config() {
         local api_host="$1"
         local agent_id="$2"
@@ -502,6 +534,7 @@ generate_znode_agent_config() {
         mkdir -p /etc/znode >/dev/null 2>&1
         cat > /etc/znode/config.json <<EOF
 {
+    "type": "zboard",
     "Log": {
         "Level": "warning",
         "Output": "",
@@ -667,10 +700,12 @@ EOF
             first_install=false
         else
             cp config.json /etc/znode/
+            ensure_zboard_config_type || exit 1
             migrate_tiktok_compat_profile
             first_install=true
         fi
     else
+        ensure_zboard_config_type || exit 1
         migrate_tiktok_compat_profile
         if [[ x"${release}" == x"alpine" ]]; then
             service znode start
@@ -738,9 +773,8 @@ EOF
 parse_args "$@"
 validate_release_source
 validate_agent_args
-if declare -F migrate_legacy_v2node >/dev/null 2>&1; then
-    migrate_legacy_v2node
-fi
+reject_legacy_v2node_config || exit 1
+ensure_zboard_config_type || exit 1
 validate_existing_agent_binding
 echo -e "${green}Bắt đầu cài đặt${plain}"
 install_base

@@ -14,3 +14,6 @@ bash znode-install.sh --api-host 'https://your-panel.example.com' --agent-id 'AG
 
 Hãy sử dụng lệnh riêng được tạo trong trang quản trị ZBoard để điền đúng thông
 tin agent. Không chia sẻ agent token.
+
+ZNode chỉ kết nối với ZBoard. Mọi cấu hình hợp lệ đều có `"type": "zboard"`;
+binary cũ hoặc panel V2Board gốc không được chấp nhận.

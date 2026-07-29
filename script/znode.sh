@@ -473,6 +473,7 @@ generate_znode_config() {
         mkdir -p /etc/znode >/dev/null 2>&1
         cat > /etc/znode/config.json <<EOF
 {
+    "type": "zboard",
     "Log": {
         "Level": "warning",
         "Output": "",
