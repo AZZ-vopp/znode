@@ -1,6 +1,14 @@
 #!/bin/bash
 
 set -o pipefail
+umask 077
+
+# This installer runs as root. Resolve every helper from operating-system
+# directories only and prevent child Bash/dynamic-loader processes from
+# inheriting attacker-selected startup code from the invoking shell.
+PATH=/usr/sbin:/usr/bin:/sbin:/bin
+export PATH
+unset BASH_ENV ENV CDPATH GLOBIGNORE LD_PRELOAD LD_LIBRARY_PATH OPENSSL_CONF
 
 red='\033[0;31m'
 green='\033[0;32m'
@@ -205,6 +213,16 @@ migrate_tiktok_compat_profile() {
     echo -e "${green}Đã nâng cấu hình UDP/QUIC để ổn định TikTok và video.${plain}"
 }
 
+secure_znode_config_permissions() {
+    local config_file="/etc/znode/config.json"
+    [[ -e "$config_file" ]] || return 0
+    if [[ -L "$config_file" ]] || [[ ! -f "$config_file" ]]; then
+        echo -e "${red}Từ chối cấu hình ZNode không phải regular file.${plain}"
+        return 1
+    fi
+    chown root:root "$config_file" && chmod 600 "$config_file"
+}
+
 # Bind every installed runtime to ZBoard. Existing ZNode configs are upgraded
 # in place, while an explicit incompatible type is never overwritten.
 ensure_zboard_config_type() {
@@ -214,7 +232,8 @@ ensure_zboard_config_type() {
 
     if grep -Eqi '"type"[[:space:]]*:' "$config_file"; then
         if grep -Eqi '"type"[[:space:]]*:[[:space:]]*"zboard"' "$config_file"; then
-            return 0
+            secure_znode_config_permissions
+            return $?
         fi
         echo -e "${red}Cấu hình ZNode có type không tương thích; yêu cầu type=zboard.${plain}"
         return 1
@@ -248,6 +267,7 @@ ensure_zboard_config_type() {
     fi
     chmod 600 "$temporary"
     mv -f "$temporary" "$config_file"
+    secure_znode_config_permissions || return 1
     echo -e "${green}Đã khóa cấu hình ZNode với type=zboard.${plain}"
 }
 
@@ -667,7 +687,9 @@ generate_znode_agent_config() {
         "UplinkOnly": 2,
         "DownlinkOnly": 4,
         "BufferSize": 128,
-        "DisableUDPContentSniffing": false
+        "DisableUDPContentSniffing": false,
+        "MaxConnectionsPerUser": 128,
+        "MaxConnections": 32768
     },
     "Agent": {
         "Enable": true,
@@ -809,6 +831,65 @@ semver_key() {
     printf '%09d%09d%09d' "$major" "$minor" "${patch:-0}"
 }
 
+latest_release_version() {
+    local repository="$1"
+    local metadata version
+    metadata=$(curl --fail --location --silent --show-error --retry 3 --connect-timeout 15 \
+        --proto '=https' --tlsv1.2 \
+        "https://api.github.com/repos/${repository}/releases/latest") || return 1
+    version=$(printf '%s\n' "$metadata" | awk -F'"' '/"tag_name":/ {print $4; exit}')
+    validate_release_version "$version" || return 1
+    printf '%s\n' "$version"
+}
+
+download_verified_script_asset() {
+    local repository="$1"
+    local version="$2"
+    local asset_name="$3"
+    local destination="$4"
+    local metadata expected actual asset_url asset_size
+
+    validate_release_version "$version" || return 1
+    case "$asset_name" in
+        install.sh|znode.sh) ;;
+        *) return 1 ;;
+    esac
+
+    metadata=$(curl --fail --location --silent --show-error --retry 3 --connect-timeout 15 \
+        --proto '=https' --tlsv1.2 \
+        "https://api.github.com/repos/${repository}/releases/tags/${version}") || return 1
+    expected=$(printf '%s\n' "$metadata" | awk -v asset="$asset_name" '
+        /"name":/ { selected = index($0, "\"" asset "\"") > 0 }
+        selected && /"digest": "sha256:/ {
+            value=$0
+            sub(/^.*"digest": "sha256:/, "", value)
+            sub(/".*$/, "", value)
+            print tolower(value)
+            exit
+        }
+    ')
+    if [[ ! "$expected" =~ ^[a-f0-9]{64}$ ]]; then
+        echo -e "${red}Release ${version} không công bố SHA-256 cho ${asset_name}; từ chối chạy script đặc quyền.${plain}"
+        return 1
+    fi
+
+    asset_url="https://github.com/${repository}/releases/download/${version}/${asset_name}"
+    if ! curl --fail --location --silent --show-error --retry 3 --connect-timeout 15 \
+        --proto '=https' --tlsv1.2 "$asset_url" -o "$destination"; then
+        rm -f "$destination"
+        return 1
+    fi
+    asset_size=$(wc -c < "$destination" | tr -d '[:space:]')
+    actual=$(sha256_file "$destination")
+    if [[ ! "$asset_size" =~ ^[0-9]+$ ]] || (( asset_size < 1024 || asset_size > 1048576 )) \
+        || [[ ! "$actual" =~ ^[a-f0-9]{64}$ ]] || [[ "$actual" != "$expected" ]] \
+        || ! bash -n "$destination"; then
+        rm -f "$destination"
+        echo -e "${red}Script ${asset_name} không vượt qua xác minh SHA-256/cú pháp; từ chối thực thi.${plain}"
+        return 1
+    fi
+}
+
 download_verified_release() {
     local version="$1"
     local archive="$2"
@@ -874,14 +955,13 @@ download_verified_release() {
 }
 
 install_manager_script() {
-    local temporary manager_url
+    local temporary manager_ref
     temporary=$(mktemp /usr/bin/.znode.XXXXXX) || return 1
-    manager_url="https://raw.githubusercontent.com/${RELEASE_REPO_ARG}/${last_version}/script/znode.sh"
-    if ! curl --fail --location --silent --show-error --retry 3 --connect-timeout 15 \
-        --proto '=https' --tlsv1.2 "$manager_url" -o "$temporary" \
-        || ! bash -n "$temporary"; then
+    manager_ref=$(latest_release_version "$RELEASE_REPO_ARG")
+    if [[ -z "$manager_ref" ]] \
+        || ! download_verified_script_asset "$RELEASE_REPO_ARG" "$manager_ref" znode.sh "$temporary"; then
         rm -f "$temporary"
-        echo -e "${red}Không tải được manager script hợp lệ từ đúng release ${last_version}.${plain}"
+        echo -e "${red}Không tải được manager đã xác minh từ release bảo mật mới nhất.${plain}"
         return 1
     fi
     if ! chmod 0755 "$temporary" || ! mv -f "$temporary" /usr/bin/znode; then
@@ -1027,10 +1107,10 @@ User=root
 Group=root
 Type=simple
 Environment=XRAY_LOCATION_ASSET=/etc/znode
-LimitAS=infinity
-LimitRSS=infinity
-LimitCORE=infinity
-LimitNOFILE=999999
+LimitNOFILE=262144
+TasksMax=8192
+MemoryHigh=80%
+MemoryMax=90%
 WorkingDirectory=/usr/local/znode/
 ExecStart=/usr/local/znode/znode server
 Restart=always

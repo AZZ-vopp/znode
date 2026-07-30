@@ -37,6 +37,15 @@ extract_function_before() {
 bash -n "$installer"
 bash -n "$manager"
 
+for privileged_script in "$installer" "$manager"; do
+    contains "$privileged_script" 'PATH=/usr/sbin:/usr/bin:/sbin:/bin'
+    contains "$privileged_script" 'unset BASH_ENV ENV CDPATH GLOBIGNORE LD_PRELOAD LD_LIBRARY_PATH OPENSSL_CONF'
+    contains "$privileged_script" 'umask 077'
+    if grep -Eq '^PATH=.*(/usr/local/bin|/usr/local/sbin)' "$privileged_script"; then
+        fail "privileged PATH contains /usr/local in $(basename "$privileged_script")"
+    fi
+done
+
 contains "$installer" '--agent-token-stdin'
 contains "$installer" '--agent-token is disabled because command-line secrets leak'
 contains "$installer" 'Legacy --node-id/--api-key enrollment is disabled'
@@ -64,20 +73,26 @@ contains "$installer" 'mv "$current_directory" "$previous_directory"'
 contains "$installer" 'restore_previous_runtime'
 contains "$installer" 'verify_runtime_checksum "$previous_directory"'
 contains "$installer" 'if ! ensure_zboard_config_type; then'
+contains "$installer" 'secure_znode_config_permissions'
+contains "$installer" 'chown root:root "$config_file" && chmod 600 "$config_file"'
+contains "$installer" 'LimitNOFILE=262144'
+contains "$installer" 'TasksMax=8192'
+contains "$installer" 'MemoryMax=90%'
 contains "$installer" 'rollback_activated_runtime "$had_previous"'
 contains "$installer" 'acquire_znode_operation_lock || exit 1'
 contains "$installer" 'trap release_znode_operation_lock EXIT'
 not_contains "$installer" 'if restore_previous_runtime; then'
 contains "$installer" 'update được đánh dấu thất bại'
-contains "$installer" 'manager_url="https://raw.githubusercontent.com/${RELEASE_REPO_ARG}/${last_version}/script/znode.sh"'
+contains "$installer" 'manager_ref=$(latest_release_version "$RELEASE_REPO_ARG")'
+contains "$installer" 'download_verified_script_asset "$RELEASE_REPO_ARG" "$manager_ref" znode.sh "$temporary"'
 contains "$installer" 'temporary=$(mktemp /usr/bin/.znode.XXXXXX)'
 contains "$installer" 'mv -f "$temporary" /usr/bin/znode'
 contains "$manager" '/usr/local/znode.previous/.znode.sha256'
 contains "$manager" "--proto '=https' --tlsv1.2"
 contains "$manager" 'target_version="$1"'
-contains "$manager" 'install_script_url="https://raw.githubusercontent.com/${release_repo}/${trusted_installer_ref}/script/install.sh"'
+contains "$manager" 'download_verified_script_asset "$release_repo" "$trusted_installer_ref" install.sh "$temporary"'
 contains "$manager" 'bash "$temporary" "$target_version" "$@"'
-contains "$manager" 'manager_script_url="https://raw.githubusercontent.com/${release_repo}/${manager_ref}/script/znode.sh"'
+contains "$manager" 'download_verified_script_asset "$release_repo" "$manager_ref" znode.sh "$temporary"'
 contains "$manager" 'temporary=$(mktemp /usr/bin/.znode.XXXXXX)'
 contains "$manager" 'mv -f "$temporary" /usr/bin/znode'
 contains "$manager" 'return "$update_status"'
@@ -91,11 +106,18 @@ contains "$release_workflow" 'actions/checkout@d23441a48e516b6c34aea4fa41551a30e
 contains "$release_workflow" 'persist-credentials: false'
 contains "$release_workflow" 'openssl dgst -sha256 "$archive"'
 contains "$release_workflow" '"${archive}.dgst"'
+contains "$release_workflow" 'script/install.sh'
+contains "$release_workflow" 'script/znode.sh'
 contains "$release_workflow" '--verify-tag'
 
 not_contains "$manager" 'bash <(curl'
 not_contains "$manager" '--no-check-certificate'
+not_contains "$manager" 'systemctl stop firewalld.service'
+not_contains "$manager" 'ufw disable'
+not_contains "$manager" 'iptables -P INPUT ACCEPT'
 not_contains "$manager" '${release_repo}/${target_version}/script/install.sh'
+not_contains "$manager" 'raw.githubusercontent.com'
+not_contains "$installer" 'raw.githubusercontent.com'
 not_contains "$installer" 'curl -sL "$url"'
 not_contains "$installer" 'sed "s|^\([[:space:]]*\"AgentToken\"'
 not_contains "$readme" "--agent-token 'AGENT_TOKEN'"
@@ -154,25 +176,45 @@ release_znode_operation_lock
 bash "$test_directory/lock-probe.sh" "$ZNODE_OPERATION_LOCK_FILE" >/dev/null 2>&1 \
     || fail 'operation lock was not reusable after release'
 
+eval "$(extract_function_before "$manager" validate_release_version sha256_file)"
+eval "$(extract_function_before "$manager" sha256_file latest_release_version)"
+eval "$(extract_function_before "$manager" latest_release_version download_verified_script_asset)"
+eval "$(extract_function_before "$manager" download_verified_script_asset run_installer)"
 eval "$(extract_function_before "$manager" run_installer install)"
 mkdir -p "$test_directory/mock-bin"
-printf '%s\n' \
-    '#!/usr/bin/env bash' \
-    'output=""' \
-    'url=""' \
-    'while [[ $# -gt 0 ]]; do' \
-    '  case "$1" in' \
-    '    -o) output="$2"; shift 2 ;;' \
-    '    https://*) url="$1"; shift ;;' \
-    '    *) shift ;;' \
-    '  esac' \
-    'done' \
-    'if [[ "$url" == *"/releases/latest" ]]; then' \
-    '  printf "{\"tag_name\":\"v9.9\"}\n"' \
-    'else' \
-    '  printf "%s\n" "$url" > "$RUN_INSTALLER_URL_CAPTURE"' \
-    '  printf "%s\n" "#!/usr/bin/env bash" "printf '\''%s\\n'\'' \"\$@\" > \"\$RUN_INSTALLER_CAPTURE\"" > "$output"' \
-    'fi' > "$test_directory/mock-bin/curl"
+cat > "$test_directory/mock-bin/curl" <<'MOCK_CURL'
+#!/usr/bin/env bash
+set -e
+output=""
+url=""
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -o) output="$2"; shift 2 ;;
+    https://*) url="$1"; shift ;;
+    *) shift ;;
+  esac
+done
+write_payload() {
+  {
+    printf '%s\n' '#!/usr/bin/env bash'
+    printf '%s\n' 'printf '\''%s\n'\'' "$@" > "$RUN_INSTALLER_CAPTURE"'
+    printf '# verified release fixture %.0s' {1..48}
+    printf '\n'
+  } > "$1"
+}
+if [[ "$url" == *"/releases/latest" ]]; then
+  printf '{"tag_name":"v9.9"}\n'
+elif [[ "$url" == *"/releases/tags/v9.9" ]]; then
+  fixture=$(mktemp)
+  write_payload "$fixture"
+  digest=$(openssl dgst -sha256 "$fixture" | awk '{print tolower($NF)}')
+  rm -f "$fixture"
+  printf '  "name": "install.sh",\n  "digest": "sha256:%s"\n' "$digest"
+else
+  printf '%s\n' "$url" > "$RUN_INSTALLER_URL_CAPTURE"
+  write_payload "$output"
+fi
+MOCK_CURL
 chmod 0755 "$test_directory/mock-bin/curl"
 release_repo='example/znode'
 red=''
@@ -181,7 +223,7 @@ export RUN_INSTALLER_URL_CAPTURE="$test_directory/installer-url"
 export RUN_INSTALLER_CAPTURE="$test_directory/installer-args"
 PATH="$test_directory/mock-bin:$PATH" run_installer v1.2 --release-repo example/znode \
     || fail 'trusted installer loader fixture failed'
-grep -Fq '/v9.9/script/install.sh' "$RUN_INSTALLER_URL_CAPTURE" \
+grep -Fq '/releases/download/v9.9/install.sh' "$RUN_INSTALLER_URL_CAPTURE" \
     || fail 'explicit target selected its own historical installer'
 [[ "$(sed -n '1p' "$RUN_INSTALLER_CAPTURE")" == 'v1.2' ]] \
     || fail 'explicit binary target was not passed as loader data'

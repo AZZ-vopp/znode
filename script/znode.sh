@@ -1,6 +1,14 @@
 #!/bin/bash
 
 set -o pipefail
+umask 077
+
+# The manager downloads and launches a privileged installer. Do not let an
+# inherited search path, Bash startup file or loader configuration replace the
+# system helpers or inject code into those child processes.
+PATH=/usr/sbin:/usr/bin:/sbin:/bin
+export PATH
+unset BASH_ENV ENV CDPATH GLOBIGNORE LD_PRELOAD LD_LIBRARY_PATH OPENSSL_CONF
 
 red='\033[0;31m'
 green='\033[0;32m'
@@ -168,8 +176,75 @@ before_show_menu() {
     show_menu
 }
 
+validate_release_version() {
+    [[ "$1" =~ ^v?[0-9]+\.[0-9]+(\.[0-9]+)?([-+_][A-Za-z0-9.-]+)?$ ]]
+}
+
+sha256_file() {
+    openssl dgst -sha256 "$1" 2>/dev/null | awk '{print tolower($NF)}'
+}
+
+latest_release_version() {
+    local repository="$1"
+    local metadata version
+    metadata=$(curl --fail --location --silent --show-error --retry 3 --connect-timeout 15 \
+        --proto '=https' --tlsv1.2 \
+        "https://api.github.com/repos/${repository}/releases/latest") || return 1
+    version=$(printf '%s\n' "$metadata" | awk -F'"' '/"tag_name":/ {print $4; exit}')
+    validate_release_version "$version" || return 1
+    printf '%s\n' "$version"
+}
+
+download_verified_script_asset() {
+    local repository="$1"
+    local version="$2"
+    local asset_name="$3"
+    local destination="$4"
+    local metadata expected actual asset_url asset_size
+
+    validate_release_version "$version" || return 1
+    case "$asset_name" in
+        install.sh|znode.sh) ;;
+        *) return 1 ;;
+    esac
+
+    metadata=$(curl --fail --location --silent --show-error --retry 3 --connect-timeout 15 \
+        --proto '=https' --tlsv1.2 \
+        "https://api.github.com/repos/${repository}/releases/tags/${version}") || return 1
+    expected=$(printf '%s\n' "$metadata" | awk -v asset="$asset_name" '
+        /"name":/ { selected = index($0, "\"" asset "\"") > 0 }
+        selected && /"digest": "sha256:/ {
+            value=$0
+            sub(/^.*"digest": "sha256:/, "", value)
+            sub(/".*$/, "", value)
+            print tolower(value)
+            exit
+        }
+    ')
+    if [[ ! "$expected" =~ ^[a-f0-9]{64}$ ]]; then
+        echo -e "${red}Release ${version} không công bố SHA-256 cho ${asset_name}; từ chối chạy script đặc quyền.${plain}"
+        return 1
+    fi
+
+    asset_url="https://github.com/${repository}/releases/download/${version}/${asset_name}"
+    if ! curl --fail --location --silent --show-error --retry 3 --connect-timeout 15 \
+        --proto '=https' --tlsv1.2 "$asset_url" -o "$destination"; then
+        rm -f "$destination"
+        return 1
+    fi
+    asset_size=$(wc -c < "$destination" | tr -d '[:space:]')
+    actual=$(sha256_file "$destination")
+    if [[ ! "$asset_size" =~ ^[0-9]+$ ]] || (( asset_size < 1024 || asset_size > 1048576 )) \
+        || [[ ! "$actual" =~ ^[a-f0-9]{64}$ ]] || [[ "$actual" != "$expected" ]] \
+        || ! bash -n "$destination"; then
+        rm -f "$destination"
+        echo -e "${red}Script ${asset_name} không vượt qua xác minh SHA-256/cú pháp; từ chối thực thi.${plain}"
+        return 1
+    fi
+}
+
 run_installer() {
-    local temporary status trusted_installer_ref install_script_url target_version=""
+    local temporary status trusted_installer_ref target_version=""
     if [[ $# -gt 0 && "$1" != --* ]]; then
         target_version="$1"
         shift
@@ -183,24 +258,15 @@ run_installer() {
     # code. Always run the loader from the latest trusted release so selecting
     # an older runtime cannot revive an installer without checksum/rollback
     # enforcement.
-    trusted_installer_ref=$(curl --fail --location --silent --show-error --retry 3 --connect-timeout 15 \
-        --proto '=https' --tlsv1.2 "https://api.github.com/repos/${release_repo}/releases/latest" \
-        | grep '"tag_name":' | sed -E 's/.*"([^"]+)".*/\1/')
-    if [[ ! "$trusted_installer_ref" =~ ^v?[0-9]+\.[0-9]+(\.[0-9]+)?([-+_][A-Za-z0-9.-]+)?$ ]]; then
+    trusted_installer_ref=$(latest_release_version "$release_repo")
+    if [[ -z "$trusted_installer_ref" ]]; then
         echo -e "${red}Không xác định được release tag hợp lệ cho installer.${plain}"
         return 1
     fi
-    install_script_url="https://raw.githubusercontent.com/${release_repo}/${trusted_installer_ref}/script/install.sh"
     temporary=$(mktemp) || return 1
-    if ! curl --fail --location --silent --show-error --retry 3 --connect-timeout 15 \
-        --proto '=https' --tlsv1.2 "$install_script_url" -o "$temporary"; then
+    if ! download_verified_script_asset "$release_repo" "$trusted_installer_ref" install.sh "$temporary"; then
         rm -f "$temporary"
-        echo -e "${red}Không tải được installer qua HTTPS.${plain}"
-        return 1
-    fi
-    if ! bash -n "$temporary"; then
-        rm -f "$temporary"
-        echo -e "${red}Installer tải về không phải Bash hợp lệ.${plain}"
+        echo -e "${red}Không tải được installer đã xác minh từ release bảo mật mới nhất.${plain}"
         return 1
     fi
     if [[ -n "$target_version" ]]; then
@@ -588,24 +654,19 @@ show_log() {
 }
 
 update_shell() {
-    local temporary manager_ref manager_script_url
-    manager_ref=$(curl --fail --location --silent --show-error --retry 3 --connect-timeout 15 \
-        --proto '=https' --tlsv1.2 "https://api.github.com/repos/${release_repo}/releases/latest" \
-        | grep '"tag_name":' | sed -E 's/.*"([^"]+)".*/\1/')
-    if [[ ! "$manager_ref" =~ ^v?[0-9]+\.[0-9]+(\.[0-9]+)?([-+_][A-Za-z0-9.-]+)?$ ]]; then
+    local temporary manager_ref
+    manager_ref=$(latest_release_version "$release_repo")
+    if [[ -z "$manager_ref" ]]; then
         echo -e "${red}Không xác định được release tag hợp lệ cho manager script.${plain}"
         return 1
     fi
     acquire_znode_operation_lock || return 1
     trap release_znode_operation_lock EXIT
-    manager_script_url="https://raw.githubusercontent.com/${release_repo}/${manager_ref}/script/znode.sh"
     temporary=$(mktemp /usr/bin/.znode.XXXXXX) || {
         release_znode_operation_lock
         return 1
     }
-    if ! curl --fail --location --silent --show-error --retry 3 --connect-timeout 15 \
-        --proto '=https' --tlsv1.2 "$manager_script_url" -o "$temporary" \
-        || ! bash -n "$temporary"; then
+    if ! download_verified_script_asset "$release_repo" "$manager_ref" znode.sh "$temporary"; then
         rm -f "$temporary"
         echo ""
         echo -e "${red}Tải script thất bại. Vui lòng kiểm tra kết nối tới GitHub.${plain}"
@@ -730,23 +791,6 @@ generate_config_file() {
     return 1
 }
 
-# Mở các cổng tường lửa
-open_ports() {
-    systemctl stop firewalld.service 2>/dev/null
-    systemctl disable firewalld.service 2>/dev/null
-    setenforce 0 2>/dev/null
-    ufw disable 2>/dev/null
-    iptables -P INPUT ACCEPT 2>/dev/null
-    iptables -P FORWARD ACCEPT 2>/dev/null
-    iptables -P OUTPUT ACCEPT 2>/dev/null
-    iptables -t nat -F 2>/dev/null
-    iptables -t mangle -F 2>/dev/null
-    iptables -F 2>/dev/null
-    iptables -X 2>/dev/null
-    netfilter-persistent save 2>/dev/null
-    echo -e "${green}Đã mở các cổng tường lửa thành công!${plain}"
-}
-
 show_usage() {
     echo "Cách sử dụng script quản lý znode: "
     echo "------------------------------------------"
@@ -791,12 +835,11 @@ show_menu() {
   ${green}11.${plain} Xem phiên bản znode
   ${green}12.${plain} Nâng cấp script quản lý znode
   ${green}13.${plain} Hướng dẫn enrollment Agent qua ZBoard
-  ${green}14.${plain} Mở toàn bộ cổng mạng trên VPS
-  ${green}15.${plain} Thoát script
+  ${green}14.${plain} Thoát script
  "
  # Có thể bổ sung chức năng mới vào menu phía trên
     show_status
-    echo && read -rp "Vui lòng chọn [0-15]: " num
+    echo && read -rp "Vui lòng chọn [0-14]: " num
 
     case "${num}" in
         0) config ;;
@@ -813,8 +856,7 @@ show_menu() {
         11) check_install && show_znode_version ;;
         12) update_shell ;;
         13) generate_config_file ;;
-        14) open_ports ;;
-        15) exit ;;
+        14) exit ;;
         *) echo -e "${red}Vui lòng nhập đúng một số từ 0 đến 15.${plain}" ;;
     esac
 }
