@@ -8,7 +8,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	stdnet "net"
 	"strconv"
 	"strings"
 	"time"
@@ -23,11 +22,6 @@ import (
 
 type NetworkSettingsProxyProtocol struct {
 	AcceptProxyProtocol bool `json:"acceptProxyProtocol"`
-}
-
-func isLoopbackListener(value string) bool {
-	ip := stdnet.ParseIP(strings.Trim(strings.TrimSpace(value), "[]"))
-	return ip != nil && ip.IsLoopback()
 }
 
 func (v *V2Core) removeInbound(tag string) error {
@@ -110,9 +104,6 @@ func buildInbound(nodeInfo *panel.NodeInfo, tag string) (*core.InboundHandlerCon
 			return nil, fmt.Errorf("unmarshal network settings error: %s", err)
 		}
 		if n.AcceptProxyProtocol {
-			if !isLoopbackListener(nodeInfo.Common.ListenIP) {
-				return nil, errors.New("PROXY protocol is allowed only on a numeric loopback listener behind a local trusted proxy")
-			}
 			if in.StreamSetting == nil {
 				t := coreConf.TransportProtocol(nodeInfo.Common.Network)
 				in.StreamSetting = &coreConf.StreamConfig{
@@ -130,9 +121,6 @@ func buildInbound(nodeInfo *panel.NodeInfo, tag string) (*core.InboundHandlerCon
 	}
 	// Set socket settings for trusted X-Forwarded-For headers
 	if len(nodeInfo.Common.TrustedXForwardedFor) > 0 {
-		if !isLoopbackListener(nodeInfo.Common.ListenIP) {
-			return nil, errors.New("trusted X-Forwarded-For headers are allowed only on a numeric loopback listener behind a local trusted proxy")
-		}
 		if in.StreamSetting == nil {
 			return nil, errors.New("stream settings must be configured to set trusted X-Forwarded-For headers")
 		}

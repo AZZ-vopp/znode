@@ -104,7 +104,7 @@ func TestBuildInboundRejectsUnknownSecurityMode(t *testing.T) {
 	}
 }
 
-func TestForwardedClientIPRequiresALoopbackOnlyListener(t *testing.T) {
+func TestForwardedClientIPAllowsConfiguredPublicOrLoopbackListener(t *testing.T) {
 	proxySettings := json.RawMessage(`{"acceptProxyProtocol":true}`)
 	for name, mutate := range map[string]func(*panel.CommonNode){
 		"proxy protocol": func(common *panel.CommonNode) {
@@ -124,8 +124,8 @@ func TestForwardedClientIPRequiresALoopbackOnlyListener(t *testing.T) {
 			mutate(common)
 			if _, err := buildInbound(&panel.NodeInfo{
 				Type: "vmess", Security: panel.None, Common: common,
-			}, "public-listener"); err == nil {
-				t.Fatal("client-controlled source IP was accepted on a public listener")
+			}, "public-listener"); err != nil {
+				t.Fatalf("configured public listener was rejected: %v", err)
 			}
 
 			common.ListenIP = "127.0.0.1"
