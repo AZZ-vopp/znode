@@ -60,3 +60,83 @@ func TestMonitorSignalsUntilRevisionIsApplied(t *testing.T) {
 	default:
 	}
 }
+
+func TestMonitorKeepsCurrentNodesUntilAuthorizationDenialIsPersistent(t *testing.T) {
+	reloadCh := make(chan struct{}, 1)
+	fetcher := &fakeManifestFetcher{manifest: &panel.AgentManifest{
+		Revision:             "authorization-revoked:401",
+		Nodes:                []int{},
+		AuthorizationRevoked: true,
+	}}
+	monitor := newMonitor(reloadCh, func(conf.AgentConfig) (manifestFetcher, error) {
+		return fetcher, nil
+	})
+	defer monitor.Close()
+
+	config := conf.AgentConfig{Enable: true, APIHost: "https://panel.example", AgentID: "agent", AgentToken: "token", PollInterval: 15}
+	if err := monitor.MarkApplied(config, Assignment{Revision: "healthy-revision"}); err != nil {
+		t.Fatal(err)
+	}
+
+	for attempt := 1; attempt < authorizationRevocationThreshold; attempt++ {
+		if err := monitor.pollOnce(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+		select {
+		case <-reloadCh:
+			t.Fatalf("transient authorization denial %d stopped healthy nodes", attempt)
+		default:
+		}
+	}
+
+	if err := monitor.pollOnce(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-reloadCh:
+	default:
+		t.Fatal("persistent authorization revocation did not trigger reconciliation")
+	}
+}
+
+func TestMonitorResetsAuthorizationDenialsAfterAHealthyManifest(t *testing.T) {
+	reloadCh := make(chan struct{}, 1)
+	fetcher := &fakeManifestFetcher{manifest: &panel.AgentManifest{
+		Revision:             "authorization-revoked:403",
+		Nodes:                []int{},
+		AuthorizationRevoked: true,
+	}}
+	monitor := newMonitor(reloadCh, func(conf.AgentConfig) (manifestFetcher, error) {
+		return fetcher, nil
+	})
+	defer monitor.Close()
+
+	config := conf.AgentConfig{Enable: true, APIHost: "https://panel.example", AgentID: "agent", AgentToken: "token", PollInterval: 15}
+	if err := monitor.MarkApplied(config, Assignment{Revision: "healthy-revision"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := monitor.pollOnce(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+
+	fetcher.manifest = &panel.AgentManifest{Revision: "healthy-revision", Nodes: []int{1}}
+	if err := monitor.pollOnce(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+
+	fetcher.manifest = &panel.AgentManifest{
+		Revision:             "authorization-revoked:403",
+		Nodes:                []int{},
+		AuthorizationRevoked: true,
+	}
+	for attempt := 1; attempt < authorizationRevocationThreshold; attempt++ {
+		if err := monitor.pollOnce(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+		select {
+		case <-reloadCh:
+			t.Fatalf("denial counter was not reset after a healthy response (attempt %d)", attempt)
+		default:
+		}
+	}
+}

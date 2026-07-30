@@ -51,6 +51,12 @@ type manifestFetcher interface {
 	GetManifest(context.Context) (*panel.AgentManifest, error)
 }
 
+// A panel deploy can briefly return 401/403 while PHP workers and route/config
+// caches are being replaced. Never tear down healthy inbounds because of one
+// transient denial; a genuinely revoked Agent remains denied and reaches this
+// threshold on the following polls.
+const authorizationRevocationThreshold = 3
+
 type fetcherFactory func(conf.AgentConfig) (manifestFetcher, error)
 
 func defaultFetcherFactory(config conf.AgentConfig) (manifestFetcher, error) {
@@ -62,19 +68,20 @@ func defaultFetcherFactory(config conf.AgentConfig) (manifestFetcher, error) {
 // applied revision. MarkApplied is intentionally separate so a failed reload
 // is retried while the healthy old runtime keeps serving traffic.
 type Monitor struct {
-	mu              sync.RWMutex
-	config          conf.AgentConfig
-	fetcher         manifestFetcher
-	factory         fetcherFactory
-	appliedRevision string
-	pollInterval    time.Duration
-	generation      uint64
-	reloadCh        chan<- struct{}
-	wake            chan struct{}
-	stop            chan struct{}
-	done            chan struct{}
-	startOnce       sync.Once
-	closeOnce       sync.Once
+	mu                   sync.RWMutex
+	config               conf.AgentConfig
+	fetcher              manifestFetcher
+	factory              fetcherFactory
+	appliedRevision      string
+	authorizationDenials int
+	pollInterval         time.Duration
+	generation           uint64
+	reloadCh             chan<- struct{}
+	wake                 chan struct{}
+	stop                 chan struct{}
+	done                 chan struct{}
+	startOnce            sync.Once
+	closeOnce            sync.Once
 }
 
 func NewMonitor(reloadCh chan<- struct{}) *Monitor {
@@ -114,6 +121,7 @@ func (m *Monitor) MarkApplied(config conf.AgentConfig, assignment Assignment) er
 	m.config = config
 	m.fetcher = fetcher
 	m.appliedRevision = assignment.Revision
+	m.authorizationDenials = 0
 	m.pollInterval = pollInterval
 	m.generation++
 	m.mu.Unlock()
@@ -207,6 +215,20 @@ func (m *Monitor) pollOnce(ctx context.Context) error {
 		return nil
 	}
 	m.pollInterval = interval
+	if manifest.AuthorizationRevoked {
+		m.authorizationDenials++
+		if m.authorizationDenials < authorizationRevocationThreshold {
+			denials := m.authorizationDenials
+			m.mu.Unlock()
+			log.WithFields(log.Fields{
+				"attempt":  denials,
+				"required": authorizationRevocationThreshold,
+			}).Warn("Agent authorization was temporarily denied; keeping current nodes")
+			return nil
+		}
+	} else {
+		m.authorizationDenials = 0
+	}
 	changed := revision != m.appliedRevision
 	m.mu.Unlock()
 
