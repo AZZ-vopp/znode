@@ -1,6 +1,7 @@
 package core
 
 import (
+	"fmt"
 	"sync"
 
 	panel "github.com/AZZ-vopp/znode/api/v2board"
@@ -37,15 +38,17 @@ type V2Core struct {
 }
 
 type UserMap struct {
-	uidMap  map[string]int
-	mapLock sync.RWMutex
+	uidMap   map[string]int
+	quiesced map[string]struct{}
+	mapLock  sync.RWMutex
 }
 
 func New(config *conf.Conf) *V2Core {
 	core := &V2Core{
 		Config: config,
 		users: &UserMap{
-			uidMap: make(map[string]int),
+			uidMap:   make(map[string]int),
+			quiesced: make(map[string]struct{}),
 		},
 	}
 	return core
@@ -54,7 +57,11 @@ func New(config *conf.Conf) *V2Core {
 func (v *V2Core) Start(infos []*panel.NodeInfo) error {
 	v.access.Lock()
 	defer v.access.Unlock()
-	v.Server = getCore(v.Config, infos)
+	server, err := getCore(v.Config, infos)
+	if err != nil {
+		return err
+	}
+	v.Server = server
 	if err := v.Server.Start(); err != nil {
 		return err
 	}
@@ -67,19 +74,29 @@ func (v *V2Core) Start(infos []*panel.NodeInfo) error {
 func (v *V2Core) Close() error {
 	v.access.Lock()
 	defer v.access.Unlock()
+	if v.Server == nil {
+		return nil
+	}
+	// Keep every handle intact until Xray confirms that all features closed.
+	// The caller can then retry a failed close without dereferencing a core that
+	// this method prematurely marked as gone.
+	if err := v.Server.Close(); err != nil {
+		return err
+	}
 	v.Config = nil
 	v.ihm = nil
 	v.ohm = nil
 	v.dispatcher = nil
-	err := v.Server.Close()
-	if err != nil {
-		return err
-	}
+	v.Server = nil
 	return nil
 }
 
-func getCore(c *conf.Conf, infos []*panel.NodeInfo) *core.Instance {
+func getCore(c *conf.Conf, infos []*panel.NodeInfo) (*core.Instance, error) {
 	dispatcher.ConfigureUDPContentSniffing(c.ConnectionConfig.DisableUDPContentSniffing)
+	dispatcher.ConfigureSessionLimits(
+		c.ConnectionConfig.MaxConnectionsPerUser,
+		c.ConnectionConfig.MaxConnections,
+	)
 	// Log Config
 	coreLogConfig := &coreConf.LogConfig{
 		LogLevel:  c.LogConfig.Level,
@@ -89,7 +106,7 @@ func getCore(c *conf.Conf, infos []*panel.NodeInfo) *core.Instance {
 	// Custom config
 	dnsConfig, outBoundConfig, routeConfig, err := GetCustomConfig(infos)
 	if err != nil {
-		log.WithField("err", err).Panic("failed to build custom config")
+		return nil, fmt.Errorf("build custom config: %w", err)
 	}
 	// Inbound config
 	var inBoundConfig []*core.InboundHandlerConfig
@@ -124,8 +141,8 @@ func getCore(c *conf.Conf, infos []*panel.NodeInfo) *core.Instance {
 	}
 	server, err := core.New(config)
 	if err != nil {
-		log.WithField("err", err).Panic("failed to create instance")
+		return nil, fmt.Errorf("create core instance: %w", err)
 	}
 	log.Info("Xray Core Version: ", core.Version())
-	return server
+	return server, nil
 }

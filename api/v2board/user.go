@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
+	"net/http"
 	"strings"
 
 	"encoding/json/jsontext"
@@ -37,6 +39,10 @@ type AliveMap struct {
 	Alive map[int]int `json:"alive"`
 }
 
+const maxPanelUsers = 200000
+const maxPanelUserResponseBytes int64 = 64 << 20
+const trafficCapabilityPath = "/api/v1/server/UniProxy/capability"
+
 // GetUserList will pull user from v2board
 func (c *Client) GetUserList(ctx context.Context) ([]UserInfo, error) {
 	const path = "/api/v1/server/UniProxy/user"
@@ -55,81 +61,244 @@ func (c *Client) GetUserList(ctx context.Context) ([]UserInfo, error) {
 	defer r.RawResponse.Body.Close()
 
 	if r.StatusCode() == 304 {
-		return nil, nil
+		if c.UserList == nil || c.UserList.Users == nil {
+			return nil, fmt.Errorf("get user list: panel returned not-modified before a complete user snapshot")
+		}
+		// Return the last complete desired state instead of a nil sentinel. The
+		// controller may have failed after fetching the preceding 200 response
+		// (for example while reading alive state); replaying this snapshot makes
+		// revocations retry even though the panel correctly answers 304 next time.
+		return cloneUserList(c.UserList.Users), nil
 	}
+	if r.StatusCode() < http.StatusOK || r.StatusCode() >= http.StatusMultipleChoices {
+		return nil, fmt.Errorf("get user list: panel returned HTTP %d", r.StatusCode())
+	}
+	if r.RawResponse.ContentLength > maxPanelUserResponseBytes {
+		return nil, fmt.Errorf("decode user list error: response is too large")
+	}
+	body := &io.LimitedReader{R: r.RawResponse.Body, N: maxPanelUserResponseBytes + 1}
 	// Keep an empty response distinguishable from a 304 response. A nil slice
 	// means "not modified" to the node task, while a non-nil empty slice means
 	// that the panel intentionally removed every user (for example, the last
 	// banned device).
 	userlist := &UserListBody{Users: make([]UserInfo, 0)}
 	if strings.Contains(r.Header().Get("Content-Type"), "application/x-msgpack") {
-		decoder := msgpack.NewDecoder(r.RawResponse.Body)
-		if err := decoder.Decode(userlist); err != nil {
-			return nil, fmt.Errorf("decode user list error: %w", err)
-		}
-	} else {
-		dec := jsontext.NewDecoder(r.RawResponse.Body)
-		for {
-			tok, err := dec.ReadToken()
-			if err != nil {
-				return nil, fmt.Errorf("decode user list error: %w", err)
-			}
-			if tok.Kind() == '"' && tok.String() == "users" {
-				break
-			}
-		}
-		tok, err := dec.ReadToken()
+		users, err := decodeMsgpackUserList(msgpack.NewDecoder(body))
 		if err != nil {
 			return nil, fmt.Errorf("decode user list error: %w", err)
 		}
-		if tok.Kind() != '[' {
-			return nil, fmt.Errorf(`decode user list error: expected "users" array`)
+		userlist.Users = users
+	} else {
+		users, err := decodeJSONUserList(jsontext.NewDecoder(body))
+		if err != nil {
+			return nil, fmt.Errorf("decode user list error: %w", err)
 		}
-		for dec.PeekKind() != ']' {
-			val, err := dec.ReadValue()
-			if err != nil {
-				return nil, fmt.Errorf("decode user list error: read user object: %w", err)
-			}
-			var u UserInfo
-			if err := json.Unmarshal(val, &u); err != nil {
-				return nil, fmt.Errorf("decode user list error: unmarshal user error: %w", err)
-			}
-			userlist.Users = append(userlist.Users, u)
-		}
+		userlist.Users = users
 	}
-	c.userEtag = r.Header().Get("ETag")
+	if body.N <= 0 {
+		return nil, fmt.Errorf("decode user list error: response is too large")
+	}
 	if userlist.Users == nil {
 		userlist.Users = make([]UserInfo, 0)
 	}
-	return userlist.Users, nil
+	if err := validateUserList(userlist.Users); err != nil {
+		return nil, err
+	}
+	etag := strings.TrimSpace(r.Header().Get("ETag"))
+	if len(etag) > 512 || strings.IndexFunc(etag, func(r rune) bool { return r < 0x20 || r == 0x7f }) >= 0 {
+		return nil, fmt.Errorf("get user list: panel returned an invalid ETag")
+	}
+	// Commit the validator and replay snapshot together only after the complete
+	// body passed all bounds and semantic validation.
+	c.userEtag = etag
+	c.UserList = &UserListBody{Users: cloneUserList(userlist.Users)}
+	return cloneUserList(userlist.Users), nil
+}
+
+func cloneUserList(users []UserInfo) []UserInfo {
+	cloned := make([]UserInfo, len(users))
+	copy(cloned, users)
+	return cloned
+}
+
+func decodeJSONUserList(decoder *jsontext.Decoder) ([]UserInfo, error) {
+	token, err := decoder.ReadToken()
+	if err != nil {
+		return nil, err
+	}
+	if token.Kind() != '{' {
+		return nil, fmt.Errorf("expected user-list object")
+	}
+	users := make([]UserInfo, 0)
+	found := false
+	fields := 0
+	for decoder.PeekKind() != '}' {
+		if fields >= 64 {
+			return nil, fmt.Errorf("too many user-list fields")
+		}
+		fields++
+		key, err := decoder.ReadToken()
+		if err != nil {
+			return nil, err
+		}
+		if key.Kind() != '"' || len(key.String()) > 64 {
+			return nil, fmt.Errorf("invalid user-list field")
+		}
+		if key.String() != "users" {
+			if err := decoder.SkipValue(); err != nil {
+				return nil, err
+			}
+			continue
+		}
+		if found {
+			return nil, fmt.Errorf("duplicate users field")
+		}
+		found = true
+		arrayStart, err := decoder.ReadToken()
+		if err != nil {
+			return nil, err
+		}
+		if arrayStart.Kind() != '[' {
+			return nil, fmt.Errorf(`expected "users" array`)
+		}
+		for decoder.PeekKind() != ']' {
+			if len(users) >= maxPanelUsers {
+				return nil, fmt.Errorf("too many users")
+			}
+			var user UserInfo
+			if err := json.UnmarshalDecode(decoder, &user); err != nil {
+				return nil, fmt.Errorf("decode user: %w", err)
+			}
+			users = append(users, user)
+		}
+		if _, err := decoder.ReadToken(); err != nil {
+			return nil, err
+		}
+	}
+	if _, err := decoder.ReadToken(); err != nil {
+		return nil, err
+	}
+	if !found {
+		return nil, fmt.Errorf("missing users field")
+	}
+	if _, err := decoder.ReadToken(); !errors.Is(err, io.EOF) {
+		if err == nil {
+			return nil, fmt.Errorf("trailing JSON value")
+		}
+		return nil, err
+	}
+	return users, nil
+}
+
+func decodeMsgpackUserList(decoder *msgpack.Decoder) ([]UserInfo, error) {
+	fieldCount, err := decoder.DecodeMapLen()
+	if err != nil {
+		return nil, err
+	}
+	if fieldCount < 0 || fieldCount > 64 {
+		return nil, fmt.Errorf("invalid user-list object")
+	}
+
+	var users []UserInfo
+	found := false
+	for index := 0; index < fieldCount; index++ {
+		key, err := decoder.DecodeString()
+		if err != nil {
+			return nil, err
+		}
+		if len(key) > 64 {
+			return nil, fmt.Errorf("invalid user-list field")
+		}
+		if key != "users" {
+			if err := decoder.Skip(); err != nil {
+				return nil, err
+			}
+			continue
+		}
+		if found {
+			return nil, fmt.Errorf("duplicate users field")
+		}
+		found = true
+		userCount, err := decoder.DecodeArrayLen()
+		if err != nil {
+			return nil, err
+		}
+		if userCount < 0 || userCount > maxPanelUsers {
+			return nil, fmt.Errorf("too many users")
+		}
+		users = make([]UserInfo, 0, userCount)
+		for userIndex := 0; userIndex < userCount; userIndex++ {
+			var user UserInfo
+			if err := decoder.Decode(&user); err != nil {
+				return nil, err
+			}
+			users = append(users, user)
+		}
+	}
+	if !found {
+		return nil, fmt.Errorf("missing users field")
+	}
+	if _, err := decoder.PeekCode(); !errors.Is(err, io.EOF) {
+		if err == nil {
+			return nil, fmt.Errorf("trailing msgpack value")
+		}
+		return nil, err
+	}
+	return users, nil
+}
+
+func validateUserList(users []UserInfo) error {
+	seenUUID := make(map[string]struct{}, len(users))
+	for index, user := range users {
+		uuid := strings.TrimSpace(user.Uuid)
+		if user.Id <= 0 || uuid == "" || len(uuid) > 512 {
+			return fmt.Errorf("invalid user at index %d", index)
+		}
+		if user.SpeedLimit < 0 || user.SpeedLimit > 1000000000 || user.DeviceLimit < 0 || user.DeviceLimit > 1000000 {
+			return fmt.Errorf("invalid limits for user at index %d", index)
+		}
+		if _, exists := seenUUID[uuid]; exists {
+			return fmt.Errorf("duplicate user credential at index %d", index)
+		}
+		seenUUID[uuid] = struct{}{}
+	}
+	return nil
 }
 
 // GetUserAlive will fetch the alive_ip count for users
 func (c *Client) GetUserAlive(ctx context.Context) (map[int]int, error) {
-	c.AliveMap = &AliveMap{}
 	const path = "/api/v1/server/UniProxy/alivelist"
 	r, err := c.client.R().
 		SetContext(ctx).
 		ForceContentType("application/json").
 		Get(path)
 	if err != nil {
-		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
-			return nil, err
-		}
-		c.AliveMap.Alive = make(map[int]int)
-		return c.AliveMap.Alive, nil
+		return nil, fmt.Errorf("get user alive list: %w", err)
 	}
-	if r == nil || r.RawResponse == nil || r.StatusCode() >= 399 {
-		c.AliveMap.Alive = make(map[int]int)
-		return c.AliveMap.Alive, nil
+	if r == nil || r.RawResponse == nil {
+		return nil, fmt.Errorf("get user alive list: panel returned no response")
+	}
+	if r.StatusCode() < http.StatusOK || r.StatusCode() >= http.StatusMultipleChoices {
+		return nil, fmt.Errorf("get user alive list: panel returned HTTP %d", r.StatusCode())
 	}
 	defer r.RawResponse.Body.Close()
-	if err := json.Unmarshal(r.Body(), c.AliveMap); err != nil {
-		fmt.Printf("unmarshal user alive list error: %s", err)
-		c.AliveMap.Alive = make(map[int]int)
+	next := &AliveMap{}
+	if err := json.Unmarshal(r.Body(), next); err != nil {
+		return nil, fmt.Errorf("decode user alive list: %w", err)
 	}
-
-	return c.AliveMap.Alive, nil
+	if next.Alive == nil {
+		next.Alive = make(map[int]int)
+	}
+	for uid, count := range next.Alive {
+		if uid <= 0 || count < 0 {
+			return nil, fmt.Errorf("decode user alive list: invalid entry")
+		}
+	}
+	// Publish a new fallback snapshot only after a complete, successful
+	// response. A transient 5xx or malformed body must not erase the previous
+	// conservative device count and silently weaken per-user limits.
+	c.AliveMap = next
+	return next.Alive, nil
 }
 
 type UserTraffic struct {
@@ -138,17 +307,76 @@ type UserTraffic struct {
 	Download int64
 }
 
+type trafficReportAck struct {
+	Data     bool   `json:"data"`
+	ReportID string `json:"report_id"`
+}
+
 // ReportUserTraffic reports the user traffic
-func (c *Client) ReportUserTraffic(ctx context.Context, userTraffic []UserTraffic) error {
+func (c *Client) ReportUserTraffic(ctx context.Context, reportID string, userTraffic []UserTraffic) error {
+	// Probe capability before the first state-changing request. Sending an
+	// immutable report to an older panel and discovering incompatibility only
+	// from its response is too late: that panel may already have charged the
+	// body without recording the report ID. Keep the durable spool intact
+	// until ZBoard protocol 2 is deployed.
+	if reportID != "" {
+		if err := c.requireTrafficProtocol2(ctx); err != nil {
+			return err
+		}
+	}
 	data := aggregateUserTraffic(userTraffic)
 	const path = "/api/v1/server/UniProxy/push"
-	_, err := c.client.R().
+	req := c.client.R().
 		SetContext(ctx).
 		SetBody(data).
 		ForceContentType("application/json").
-		Post(path)
+		SetHeader("X-ZNode-Traffic-Protocol", "2")
+	if reportID != "" {
+		req.SetHeader("X-ZNode-Traffic-Report-ID", reportID)
+	}
+	response, err := req.Post(path)
 	if err != nil {
 		return err
+	}
+	if response == nil || response.StatusCode() < http.StatusOK || response.StatusCode() >= http.StatusMultipleChoices {
+		if response == nil {
+			return fmt.Errorf("report user traffic: panel returned no response")
+		}
+		return fmt.Errorf("report user traffic: panel returned HTTP %d", response.StatusCode())
+	}
+	if reportID != "" {
+		contentType := strings.ToLower(strings.TrimSpace(strings.Split(response.Header().Get("Content-Type"), ";")[0]))
+		if contentType != "application/json" && !strings.HasSuffix(contentType, "+json") {
+			return fmt.Errorf("report user traffic: panel acknowledgement is not JSON")
+		}
+		var ack trafficReportAck
+		if err := json.Unmarshal(response.Body(), &ack); err != nil {
+			return fmt.Errorf("report user traffic: invalid panel acknowledgement: %w", err)
+		}
+		if ack.Data && ack.ReportID == reportID {
+			return nil
+		}
+		return fmt.Errorf("report user traffic: panel acknowledgement did not confirm report %s", reportID)
+	}
+	return nil
+}
+
+func (c *Client) requireTrafficProtocol2(ctx context.Context) error {
+	response, err := c.client.R().
+		SetContext(ctx).
+		SetHeader("Accept", "application/json").
+		Get(trafficCapabilityPath)
+	if err != nil {
+		return fmt.Errorf("check traffic protocol capability: %w", err)
+	}
+	if response == nil {
+		return fmt.Errorf("check traffic protocol capability: panel returned no response")
+	}
+	if response.StatusCode() < http.StatusOK || response.StatusCode() >= http.StatusMultipleChoices {
+		return fmt.Errorf("check traffic protocol capability: panel returned HTTP %d; upgrade ZBoard before ZNode", response.StatusCode())
+	}
+	if strings.TrimSpace(response.Header().Get("X-ZBoard-Traffic-Protocol")) != "2" {
+		return fmt.Errorf("check traffic protocol capability: ZBoard traffic protocol 2 is required")
 	}
 	return nil
 }
@@ -173,7 +401,7 @@ func aggregateUserTraffic(userTraffic []UserTraffic) map[int][]int64 {
 
 func (c *Client) ReportNodeOnlineUsers(ctx context.Context, data *map[int][]string) error {
 	const path = "/api/v1/server/UniProxy/alive"
-	_, err := c.client.R().
+	response, err := c.client.R().
 		SetContext(ctx).
 		SetBody(data).
 		ForceContentType("application/json").
@@ -181,6 +409,12 @@ func (c *Client) ReportNodeOnlineUsers(ctx context.Context, data *map[int][]stri
 
 	if err != nil {
 		return err
+	}
+	if response == nil || response.StatusCode() < http.StatusOK || response.StatusCode() >= http.StatusMultipleChoices {
+		if response == nil {
+			return fmt.Errorf("report online users: panel returned no response")
+		}
+		return fmt.Errorf("report online users: panel returned HTTP %d", response.StatusCode())
 	}
 
 	return nil

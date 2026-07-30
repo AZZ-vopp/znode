@@ -30,11 +30,14 @@ func TestReportNodeStatusSendsResourceTelemetryToAssignedNode(t *testing.T) {
 			t.Errorf("unexpected telemetry request: %s %s", request.Method, request.URL.Path)
 		}
 		query := request.URL.Query()
-		if query.Get("node_type") != "znode" || query.Get("node_id") != "31" || query.Get("agent_id") != "agent-a" {
+		if query.Get("node_type") != "znode" || query.Get("node_id") != "31" || query.Get("agent_id") != "" {
 			t.Errorf("unexpected telemetry query: %v", query)
 		}
 		if request.Header.Get("X-ZNode-Agent-ID") != "agent-a" || request.Header.Get("X-ZNode-Agent-Token") != "secret" {
 			t.Errorf("agent credentials were not sent")
+		}
+		if request.Header.Get("X-ZNode-Type") != conf.RequiredPanelType || query.Get("type") != conf.RequiredPanelType {
+			t.Errorf("ZBoard identity was not sent")
 		}
 		var got NodeStatus
 		if err := json.NewDecoder(request.Body).Decode(&got); err != nil {
@@ -70,7 +73,7 @@ func TestReportNodeStatusReturnsPanelFailure(t *testing.T) {
 	}))
 	defer server.Close()
 
-	client, err := New(&conf.NodeConfig{APIHost: server.URL, NodeID: 9, Key: "legacy-token"})
+	client, err := New(&conf.NodeConfig{APIHost: server.URL, NodeID: 9, Key: "agent-token", AgentID: "agent-a"})
 	if err != nil {
 		t.Fatal(err)
 	}

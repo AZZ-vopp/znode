@@ -35,7 +35,7 @@ func TestControllerPrepareAllowsEmptyUserList(t *testing.T) {
 	}))
 	defer server.Close()
 
-	nodeConfig := &conf.NodeConfig{APIHost: server.URL, NodeID: 12, Key: "legacy-token"}
+	nodeConfig := &conf.NodeConfig{APIHost: server.URL, NodeID: 12, Key: "agent-token", AgentID: "agent-a"}
 	client, err := panel.New(nodeConfig)
 	if err != nil {
 		t.Fatal(err)

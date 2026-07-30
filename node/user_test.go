@@ -41,3 +41,16 @@ func TestCompareUserListDeletesOnlyRequestedUUID(t *testing.T) {
 		t.Fatalf("deleting one UUID affected its sibling: deleted=%#v added=%#v modified=%#v", deleted, added, modified)
 	}
 }
+
+func TestOnlineUsersMeetingTrafficThresholdUsesAggregatedSnapshot(t *testing.T) {
+	online := []panel.OnlineUser{
+		{UID: 9, IP: "192.0.2.1"},
+		{UID: 10, IP: "192.0.2.2"},
+	}
+	trafficByUID := map[int]int64{9: 2_500, 10: 999}
+
+	got := onlineUsersMeetingTrafficThreshold(online, trafficByUID, 2)
+	if len(got) != 1 || got[0].UID != 9 {
+		t.Fatalf("expected only UID 9 to meet the online threshold, got %#v", got)
+	}
+}

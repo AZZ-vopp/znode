@@ -51,8 +51,10 @@ func TestReloadRestoresPreviousRuntimeWhenReplacementControllerFails(t *testing.
 	panel := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		switch r.URL.Path {
+		case "/api/v2/server/agent/config":
+			_, _ = w.Write([]byte(`{"panel_type":"zboard","revision":"test-revision","nodes":[12],"poll_interval":15}`))
 		case "/api/v2/server/config":
-			_, _ = w.Write([]byte(`{"listen_ip":"127.0.0.1","server_port":` + strconv.Itoa(occupiedPort) + `,"protocol":"vmess","network":"tcp","tls":0,"base_config":{"push_interval":60,"pull_interval":60}}`))
+			_, _ = w.Write([]byte(`{"panel_type":"zboard","listen_ip":"127.0.0.1","server_port":` + strconv.Itoa(occupiedPort) + `,"protocol":"vmess","network":"tcp","tls":0,"base_config":{"push_interval":60,"pull_interval":60}}`))
 		case "/api/v1/server/UniProxy/user":
 			_, _ = w.Write([]byte(`{"users":[]}`))
 		case "/api/v1/server/UniProxy/alivelist":
@@ -64,7 +66,7 @@ func TestReloadRestoresPreviousRuntimeWhenReplacementControllerFails(t *testing.
 	defer panel.Close()
 
 	configPath := filepath.Join(t.TempDir(), "config.json")
-	configJSON := `{"Nodes":[{"ApiHost":"` + panel.URL + `","NodeID":12,"ApiKey":"legacy"}]}`
+	configJSON := `{"type":"zboard","Agent":{"Enable":true,"ApiHost":"` + panel.URL + `","AgentID":"agent-a","AgentToken":"agent-token"}}`
 	if err := os.WriteFile(configPath, []byte(configJSON), 0600); err != nil {
 		t.Fatal(err)
 	}

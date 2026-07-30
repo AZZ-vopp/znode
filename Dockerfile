@@ -1,5 +1,5 @@
 # Build go
-FROM golang:1.26.1-alpine AS builder
+FROM golang:1.26.5-alpine AS builder
 WORKDIR /app
 COPY . .
 ENV CGO_ENABLED=0
@@ -21,10 +21,16 @@ FROM  alpine
 # Cài đặt các gói công cụ cần thiết
 RUN  apk --update --no-cache add tzdata ca-certificates \
     && cp /usr/share/zoneinfo/Asia/Shanghai /etc/localtime
-RUN mkdir /etc/znode/
+RUN mkdir /etc/znode/ \
+    && install -d -m 0700 /var/lib/znode
 COPY --from=builder /app/znode /usr/local/bin
 COPY --from=geodata /assets/geoip.dat /assets/geosite.dat /etc/znode/
 
 ENV XRAY_LOCATION_ASSET=/etc/znode
+
+# Immutable traffic batches live here until ZBoard durably acknowledges them.
+# Keeping this as a volume prevents an image/container replacement from
+# silently discarding traffic that was still awaiting delivery.
+VOLUME ["/var/lib/znode"]
 
 ENTRYPOINT [ "znode", "server", "--config", "/etc/znode/config.json"]

@@ -4,6 +4,7 @@ import (
 	"context"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -21,14 +22,17 @@ func TestAgentClientGetsManifestWithCredentials(t *testing.T) {
 		if got := r.Header.Get("X-ZNode-Agent-Token"); got != "top-secret" {
 			t.Fatalf("unexpected agent token header: %q", got)
 		}
+		if got := r.Header.Get("X-ZNode-Type"); got != conf.RequiredPanelType {
+			t.Fatalf("unexpected ZBoard type header: %q", got)
+		}
 		if got := r.Header.Get("Authorization"); got != "Bearer top-secret" {
 			t.Fatalf("unexpected authorization header: %q", got)
 		}
-		if got := r.URL.Query().Get("agent_id"); got != "agent-123" {
-			t.Fatalf("unexpected agent_id query: %q", got)
+		if got := r.URL.Query().Get("agent_id"); got != "" {
+			t.Fatalf("agent ID leaked into query string: %q", got)
 		}
 		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(`{"revision":"rev-9","nodes":[12,18],"poll_interval":7}`))
+		_, _ = w.Write([]byte(`{"panel_type":"zboard","revision":"rev-9","nodes":[12,18],"poll_interval":7}`))
 	}))
 	defer server.Close()
 
@@ -76,10 +80,10 @@ func TestAgentClientGetsManifestWithCredentials(t *testing.T) {
 }
 
 func TestAgentManifestValidationAndStableFallbackRevision(t *testing.T) {
-	if err := (&AgentManifest{Nodes: []int{2, 2}}).Validate(); err == nil {
+	if err := (&AgentManifest{PanelType: conf.RequiredPanelType, Nodes: []int{2, 2}}).Validate(); err == nil {
 		t.Fatal("expected duplicate node ID error")
 	}
-	if err := (&AgentManifest{Nodes: []int{0}}).Validate(); err == nil {
+	if err := (&AgentManifest{PanelType: conf.RequiredPanelType, Nodes: []int{0}}).Validate(); err == nil {
 		t.Fatal("expected invalid node ID error")
 	}
 
@@ -90,6 +94,9 @@ func TestAgentManifestValidationAndStableFallbackRevision(t *testing.T) {
 	}
 	if got := (&AgentManifest{PollInterval: 1}).EffectivePollInterval(15); got != 5*time.Second {
 		t.Fatalf("poll interval was not clamped: %s", got)
+	}
+	if err := (&AgentManifest{Nodes: []int{1}}).Validate(); err == nil {
+		t.Fatal("expected a manifest without the ZBoard panel type to be rejected")
 	}
 }
 
@@ -140,11 +147,17 @@ func TestLogicalNodeClientUsesAgentHeadersWithoutTokenQuery(t *testing.T) {
 		if got := r.Header.Get("X-ZNode-Agent-Token"); got != "top-secret" {
 			t.Fatalf("unexpected agent token header: %q", got)
 		}
+		if got := r.Header.Get("X-ZNode-Type"); got != conf.RequiredPanelType {
+			t.Fatalf("unexpected ZBoard type header: %q", got)
+		}
+		if got := r.URL.Query().Get("type"); got != conf.RequiredPanelType {
+			t.Fatalf("unexpected ZBoard type query: %q", got)
+		}
 		if got := r.URL.Query().Get("token"); got != "" {
 			t.Fatalf("agent token leaked into query string: %q", got)
 		}
-		if got := r.URL.Query().Get("agent_id"); got != "agent-123" {
-			t.Fatalf("unexpected agent ID query: %q", got)
+		if got := r.URL.Query().Get("agent_id"); got != "" {
+			t.Fatalf("agent ID leaked into query string: %q", got)
 		}
 		w.WriteHeader(http.StatusNoContent)
 	}))
@@ -165,5 +178,47 @@ func TestLogicalNodeClientUsesAgentHeadersWithoutTokenQuery(t *testing.T) {
 	}
 	if response.StatusCode() != http.StatusNoContent {
 		t.Fatalf("unexpected status: %d", response.StatusCode())
+	}
+}
+
+func TestLogicalNodeClientDoesNotLeakAgentTokenAcrossRedirects(t *testing.T) {
+	leaked := make(chan string, 1)
+	target := httptest.NewServer(http.HandlerFunc(func(_ http.ResponseWriter, request *http.Request) {
+		leaked <- request.Header.Get("X-ZNode-Agent-Token")
+	}))
+	defer target.Close()
+	redirector := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Location", target.URL)
+		w.WriteHeader(http.StatusFound)
+	}))
+	defer redirector.Close()
+
+	client, err := New(&conf.NodeConfig{
+		APIHost: redirector.URL, NodeID: 12, Key: "top-secret", AgentID: "agent-123",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := client.client.R().Get("/redirect"); err == nil {
+		t.Fatal("expected panel redirect to be rejected")
+	}
+	select {
+	case token := <-leaked:
+		t.Fatalf("redirect target received agent token %q", token)
+	default:
+	}
+}
+
+func TestAgentManifestRejectsResourceExhaustionPayloads(t *testing.T) {
+	manifest := &AgentManifest{PanelType: conf.RequiredPanelType, Nodes: make([]int, maxAgentNodes+1)}
+	if err := manifest.Validate(); err == nil {
+		t.Fatal("oversized agent assignment was accepted")
+	}
+	manifest = &AgentManifest{PanelType: conf.RequiredPanelType, Revision: strings.Repeat("x", 257)}
+	if err := manifest.Validate(); err == nil {
+		t.Fatal("oversized agent revision was accepted")
+	}
+	if got := (&AgentManifest{PollInterval: 999999}).EffectivePollInterval(15); got != time.Hour {
+		t.Fatalf("oversized polling interval was not capped: %s", got)
 	}
 }

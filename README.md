@@ -14,7 +14,7 @@ Redis.
 - Tối ưu bộ đếm traffic và UDP để giảm CPU/RAM.
 - Gửi CPU, RAM, disk và tốc độ mạng về ZBoard.
 - TLS tự ký và SHA-256 certificate pinning.
-- Hỗ trợ cấu hình node thủ công cũ khi Agent bị tắt.
+- Chỉ kết nối với ZBoard bằng nhận diện hai chiều, không chạy với V2Board gốc.
 
 Xem thêm [tài liệu Redis và tối ưu UDP](docs/ZNODE_REDIS_UDP_VI.md).
 
@@ -28,19 +28,26 @@ wget -N https://raw.githubusercontent.com/AZZ-vopp/znode/main/script/install.sh
 bash install.sh
 ```
 
-Cài agent bằng thông tin do ZBoard cấp:
+Cài agent bằng thông tin do ZBoard cấp. Token được đọc qua stdin để không xuất
+hiện trong shell history hoặc danh sách process:
 
 ```bash
-bash install.sh \
+read -rsp 'Agent token: ' ZNODE_AGENT_TOKEN; echo
+printf '%s\n' "$ZNODE_AGENT_TOKEN" | bash install.sh \
   --api-host https://panel.example.com \
   --agent-id AGENT_ID \
-  --agent-token AGENT_TOKEN \
+  --agent-token-stdin \
   --release-repo AZZ-vopp/znode \
   --release-branch main
+unset ZNODE_AGENT_TOKEN
 ```
 
 Installer lưu repository phát hành trong `/etc/znode/release-repo`; lệnh
 `znode update` sau này tiếp tục tải đúng binary từ `AZZ-vopp/znode`.
+Installer chỉ chấp nhận gói có tệp `.dgst`, kiểm tra SHA-256 trước khi giải nén
+và tải script qua HTTPS có kiểm tra chứng chỉ. Bản trước được giữ tại
+`/usr/local/znode.rollback` để có thể khôi phục nếu cần; không tắt kiểm tra TLS
+hoặc tự thay URL tải bằng nguồn không tin cậy.
 
 ## Biên dịch
 
@@ -66,6 +73,7 @@ Giữ cùng channel đã cấu hình trên panel, mặc định `v2board:device-
 
 Thông tin Agent được lưu tại `/etc/znode/config.json` với quyền `0600`. Không
 chia sẻ Agent token hoặc sao chép file này sang VPS khác.
+Mọi cấu hình hợp lệ phải có trường `"type": "zboard"` ở cấp cao nhất.
 
 ## Giấy phép
 
@@ -79,6 +87,10 @@ Các rule Xray dùng `geoip:` và `geosite:` cần đồng thời hai file
 Loyalsoldier, trình cài đặt xác thực file không rỗng rồi đặt chúng tại
 `/etc/znode`. Znode tự đặt `XRAY_LOCATION_ASSET` về thư mục chứa đủ hai file;
 Docker image cũng đóng gói sẵn dữ liệu vào `/etc/znode`.
+
+Khi chạy Docker, phải gắn volume bền vững vào `/var/lib/znode`, ví dụ
+`-v znode-data:/var/lib/znode`. Đây là nơi lưu batch traffic chưa được ZBoard
+xác nhận; không mount thư mục này sẽ làm mất batch đang chờ khi thay container.
 
 Có thể đổi nguồn tải khi cài bằng biến `ZNODE_GEODATA_URL`, ví dụ một mirror
 nội bộ có cấu trúc `.../geoip.dat` và `.../geosite.dat`.

@@ -3,14 +3,16 @@ package core
 import (
 	"context"
 	"encoding/base64"
+	"errors"
 	"fmt"
+	"math"
 	"strings"
+	"sync"
 	"time"
 
 	panel "github.com/AZZ-vopp/znode/api/v2board"
 	"github.com/AZZ-vopp/znode/common/counter"
 	"github.com/AZZ-vopp/znode/common/format"
-	"github.com/AZZ-vopp/znode/core/app/dispatcher"
 	"github.com/xtls/xray-core/common/protocol"
 	"github.com/xtls/xray-core/common/serial"
 	"github.com/xtls/xray-core/infra/conf"
@@ -43,74 +45,233 @@ func (v *V2Core) GetUserManager(tag string) (proxy.UserManager, error) {
 }
 
 func (vc *V2Core) DelUsers(users []panel.UserInfo, tag string, _ *panel.NodeInfo) error {
+	completed, err := vc.QuiesceUsers(users, tag)
+	if err != nil {
+		return err
+	}
+	vc.ForgetUsers(completed, tag)
+	return nil
+}
+
+// QuiesceNodeLinks drains all established sessions for an inbound without
+// mutating its user manager. Controller shutdown uses this after removing the
+// listener and before its final durable traffic capture.
+func (vc *V2Core) QuiesceNodeLinks(tag string) error {
+	if vc == nil || vc.dispatcher == nil || tag == "" {
+		return nil
+	}
+	return vc.dispatcher.QuiesceTag(tag)
+}
+
+// ReactivateNodeLinks removes the tag/user admission barriers installed by a
+// failed close after the inbound and its runtime users have been restored.
+func (vc *V2Core) ReactivateNodeLinks(tag string) {
+	if vc == nil || vc.dispatcher == nil || tag == "" {
+		return
+	}
+	vc.dispatcher.ReactivateTag(tag)
+}
+
+// QuiesceUsers prevents new sessions and closes current links while retaining
+// the UID mapping and counters for one final durable capture.
+func (vc *V2Core) QuiesceUsers(users []panel.UserInfo, tag string) ([]panel.UserInfo, error) {
 	userManager, err := vc.GetUserManager(tag)
 	if err != nil {
-		return fmt.Errorf("get user manager error: %s", err)
+		return nil, fmt.Errorf("get user manager error: %s", err)
 	}
-	var user string
-	vc.users.mapLock.Lock()
-	defer vc.users.mapLock.Unlock()
+	completed := make([]panel.UserInfo, 0, len(users))
+	var quiesceErrors error
 	for i := range users {
-		user = format.UserTag(tag, users[i].Uuid)
+		user := format.UserTag(tag, users[i].Uuid)
+		vc.users.mapLock.RLock()
+		_, alreadyQuiesced := vc.users.quiesced[user]
+		vc.users.mapLock.RUnlock()
+		if alreadyQuiesced {
+			completed = append(completed, users[i])
+			continue
+		}
+		// Install the rejection barrier before removing the runtime credential.
+		// Otherwise a session that finishes authentication in this small window
+		// can create a fresh link after the old links are closed.
+		quiesceErr := vc.dispatcher.QuiesceUser(user)
+		// QuiesceUser installs its fail-closed sentinel before it waits for old
+		// reads to drain. Include this credential even on a timeout so a core
+		// rebuild cannot accidentally re-authorize it.
+		completed = append(completed, users[i])
+		if quiesceErr != nil {
+			quiesceErrors = errors.Join(quiesceErrors,
+				fmt.Errorf("drain user %s: %w", format.RedactUserTag(user), quiesceErr))
+			continue
+		}
 		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		err = userManager.RemoveUser(ctx, user)
 		cancel()
 		if err != nil {
-			return err
+			// Keep processing the remaining requested revocations. One malformed or
+			// transiently failing runtime credential must not leave every user after
+			// it authorized until a later poll.
+			quiesceErrors = errors.Join(quiesceErrors,
+				fmt.Errorf("remove user %s: %w", format.RedactUserTag(user), err))
+			continue
 		}
+		vc.users.mapLock.Lock()
+		vc.users.quiesced[user] = struct{}{}
+		vc.users.mapLock.Unlock()
+	}
+	return completed, quiesceErrors
+}
+
+// ForgetUsers is called only after the controller has fsynced the final
+// capture produced after QuiesceUsers.
+func (vc *V2Core) ForgetUsers(users []panel.UserInfo, tag string) {
+	vc.users.mapLock.Lock()
+	defer vc.users.mapLock.Unlock()
+	trafficValue, hasTraffic := vc.dispatcher.Counter.Load(tag)
+	for i := range users {
+		user := format.UserTag(tag, users[i].Uuid)
 		delete(vc.users.uidMap, user)
-		if v, ok := vc.dispatcher.Counter.Load(tag); ok {
-			tc := v.(*counter.TrafficCounter)
-			tc.Delete(user)
-		}
-		if v, ok := vc.dispatcher.LinkManagers.Load(user); ok {
-			lm := v.(*dispatcher.LinkManager)
-			lm.CloseAll()
-			vc.dispatcher.LinkManagers.Delete(user)
+		delete(vc.users.quiesced, user)
+		if hasTraffic {
+			trafficValue.(*counter.TrafficCounter).Delete(user)
 		}
 	}
-	return nil
 }
 
 func (vc *V2Core) GetUserTrafficSlice(tag string, mintraffic int) ([]panel.UserTraffic, error) {
-	trafficSlice := make([]panel.UserTraffic, 0)
+	_, trafficSlice, err := vc.GetUserTrafficSnapshotAndSlice(tag, mintraffic)
+	return trafficSlice, err
+}
+
+type userTrafficCaptureEntry struct {
+	storage        *counter.TrafficStorage
+	trafficCounter *counter.TrafficCounter
+	email          string
+	upload         int64
+	download       int64
+	deleteOrphan   bool
+}
+
+// UserTrafficCapture is prepared without mutating live counters. Commit
+// subtracts exactly the observed values only after the controller fsyncs the
+// immutable batch. Bytes arriving in between remain in the live counters.
+type UserTrafficCapture struct {
+	Snapshot map[int]int64
+	Traffic  []panel.UserTraffic
+	entries  []userTrafficCaptureEntry
+	once     sync.Once
+}
+
+func (capture *UserTrafficCapture) Commit() {
+	if capture == nil {
+		return
+	}
+	capture.once.Do(func() {
+		for _, entry := range capture.entries {
+			entry.storage.UpCounter.Add(-entry.upload)
+			entry.storage.DownCounter.Add(-entry.download)
+			if entry.deleteOrphan {
+				entry.trafficCounter.Delete(entry.email)
+			}
+		}
+	})
+}
+
+func (vc *V2Core) PrepareUserTrafficCapture(tag string, mintraffic int) (*UserTrafficCapture, error) {
+	if mintraffic < 0 || int64(mintraffic) > math.MaxInt64/1000 {
+		return nil, fmt.Errorf("invalid minimum traffic threshold")
+	}
+	capture := &UserTrafficCapture{Snapshot: make(map[int]int64)}
+	var captureErr error
 	vc.users.mapLock.RLock()
 	defer vc.users.mapLock.RUnlock()
-	if v, ok := vc.dispatcher.Counter.Load(tag); ok {
-		c := v.(*counter.TrafficCounter)
-		c.Counters.Range(func(key, value interface{}) bool {
+	if value, ok := vc.dispatcher.Counter.Load(tag); ok {
+		trafficCounter := value.(*counter.TrafficCounter)
+		trafficCounter.Counters.Range(func(key, value interface{}) bool {
 			email := key.(string)
 			traffic := value.(*counter.TrafficStorage)
 			up := traffic.UpCounter.Load()
 			down := traffic.DownCounter.Load()
-			if up+down > int64(mintraffic*1000) {
-				traffic.UpCounter.Store(0)
-				traffic.DownCounter.Store(0)
-				if vc.users.uidMap[email] == 0 {
-					c.Delete(email)
-					return true
+			if up < 0 || down < 0 {
+				captureErr = fmt.Errorf("traffic counter overflow for %s", format.RedactUserTag(email))
+				return false
+			}
+			total := up
+			if down > math.MaxInt64-total {
+				total = math.MaxInt64
+			} else {
+				total += down
+			}
+			uid := vc.users.uidMap[email]
+			if uid != 0 {
+				current := capture.Snapshot[uid]
+				if total > math.MaxInt64-current {
+					capture.Snapshot[uid] = math.MaxInt64
+				} else {
+					capture.Snapshot[uid] = current + total
 				}
-				trafficSlice = append(trafficSlice, panel.UserTraffic{
-					UID:      vc.users.uidMap[email],
-					Upload:   up,
-					Download: down,
+			}
+			if total <= int64(mintraffic)*1000 {
+				return true
+			}
+			capture.entries = append(capture.entries, userTrafficCaptureEntry{
+				storage:        traffic,
+				trafficCounter: trafficCounter,
+				email:          email,
+				upload:         up,
+				download:       down,
+				deleteOrphan:   uid == 0,
+			})
+			if uid != 0 {
+				capture.Traffic = append(capture.Traffic, panel.UserTraffic{
+					UID: uid, Upload: up, Download: down,
 				})
 			}
 			return true
 		})
-		if len(trafficSlice) == 0 {
-			return nil, nil
-		}
-		return trafficSlice, nil
 	}
-	return nil, nil
+	if captureErr != nil {
+		return nil, captureErr
+	}
+	if len(capture.Traffic) == 0 {
+		capture.Traffic = nil
+	}
+	return capture, nil
+}
+
+// GetUserTrafficSnapshotAndSlice preserves the legacy immediate-capture API.
+// Controller reporting uses PrepareUserTrafficCapture so disk persistence
+// happens before Commit.
+func (vc *V2Core) GetUserTrafficSnapshotAndSlice(tag string, mintraffic int) (map[int]int64, []panel.UserTraffic, error) {
+	capture, err := vc.PrepareUserTrafficCapture(tag, mintraffic)
+	if err != nil {
+		return nil, nil, err
+	}
+	capture.Commit()
+	return capture.Snapshot, capture.Traffic, nil
+}
+
+// GetUserTrafficSnapshot returns the current traffic totals grouped by panel
+// user ID without filtering or resetting the underlying counters.
+func (vc *V2Core) GetUserTrafficSnapshot(tag string) map[int]int64 {
+	trafficByUID := make(map[int]int64)
+	vc.users.mapLock.RLock()
+	defer vc.users.mapLock.RUnlock()
+	if value, ok := vc.dispatcher.Counter.Load(tag); ok {
+		value.(*counter.TrafficCounter).Counters.Range(func(key, value interface{}) bool {
+			uid := vc.users.uidMap[key.(string)]
+			if uid != 0 {
+				traffic := value.(*counter.TrafficStorage)
+				trafficByUID[uid] += traffic.UpCounter.Load() + traffic.DownCounter.Load()
+			}
+			return true
+		})
+	}
+	return trafficByUID
 }
 
 func (v *V2Core) AddUsers(p *AddUsersParams) (added int, err error) {
-	v.users.mapLock.Lock()
-	defer v.users.mapLock.Unlock()
-	for i := range p.Users {
-		v.users.uidMap[format.UserTag(p.Tag, p.Users[i].Uuid)] = p.Users[i].Id
+	if p == nil || p.NodeInfo == nil || p.Common == nil {
+		return 0, fmt.Errorf("invalid add-users parameters")
 	}
 	var users []*protocol.User
 	switch p.NodeInfo.Type {
@@ -121,10 +282,13 @@ func (v *V2Core) AddUsers(p *AddUsersParams) (added int, err error) {
 	case "trojan":
 		users = buildTrojanUsers(p.Tag, p.Users)
 	case "shadowsocks":
-		users = buildSSUsers(p.Tag,
+		users, err = buildSSUsers(p.Tag,
 			p.Users,
 			p.Common.Cipher,
 			p.Common.ServerKey)
+		if err != nil {
+			return 0, err
+		}
 	case "hysteria2":
 		users = buildHysteria2Users(p.Tag, p.Users)
 	case "tuic":
@@ -134,23 +298,60 @@ func (v *V2Core) AddUsers(p *AddUsersParams) (added int, err error) {
 	default:
 		return 0, fmt.Errorf("unsupported node type: %s", p.NodeInfo.Type)
 	}
+	memoryUsers := make([]*protocol.MemoryUser, 0, len(users))
+	for _, user := range users {
+		memoryUser, convertErr := user.ToMemoryUser()
+		if convertErr != nil {
+			return 0, convertErr
+		}
+		memoryUsers = append(memoryUsers, memoryUser)
+	}
 	man, err := v.GetUserManager(p.Tag)
 	if err != nil {
 		return 0, fmt.Errorf("get user manager error: %s", err)
 	}
-	for _, u := range users {
-		mUser, err := u.ToMemoryUser()
-		if err != nil {
-			return 0, err
-		}
+	addedEmails := make([]string, 0, len(memoryUsers))
+	for _, memoryUser := range memoryUsers {
 		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-		err = man.AddUser(ctx, mUser)
+		err = man.AddUser(ctx, memoryUser)
 		cancel()
 		if err != nil {
-			return 0, err
+			rollbackErr := removeRuntimeUsers(man, addedEmails)
+			if rollbackErr != nil {
+				return 0, fmt.Errorf("add user %s: %w; rollback failed: %v", format.RedactUserTag(memoryUser.Email), err, rollbackErr)
+			}
+			return 0, fmt.Errorf("add user %s: %w", format.RedactUserTag(memoryUser.Email), err)
+		}
+		addedEmails = append(addedEmails, memoryUser.Email)
+	}
+
+	// Publish UUID-to-reporting-ID ownership only after every runtime user was
+	// accepted. Failed validation or a partial runtime update must not leave a
+	// phantom mapping that can corrupt traffic attribution on the next report.
+	v.users.mapLock.Lock()
+	for i := range p.Users {
+		user := format.UserTag(p.Tag, p.Users[i].Uuid)
+		v.users.uidMap[user] = p.Users[i].Id
+		delete(v.users.quiesced, user)
+	}
+	v.users.mapLock.Unlock()
+	for i := range p.Users {
+		v.dispatcher.ReactivateUser(format.UserTag(p.Tag, p.Users[i].Uuid))
+	}
+	return len(memoryUsers), nil
+}
+
+func removeRuntimeUsers(manager proxy.UserManager, emails []string) error {
+	var firstErr error
+	for i := len(emails) - 1; i >= 0; i-- {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		err := manager.RemoveUser(ctx, emails[i])
+		cancel()
+		if err != nil && firstErr == nil {
+			firstErr = err
 		}
 	}
-	return len(users), nil
+	return firstErr
 }
 
 func buildVmessUsers(tag string, userInfo []panel.UserInfo) (users []*protocol.User) {
@@ -212,25 +413,32 @@ func buildTrojanUser(tag string, userInfo *panel.UserInfo) (user *protocol.User)
 	}
 }
 
-func buildSSUsers(tag string, userInfo []panel.UserInfo, cypher string, serverKey string) (users []*protocol.User) {
+func buildSSUsers(tag string, userInfo []panel.UserInfo, cypher string, serverKey string) (users []*protocol.User, err error) {
 	users = make([]*protocol.User, len(userInfo))
 	for i := range userInfo {
-		users[i] = buildSSUser(tag, &userInfo[i], cypher, serverKey)
+		users[i], err = buildSSUser(tag, &userInfo[i], cypher, serverKey)
+		if err != nil {
+			return nil, fmt.Errorf("invalid Shadowsocks user at index %d: %w", i, err)
+		}
 	}
-	return users
+	return users, nil
 }
 
-func buildSSUser(tag string, userInfo *panel.UserInfo, cypher string, serverKey string) (user *protocol.User) {
+func buildSSUser(tag string, userInfo *panel.UserInfo, cypher string, serverKey string) (user *protocol.User, err error) {
 	if serverKey == "" {
+		cipherType := getCipherFromString(cypher)
+		if cipherType == shadowsocks.CipherType_UNKNOWN {
+			return nil, fmt.Errorf("unsupported Shadowsocks cipher %q", cypher)
+		}
 		ssAccount := &shadowsocks.Account{
 			Password:   userInfo.Uuid,
-			CipherType: getCipherFromString(cypher),
+			CipherType: cipherType,
 		}
 		return &protocol.User{
 			Level:   0,
 			Email:   format.UserTag(tag, userInfo.Uuid),
 			Account: serial.ToTypedMessage(ssAccount),
-		}
+		}, nil
 	} else {
 		var keyLength int
 		switch cypher {
@@ -241,6 +449,12 @@ func buildSSUser(tag string, userInfo *panel.UserInfo, cypher string, serverKey 
 		case "2022-blake3-chacha20-poly1305":
 			keyLength = 32
 		}
+		if keyLength == 0 {
+			return nil, fmt.Errorf("unsupported Shadowsocks 2022 cipher %q", cypher)
+		}
+		if len(userInfo.Uuid) < keyLength {
+			return nil, fmt.Errorf("credential is shorter than the %d-byte key requirement", keyLength)
+		}
 		ssAccount := &shadowsocks_2022.Account{
 			Key: base64.StdEncoding.EncodeToString([]byte(userInfo.Uuid[:keyLength])),
 		}
@@ -248,7 +462,7 @@ func buildSSUser(tag string, userInfo *panel.UserInfo, cypher string, serverKey 
 			Level:   0,
 			Email:   format.UserTag(tag, userInfo.Uuid),
 			Account: serial.ToTypedMessage(ssAccount),
-		}
+		}, nil
 	}
 }
 

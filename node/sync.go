@@ -31,6 +31,9 @@ type deviceSyncHubKey struct {
 	db       int
 	timeout  int
 	channel  string
+	tls      bool
+	tlsName  string
+	tlsCA    string
 }
 
 type deviceSyncHubEntry struct {
@@ -112,10 +115,17 @@ func deviceSyncKey(config *conf.GlobalDeviceLimitConfig) deviceSyncHubKey {
 		db:       config.RedisDB,
 		timeout:  config.Timeout,
 		channel:  config.SyncChannel,
+		tls:      config.RedisTLS,
+		tlsName:  config.RedisTLSServerName,
+		tlsCA:    config.RedisTLSCAFile,
 	}
 }
 
-func newDeviceSyncHub(config *conf.GlobalDeviceLimitConfig) *deviceSyncHub {
+func newDeviceSyncHub(config *conf.GlobalDeviceLimitConfig) (*deviceSyncHub, error) {
+	tlsConfig, err := conf.RedisTLSConfig(config)
+	if err != nil {
+		return nil, err
+	}
 	return &deviceSyncHub{
 		client: redis.NewClient(&redis.Options{
 			Network:      config.RedisNetwork,
@@ -127,26 +137,31 @@ func newDeviceSyncHub(config *conf.GlobalDeviceLimitConfig) *deviceSyncHub {
 			DialTimeout:  time.Duration(config.Timeout) * time.Second,
 			ReadTimeout:  time.Duration(config.Timeout) * time.Second,
 			WriteTimeout: time.Duration(config.Timeout) * time.Second,
+			TLSConfig:    tlsConfig,
 		}),
 		channel:     config.SyncChannel,
 		subscribers: make(map[uint64]*deviceSyncSubscriber),
 		stop:        make(chan struct{}),
 		done:        make(chan struct{}),
-	}
+	}, nil
 }
 
-func acquireDeviceSyncHub(config *conf.GlobalDeviceLimitConfig) (*deviceSyncHub, deviceSyncHubKey) {
+func acquireDeviceSyncHub(config *conf.GlobalDeviceLimitConfig) (*deviceSyncHub, deviceSyncHubKey, error) {
 	key := deviceSyncKey(config)
 	deviceSyncHubRegistry.Lock()
 	if entry := deviceSyncHubRegistry.hubs[key]; entry != nil {
 		entry.refs++
 		deviceSyncHubRegistry.Unlock()
-		return entry.hub, key
+		return entry.hub, key, nil
 	}
-	hub := newDeviceSyncHub(config)
+	hub, err := newDeviceSyncHub(config)
+	if err != nil {
+		deviceSyncHubRegistry.Unlock()
+		return nil, deviceSyncHubKey{}, err
+	}
 	deviceSyncHubRegistry.hubs[key] = &deviceSyncHubEntry{hub: hub, refs: 1}
 	deviceSyncHubRegistry.Unlock()
-	return hub, key
+	return hub, key, nil
 }
 
 func releaseDeviceSyncHub(key deviceSyncHubKey) {
@@ -166,24 +181,28 @@ func releaseDeviceSyncHub(key deviceSyncHubKey) {
 	entry.hub.Close()
 }
 
-func (w *deviceSyncWatcher) Start(apiHost string, refresh func()) {
+func (w *deviceSyncWatcher) Start(apiHost string, refresh func()) error {
 	if w == nil || refresh == nil {
-		return
+		return nil
 	}
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	if w.started || w.closed {
-		return
+		return nil
 	}
 	host := normalizeDeviceSyncAPIHost(apiHost)
 	if host == "" {
 		host = w.apiHost
 	}
-	hub, key := acquireDeviceSyncHub(&w.config)
+	hub, key, err := acquireDeviceSyncHub(&w.config)
+	if err != nil {
+		return err
+	}
 	w.hubKey = key
 	w.id = hub.addSubscriber(host, refresh)
 	hub.Start()
 	w.started = true
+	return nil
 }
 
 func (h *deviceSyncHub) Start() {

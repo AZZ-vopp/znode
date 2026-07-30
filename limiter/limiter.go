@@ -32,6 +32,7 @@ type Limiter struct {
 	SpeedLimiter  *sync.Map // key: tag|uuid, value: *DynamicBucket
 	devices       *deviceTracker
 	remote        *redisDeviceStore
+	remoteEnabled bool
 	failClosed    bool
 	lastRemoteErr atomic.Int64
 }
@@ -61,12 +62,17 @@ func AddLimiter(nodetype string, tag string, users []panel.UserInfo, alive map[i
 	}
 	l.devices.SetAliveList(alive)
 	if deviceConfig != nil && deviceConfig.Enable {
+		l.remoteEnabled = true
+		l.failClosed = deviceConfig.FailClosed
 		remote, err := newRedisDeviceStore(deviceConfig, namespace)
 		if err != nil {
-			log.WithError(err).Warn("Redis device limiter disabled; using bounded local device tracking")
+			if l.failClosed {
+				log.WithError(err).Error("Redis device limiter unavailable; device-limited users fail closed")
+			} else {
+				log.WithError(err).Warn("Redis device limiter disabled; using bounded local device tracking")
+			}
 		} else {
 			l.remote = remote
-			l.failClosed = deviceConfig.FailClosed
 		}
 	}
 	for i := range users {
@@ -194,6 +200,13 @@ func (l *Limiter) CheckLimit(ctx context.Context, taguuid string, ip string) (*r
 	}
 
 	if normalizedIP := normalizeIP(ip); normalizedIP != "" {
+		// FailClosed must also cover configuration/initialization failures. The
+		// previous implementation enforced it only after a Redis client had been
+		// created, so an unsupported network value silently bypassed the global
+		// device limit even though the administrator explicitly requested denial.
+		if info.DeviceLimit > 0 && l.remoteEnabled && l.failClosed && l.remote == nil {
+			return nil, true
+		}
 		allowed, err := l.devices.Observe(ctx, l.remote, l.failClosed, taguuid, normalizedIP, info.UID, info.DeviceLimit, now)
 		if err != nil && l.shouldLogRemoteError(now) {
 			log.WithError(err).Warn("Redis device limiter request failed; local bounded tracker is used")

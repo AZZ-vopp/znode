@@ -10,6 +10,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/AZZ-vopp/znode/common/format"
 	"github.com/AZZ-vopp/znode/conf"
 	"github.com/redis/go-redis/v9"
 )
@@ -57,6 +58,9 @@ type redisClientKey struct {
 	password string
 	db       int
 	timeout  int
+	tls      bool
+	tlsName  string
+	tlsCA    string
 }
 
 type sharedRedisClient struct {
@@ -69,7 +73,11 @@ var redisClientRegistry = struct {
 	clients map[redisClientKey]*sharedRedisClient
 }{clients: make(map[redisClientKey]*sharedRedisClient)}
 
-func acquireRedisClient(c *conf.GlobalDeviceLimitConfig) (*redis.Client, redisClientKey) {
+func acquireRedisClient(c *conf.GlobalDeviceLimitConfig) (*redis.Client, redisClientKey, error) {
+	tlsConfig, err := conf.RedisTLSConfig(c)
+	if err != nil {
+		return nil, redisClientKey{}, err
+	}
 	key := redisClientKey{
 		network:  c.RedisNetwork,
 		addr:     c.RedisAddr,
@@ -77,12 +85,15 @@ func acquireRedisClient(c *conf.GlobalDeviceLimitConfig) (*redis.Client, redisCl
 		password: c.RedisPassword,
 		db:       c.RedisDB,
 		timeout:  c.Timeout,
+		tls:      c.RedisTLS,
+		tlsName:  c.RedisTLSServerName,
+		tlsCA:    c.RedisTLSCAFile,
 	}
 	redisClientRegistry.Lock()
 	defer redisClientRegistry.Unlock()
 	if shared := redisClientRegistry.clients[key]; shared != nil {
 		shared.refs++
-		return shared.client, key
+		return shared.client, key, nil
 	}
 	client := redis.NewClient(&redis.Options{
 		Network:      c.RedisNetwork,
@@ -95,9 +106,10 @@ func acquireRedisClient(c *conf.GlobalDeviceLimitConfig) (*redis.Client, redisCl
 		DialTimeout:  time.Duration(c.Timeout) * time.Second,
 		ReadTimeout:  time.Duration(c.Timeout) * time.Second,
 		WriteTimeout: time.Duration(c.Timeout) * time.Second,
+		TLSConfig:    tlsConfig,
 	})
 	redisClientRegistry.clients[key] = &sharedRedisClient{client: client, refs: 1}
-	return client, key
+	return client, key, nil
 }
 
 func releaseRedisClient(key redisClientKey) error {
@@ -125,7 +137,10 @@ func newRedisDeviceStore(c *conf.GlobalDeviceLimitConfig, namespace string) (*re
 	if c.RedisNetwork != "tcp" && c.RedisNetwork != "unix" {
 		return nil, fmt.Errorf("unsupported Redis network %q", c.RedisNetwork)
 	}
-	client, clientKey := acquireRedisClient(c)
+	client, clientKey, err := acquireRedisClient(c)
+	if err != nil {
+		return nil, err
+	}
 	return &redisDeviceStore{
 		client:    client,
 		clientKey: clientKey,
@@ -138,12 +153,8 @@ func newRedisDeviceStore(c *conf.GlobalDeviceLimitConfig, namespace string) (*re
 }
 
 func (r *redisDeviceStore) key(userKey string) string {
-	identity := userKey
-	if i := strings.LastIndexByte(userKey, '|'); i >= 0 && i+1 < len(userKey) {
-		identity = userKey[i+1:]
-	}
 	nsHash := sha256.Sum256([]byte(r.namespace))
-	userHash := sha256.Sum256([]byte(identity))
+	userHash := format.UserCredentialDigest(userKey)
 	return fmt.Sprintf("%s:%s:%s", r.prefix, hex.EncodeToString(nsHash[:8]), hex.EncodeToString(userHash[:16]))
 }
 

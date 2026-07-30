@@ -90,6 +90,9 @@ func (c *Controller) refreshUsersImmediately() {
 func (c *Controller) syncUsers(ctx context.Context) (err error) {
 	c.userSyncMu.Lock()
 	defer c.userSyncMu.Unlock()
+	if c.closing {
+		return nil
+	}
 	// get user info
 	newU, err := c.apiClient.GetUserList(ctx)
 	if err != nil {
@@ -119,6 +122,29 @@ func (c *Controller) syncUsers(ctx context.Context) (err error) {
 	if newA != nil {
 		c.limiter.UpdateAliveList(newA)
 	}
+	// A prior deletion may already have removed runtime credentials but failed
+	// to fsync its final counters. Finish that transaction before comparing the
+	// latest desired list. In particular, if the panel re-adds the UUID while
+	// disk persistence is recovering, the comparison below must see it as an
+	// addition and restore the runtime credential.
+	if len(c.quiescedUsers) > 0 {
+		quiesced, quiesceErr := c.server.QuiesceUsers(c.quiescedUsers, c.tag)
+		c.quiescedUsers = mergeUsersByCredential(c.quiescedUsers, quiesced)
+		if quiesceErr != nil {
+			log.WithFields(log.Fields{
+				"tag": c.tag,
+				"err": quiesceErr,
+			}).Error("Complete prior user quiesce failed")
+			return nil
+		}
+		if finalizeErr := c.finalizeQuiescedUsersLocked(); finalizeErr != nil {
+			log.WithFields(log.Fields{
+				"tag": c.tag,
+				"err": finalizeErr,
+			}).Error("Persist final traffic for quiesced users failed")
+			return nil
+		}
+	}
 	// node no changed, check users
 	if newU == nil {
 		log.WithField("tag", c.tag).Debug("User list no change")
@@ -126,13 +152,24 @@ func (c *Controller) syncUsers(ctx context.Context) (err error) {
 	}
 	deleted, added, modified := compareUserList(c.userList, newU)
 	if len(deleted) > 0 {
-		// have deleted users
-		err = c.server.DelUsers(deleted, c.tag, c.info)
-		if err != nil {
+		// Stop new sessions and close old links, but retain UID mappings and
+		// counters until the final capture is fsynced. A disk failure keeps the
+		// users quiesced (fail closed) and retries the durable capture later.
+		quiesced, quiesceErr := c.server.QuiesceUsers(deleted, c.tag)
+		c.quiescedUsers = mergeUsersByCredential(c.quiescedUsers, quiesced)
+		if quiesceErr != nil {
 			log.WithFields(log.Fields{
 				"tag": c.tag,
-				"err": err,
-			}).Error("Delete users failed")
+				"err": quiesceErr,
+			}).Error("Quiesce users failed")
+			return nil
+		}
+		c.quiescedUsers = mergeUsersByCredential(c.quiescedUsers, deleted)
+		if finalizeErr := c.finalizeQuiescedUsersLocked(); finalizeErr != nil {
+			log.WithFields(log.Fields{
+				"tag": c.tag,
+				"err": finalizeErr,
+			}).Error("Persist final traffic for deleted users failed")
 			return nil
 		}
 	}
@@ -151,11 +188,67 @@ func (c *Controller) syncUsers(ctx context.Context) (err error) {
 			return nil
 		}
 	}
-	if len(added) > 0 || len(deleted) > 0 || len(modified) > 0 {
+	if len(added) > 0 || len(modified) > 0 {
 		// update Limiter
-		c.limiter.UpdateUser(c.tag, added, deleted, modified)
+		c.limiter.UpdateUser(c.tag, added, nil, modified)
 	}
 	c.userList = newU
 	log.WithField("tag", c.tag).Infof("%d user deleted, %d user added, %d user modified", len(deleted), len(added), len(modified))
 	return nil
+}
+
+// finalizeQuiescedUsersLocked requires userSyncMu. Once the final counters are
+// durable, it makes the controller's active-user snapshot match the runtime
+// before a later desired-state comparison can re-add any restored UUID.
+func (c *Controller) finalizeQuiescedUsersLocked() error {
+	if len(c.quiescedUsers) == 0 {
+		return nil
+	}
+	if err := c.spoolOutstandingTrafficWithUsersLocked(); err != nil {
+		return err
+	}
+	completed := append([]panel.UserInfo(nil), c.quiescedUsers...)
+	c.server.ForgetUsers(completed, c.tag)
+	if c.limiter != nil {
+		c.limiter.UpdateUser(c.tag, nil, completed, nil)
+	}
+	c.userList = removeUsersByCredential(c.userList, completed)
+	c.quiescedUsers = nil
+	return nil
+}
+
+func removeUsersByCredential(users, removed []panel.UserInfo) []panel.UserInfo {
+	if len(users) == 0 || len(removed) == 0 {
+		return users
+	}
+	credentials := make(map[string]struct{}, len(removed))
+	for _, user := range removed {
+		credentials[user.Uuid] = struct{}{}
+	}
+	kept := make([]panel.UserInfo, 0, len(users))
+	for _, user := range users {
+		if _, remove := credentials[user.Uuid]; !remove {
+			kept = append(kept, user)
+		}
+	}
+	return kept
+}
+
+func mergeUsersByCredential(existing, additions []panel.UserInfo) []panel.UserInfo {
+	if len(additions) == 0 {
+		return existing
+	}
+	merged := append([]panel.UserInfo(nil), existing...)
+	seen := make(map[string]struct{}, len(existing)+len(additions))
+	for _, user := range existing {
+		seen[user.Uuid] = struct{}{}
+	}
+	for _, user := range additions {
+		if _, ok := seen[user.Uuid]; ok {
+			continue
+		}
+		seen[user.Uuid] = struct{}{}
+		merged = append(merged, user)
+	}
+	return merged
 }

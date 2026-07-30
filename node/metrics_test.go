@@ -114,3 +114,124 @@ func TestCertificateMetricsUsesCertificateDERAndSPKI(t *testing.T) {
 		t.Fatal("expected issuer")
 	}
 }
+
+func TestCertificateMetricsSelectsLeafFromReversedFullchain(t *testing.T) {
+	rootPublic, rootPrivate, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rootTemplate := &x509.Certificate{
+		SerialNumber:          big.NewInt(10),
+		Subject:               pkix.Name{CommonName: "test root"},
+		NotBefore:             time.Now().Add(-time.Hour),
+		NotAfter:              time.Now().Add(48 * time.Hour),
+		IsCA:                  true,
+		BasicConstraintsValid: true,
+		KeyUsage:              x509.KeyUsageCertSign,
+	}
+	rootDER, err := x509.CreateCertificate(rand.Reader, rootTemplate, rootTemplate, rootPublic, rootPrivate)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rootCertificate, err := x509.ParseCertificate(rootDER)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	leafPublic, _, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	leafTemplate := &x509.Certificate{
+		SerialNumber: big.NewInt(11),
+		Subject:      pkix.Name{CommonName: "node.example.com"},
+		NotBefore:    time.Now().Add(-time.Hour),
+		NotAfter:     time.Now().Add(24 * time.Hour),
+		DNSNames:     []string{"node.example.com"},
+		ExtKeyUsage:  []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+	}
+	leafDER, err := x509.CreateCertificate(rand.Reader, leafTemplate, rootCertificate, leafPublic, rootPrivate)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	fullchain := append(
+		pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: rootDER}),
+		pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: leafDER})...,
+	)
+	path := filepath.Join(t.TempDir(), "reversed-fullchain.pem")
+	if err := os.WriteFile(path, fullchain, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	certificateHash, publicKeyHash, _, _ := certificateMetrics(path)
+	leafCertificate, err := x509.ParseCertificate(leafDER)
+	if err != nil {
+		t.Fatal(err)
+	}
+	leafDigest := sha256.Sum256(leafDER)
+	leafSPKI := sha256.Sum256(leafCertificate.RawSubjectPublicKeyInfo)
+	if certificateHash != hex.EncodeToString(leafDigest[:]) {
+		t.Fatalf("expected leaf certificate hash, got %s", certificateHash)
+	}
+	if publicKeyHash != base64.StdEncoding.EncodeToString(leafSPKI[:]) {
+		t.Fatalf("expected leaf public key hash, got %s", publicKeyHash)
+	}
+}
+
+func TestCachedCertificateMetricsRefreshesSameSizeAndModTime(t *testing.T) {
+	publicKey, privateKey, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	makeCertificate := func(serial int64) []byte {
+		t.Helper()
+		template := &x509.Certificate{
+			SerialNumber: big.NewInt(serial),
+			Subject:      pkix.Name{CommonName: "node.example.com"},
+			NotBefore:    time.Unix(1_700_000_000, 0),
+			NotAfter:     time.Unix(1_800_000_000, 0),
+			DNSNames:     []string{"node.example.com"},
+		}
+		der, err := x509.CreateCertificate(rand.Reader, template, template, publicKey, privateKey)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der})
+	}
+
+	first := makeCertificate(20)
+	second := makeCertificate(21)
+	if len(first) != len(second) {
+		t.Fatalf("test certificates must have equal size: %d != %d", len(first), len(second))
+	}
+	path := filepath.Join(t.TempDir(), "certificate.pem")
+	if err := os.WriteFile(path, first, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	modTime := time.Unix(1_710_000_000, 0)
+	if err := os.Chtimes(path, modTime, modTime); err != nil {
+		t.Fatal(err)
+	}
+
+	clock := time.Unix(1_720_000_000, 0)
+	collector := &nodeMetricsCollector{now: func() time.Time { return clock }}
+	firstHash, _, _, _ := collector.cachedCertificateMetrics(path)
+	if err := os.WriteFile(path, second, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chtimes(path, modTime, modTime); err != nil {
+		t.Fatal(err)
+	}
+
+	clock = clock.Add(certificateMetricsCacheTTL + time.Second)
+	secondHash, _, _, _ := collector.cachedCertificateMetrics(path)
+	if secondHash == firstHash {
+		t.Fatal("certificate cache remained stale after its mandatory refresh interval")
+	}
+	secondDER, _ := pem.Decode(second)
+	want := sha256.Sum256(secondDER.Bytes)
+	if secondHash != hex.EncodeToString(want[:]) {
+		t.Fatalf("expected refreshed certificate hash %x, got %s", want, secondHash)
+	}
+}

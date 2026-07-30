@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/AZZ-vopp/znode/agent"
+	panel "github.com/AZZ-vopp/znode/api/v2board"
 	"github.com/AZZ-vopp/znode/conf"
 	"github.com/AZZ-vopp/znode/core"
 	"github.com/AZZ-vopp/znode/limiter"
@@ -44,6 +45,7 @@ func init() {
 
 func serverHandle(_ *cobra.Command, _ []string) {
 	showVersion()
+	panel.SetClientVersion(version)
 	log.SetFormatter(&log.TextFormatter{
 		DisableTimestamp: true,
 		DisableQuote:     true,
@@ -79,7 +81,7 @@ func serverHandle(_ *cobra.Command, _ []string) {
 		log.WithField("err", err).Error("Start runtime failed")
 		return
 	}
-	defer func() { running.Close() }()
+	defer func() { closeRuntimeUntilDurable(running) }()
 	logRevokedAssignment(running.assignment)
 	log.WithField("nodes", len(running.config.NodeConfigs)).Info("Nodes started")
 
@@ -244,15 +246,33 @@ func restorePreviousRuntime(old *runningRuntime, reloadCh chan struct{}) error {
 	return nil
 }
 
-func (r *runningRuntime) Close() {
+func (r *runningRuntime) Close() error {
 	if r == nil {
-		return
+		return nil
 	}
 	if r.nodes != nil {
-		_ = r.nodes.Close()
+		if err := r.nodes.Close(); err != nil {
+			// Node.Close restores controllers that were already stopped. Never
+			// close the core while any final traffic capture is not durable.
+			return err
+		}
 	}
 	if r.core != nil {
-		_ = r.core.Close()
+		if err := r.core.Close(); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func closeRuntimeUntilDurable(r *runningRuntime) {
+	for {
+		if err := r.Close(); err != nil {
+			log.WithField("err", err).Error("Shutdown accounting barrier failed; retrying without discarding traffic")
+			time.Sleep(2 * time.Second)
+			continue
+		}
+		return
 	}
 }
 

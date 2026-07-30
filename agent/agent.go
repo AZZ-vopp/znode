@@ -33,6 +33,12 @@ func Resolve(ctx context.Context, config *conf.Conf) (Assignment, error) {
 	if err != nil {
 		return Assignment{}, err
 	}
+	if err := reconcileMaintenance(ctx, client, manifest.Maintenance); err != nil {
+		return Assignment{}, fmt.Errorf("reconcile agent maintenance: %w", err)
+	}
+	if err := reconcileCertificate(ctx, client, manifest.CertificateRequest); err != nil {
+		return Assignment{}, fmt.Errorf("reconcile agent certificate: %w", err)
+	}
 	config.NodeConfigs = manifest.NodeConfigs(config.AgentConfig)
 	return Assignment{
 		Revision:             manifest.EffectiveRevision(),
@@ -181,6 +187,16 @@ func (m *Monitor) pollOnce(ctx context.Context) error {
 	manifest, err := fetcher.GetManifest(ctx)
 	if err != nil {
 		return err
+	}
+	if reporter, ok := fetcher.(maintenanceReporter); ok {
+		if err := reconcileMaintenance(ctx, reporter, manifest.Maintenance); err != nil {
+			return err
+		}
+	}
+	if reporter, ok := fetcher.(certificateReporter); ok {
+		if err := reconcileCertificate(ctx, reporter, manifest.CertificateRequest); err != nil {
+			return err
+		}
 	}
 	revision := manifest.EffectiveRevision()
 	interval := manifest.EffectivePollInterval(fallback)

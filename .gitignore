@@ -16,3 +16,12 @@ output/*
 .idea/*
 new.sh
 quick_update.sh
+config.json
+.env*
+*.pem
+*.key
+*.p12
+*.log
+*.zip
+*.rar
+.DS_Store

@@ -12,6 +12,7 @@ import (
 	"time"
 
 	panel "github.com/AZZ-vopp/znode/api/v2board"
+	commonfile "github.com/AZZ-vopp/znode/common/file"
 )
 
 type platformSnapshot struct {
@@ -30,12 +31,24 @@ type platformSnapshot struct {
 }
 
 type nodeMetricsCollector struct {
-	mu           sync.Mutex
-	previous     platformSnapshot
-	lastAt       time.Time
-	readSnapshot func() platformSnapshot
-	now          func() time.Time
+	mu            sync.Mutex
+	previous      platformSnapshot
+	lastAt        time.Time
+	hostname      string
+	certPath      string
+	certFileInfo  os.FileInfo
+	certModTime   int64
+	certSize      int64
+	certCheckedAt time.Time
+	certHash      string
+	certKeyHash   string
+	certNotAfter  int64
+	certIssuer    string
+	readSnapshot  func() platformSnapshot
+	now           func() time.Time
 }
+
+const certificateMetricsCacheTTL = 10 * time.Minute
 
 func newNodeMetricsCollector() *nodeMetricsCollector {
 	return newNodeMetricsCollectorWithSources(readPlatformSnapshot, time.Now)
@@ -48,9 +61,11 @@ func newNodeMetricsCollectorWithSources(readSnapshot func() platformSnapshot, no
 	if now == nil {
 		now = time.Now
 	}
+	hostname, _ := os.Hostname()
 	return &nodeMetricsCollector{
 		previous:     readSnapshot(),
 		lastAt:       now(),
+		hostname:     hostname,
 		readSnapshot: readSnapshot,
 		now:          now,
 	}
@@ -81,7 +96,7 @@ func (c *nodeMetricsCollector) Collect(info *panel.NodeInfo) panel.NodeStatus {
 		Goroutines:           runtime.NumGoroutine(),
 		TLSEnabled:           info != nil && info.Security == panel.Tls,
 	}
-	status.Hostname, _ = os.Hostname()
+	status.Hostname = c.hostname
 	if current.memoryTotal > 0 {
 		status.MemoryPercent = roundMetric(float64(current.memoryUsed) * 100 / float64(current.memoryTotal))
 	}
@@ -100,7 +115,7 @@ func (c *nodeMetricsCollector) Collect(info *panel.NodeInfo) panel.NodeStatus {
 	}
 	if info != nil && info.Security == panel.Tls && info.Common != nil && info.Common.CertInfo != nil {
 		status.TLSCertificateSHA256, status.TLSPublicKeySHA256, status.TLSNotAfter, status.TLSIssuer =
-			certificateMetrics(info.Common.CertInfo.CertFile)
+			c.cachedCertificateMetrics(info.Common.CertInfo.CertFile)
 	}
 
 	c.previous = current
@@ -108,21 +123,71 @@ func (c *nodeMetricsCollector) Collect(info *panel.NodeInfo) panel.NodeStatus {
 	return status
 }
 
+func (c *nodeMetricsCollector) cachedCertificateMetrics(path string) (certificateHash, publicKeyHash string, notAfter int64, issuer string) {
+	if path == "" {
+		return "", "", 0, ""
+	}
+	now := c.now()
+	info, err := os.Stat(path)
+	if err == nil && c.certPath == path && c.certFileInfo != nil && os.SameFile(c.certFileInfo, info) &&
+		c.certModTime == info.ModTime().UnixNano() && c.certSize == info.Size() &&
+		now.Before(c.certCheckedAt.Add(certificateMetricsCacheTTL)) {
+		return c.certHash, c.certKeyHash, c.certNotAfter, c.certIssuer
+	}
+	certificateHash, publicKeyHash, notAfterUnix, issuer := certificateMetrics(path)
+	c.certPath = path
+	if err == nil {
+		c.certFileInfo = info
+		c.certModTime = info.ModTime().UnixNano()
+		c.certSize = info.Size()
+	} else {
+		c.certFileInfo = nil
+		c.certModTime = 0
+		c.certSize = 0
+	}
+	c.certCheckedAt = now
+	c.certHash = certificateHash
+	c.certKeyHash = publicKeyHash
+	c.certNotAfter = notAfterUnix
+	c.certIssuer = issuer
+	return certificateHash, publicKeyHash, notAfterUnix, issuer
+}
+
 func certificateMetrics(path string) (certificateHash, publicKeyHash string, notAfter int64, issuer string) {
 	if path == "" {
 		return "", "", 0, ""
 	}
-	data, err := os.ReadFile(path)
+	data, err := commonfile.ReadRegularFileLimited(path, maxCertificateMaterialBytes)
 	if err != nil {
 		return "", "", 0, ""
 	}
-	block, _ := pem.Decode(data)
-	if block == nil || block.Type != "CERTIFICATE" {
+	var certificates []*x509.Certificate
+	for len(data) > 0 {
+		block, rest := pem.Decode(data)
+		if block == nil {
+			break
+		}
+		data = rest
+		if block.Type != "CERTIFICATE" {
+			continue
+		}
+		certificate, err := x509.ParseCertificate(block.Bytes)
+		if err == nil {
+			certificates = append(certificates, certificate)
+		}
+	}
+	if len(certificates) == 0 {
 		return "", "", 0, ""
 	}
-	certificate, err := x509.ParseCertificate(block.Bytes)
-	if err != nil {
-		return "", "", 0, ""
+	// ACME fullchain files normally start with the leaf certificate, but some
+	// providers write the chain in the opposite order. Apps pin the server leaf,
+	// never the intermediate CA, so select the first non-CA certificate.
+	certificate := certificates[0]
+	for _, candidate := range certificates {
+		if !candidate.IsCA {
+			certificate = candidate
+			break
+		}
 	}
 	certDigest := sha256.Sum256(certificate.Raw)
 	spkiDigest := sha256.Sum256(certificate.RawSubjectPublicKeyInfo)

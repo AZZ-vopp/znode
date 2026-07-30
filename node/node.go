@@ -107,17 +107,32 @@ func (n *Node) Start(nodes []conf.NodeConfig, core *core.V2Core) error {
 }
 
 func (n *Node) Close() error {
-	var firstErr error
+	closed := make([]*Controller, 0, len(n.controllers))
 	for _, c := range n.controllers {
 		if c == nil {
 			continue
 		}
+		wasActive := c.started
 		if err := c.Close(); err != nil {
 			log.Errorf("close controller failed: %v", err)
-			if firstErr == nil {
-				firstErr = err
+			// Closing a multi-node Agent is transactional from the caller's
+			// perspective. Controllers closed earlier in this pass must be brought
+			// back before reload reports that it retained the previous runtime.
+			var restoreErr error
+			for index := len(closed) - 1; index >= 0; index-- {
+				controller := closed[index]
+				if startErr := controller.Start(controller.server); startErr != nil && restoreErr == nil {
+					restoreErr = startErr
+				}
 			}
+			if restoreErr != nil {
+				return fmt.Errorf("close node controllers: %w; restore previous controllers: %v", err, restoreErr)
+			}
+			return fmt.Errorf("close node controllers: %w; previous controllers restored", err)
+		}
+		if wasActive {
+			closed = append(closed, c)
 		}
 	}
-	return firstErr
+	return nil
 }

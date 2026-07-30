@@ -5,6 +5,8 @@ import (
 	"testing"
 	"time"
 
+	panel "github.com/AZZ-vopp/znode/api/v2board"
+	"github.com/AZZ-vopp/znode/common/format"
 	"github.com/AZZ-vopp/znode/conf"
 )
 
@@ -30,6 +32,15 @@ func TestRedisDeviceKeyUsesUUIDAndNamespaceHash(t *testing.T) {
 	}
 	if first == other || len(first) > 100 || containsRaw(first, "uuid-123") {
 		t.Fatalf("Redis key should be namespaced and opaque: %q", first)
+	}
+}
+
+func TestRedisDeviceKeyIsStableAcrossHashedUserTagUpgrade(t *testing.T) {
+	store := &redisDeviceStore{prefix: "znode:device", namespace: "https://panel.example"}
+	legacy := store.key("[node-a]|uuid-123")
+	hardened := store.key(format.UserTag("[node-a]", "uuid-123"))
+	if legacy != hardened {
+		t.Fatalf("rolling upgrade split the device-limit identity: legacy=%q hardened=%q", legacy, hardened)
 	}
 }
 
@@ -128,6 +139,25 @@ func TestDeviceTrackerUsesPanelAliveAsFallback(t *testing.T) {
 	now := time.Now()
 	if allowed, err := tracker.Observe(context.Background(), nil, false, "user", "192.0.2.9", 42, 1, now); allowed || err != nil {
 		t.Fatalf("panel alive count should consume the only slot: allowed=%v err=%v", allowed, err)
+	}
+}
+
+func TestDeviceLimiterHonorsFailClosedWhenRedisCannotInitialize(t *testing.T) {
+	Init()
+	config := &conf.GlobalDeviceLimitConfig{
+		Enable:       true,
+		RedisNetwork: "unsupported",
+		FailClosed:   true,
+	}
+	limiter := AddLimiter("vless", "node-a", []panel.UserInfo{{
+		Id: 1, Uuid: "uuid-a", DeviceLimit: 1,
+	}}, nil, config, "https://panel.example")
+	defer DeleteLimiter("node-a")
+
+	if _, rejected := limiter.CheckLimit(
+		context.Background(), format.UserTag("node-a", "uuid-a"), "192.0.2.10",
+	); !rejected {
+		t.Fatal("FailClosed=true allowed a device-limited session without Redis")
 	}
 }
 

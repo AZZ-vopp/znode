@@ -6,6 +6,8 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+
+	panel "github.com/AZZ-vopp/znode/api/v2board"
 )
 
 func TestGenerateSelfSignedCertificateWritesMatchingRSAFiles(t *testing.T) {
@@ -42,5 +44,48 @@ func TestGenerateSelfSignedCertificateWritesMatchingRSAFiles(t *testing.T) {
 	}
 	if _, err := x509.ParsePKCS1PrivateKey(keyBlock.Bytes); err != nil {
 		t.Fatalf("parse private key: %v", err)
+	}
+}
+
+func TestCertificateGenerationRejectsPanelControlledPathsOutsideZNode(t *testing.T) {
+	controller := &Controller{info: &panel.NodeInfo{Common: &panel.CommonNode{CertInfo: &panel.CertInfo{
+		CertMode: "self",
+		CertFile: filepath.Join(t.TempDir(), "node.cer"),
+		KeyFile:  filepath.Join(t.TempDir(), "node.key"),
+	}}}}
+	if err := controller.requestCert(); err == nil {
+		t.Fatal("root certificate generation accepted a path outside /etc/znode")
+	}
+	if !pathWithinCertificateRoot("/etc/znode/nodes/node.cer", []string{"/etc/znode"}) {
+		t.Fatal("valid ZNode certificate path was rejected")
+	}
+	if pathWithinCertificateRoot("/etc/znode-escape/node.cer", []string{"/etc/znode"}) {
+		t.Fatal("prefix-confusable certificate path was accepted")
+	}
+	if err := validateCertificateMaterialPath("/etc/znode/config.json", false, true); err == nil {
+		t.Fatal("certificate generation accepted a non-certificate target")
+	}
+}
+
+func TestCertificateReaderRejectsOversizedMaterial(t *testing.T) {
+	root := t.TempDir()
+	oldRoots := certificateReadRoots
+	certificateReadRoots = []string{root}
+	t.Cleanup(func() { certificateReadRoots = oldRoots })
+
+	path := filepath.Join(root, "oversized.pem")
+	file, err := os.Create(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := file.Truncate(maxCertificateMaterialBytes + 1); err != nil {
+		file.Close()
+		t.Fatal(err)
+	}
+	if err := file.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := validateCertificateMaterialPath(path, false, false); err == nil {
+		t.Fatal("oversized certificate material was accepted")
 	}
 }

@@ -12,47 +12,195 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/AZZ-vopp/znode/common/file"
 	log "github.com/sirupsen/logrus"
 )
 
-func (c *Controller) renewCertTask(_ context.Context) error {
+var certificateReadRoots = []string{"/etc/znode", "/etc/letsencrypt", "/etc/ssl"}
+
+const maxCertificateMaterialBytes int64 = 4 << 20
+
+func pathWithinCertificateRoot(candidate string, roots []string) bool {
+	clean := filepath.Clean(candidate)
+	for _, root := range roots {
+		relative, err := filepath.Rel(filepath.Clean(root), clean)
+		if err == nil && relative != ".." && !strings.HasPrefix(relative, ".."+string(filepath.Separator)) {
+			return true
+		}
+	}
+	return false
+}
+
+func validateCertificatePath(candidate string, writable bool) error {
+	if candidate == "" || len(candidate) > 4096 || !filepath.IsAbs(candidate) {
+		return fmt.Errorf("certificate path must be an absolute path")
+	}
+	clean := filepath.Clean(candidate)
+	roots := certificateReadRoots
+	if writable {
+		roots = []string{"/etc/znode"}
+	}
+	if !pathWithinCertificateRoot(clean, roots) {
+		return fmt.Errorf("certificate path %q is outside the allowed directories", candidate)
+	}
+
+	if !writable {
+		resolved, err := filepath.EvalSymlinks(clean)
+		if err != nil {
+			return fmt.Errorf("resolve certificate path %q: %w", candidate, err)
+		}
+		if !pathWithinCertificateRoot(resolved, roots) {
+			return fmt.Errorf("certificate path %q resolves outside the allowed directories", candidate)
+		}
+		info, err := os.Stat(resolved)
+		if err != nil || !info.Mode().IsRegular() {
+			return fmt.Errorf("certificate path %q is not a regular file", candidate)
+		}
+		if info.Size() < 1 || info.Size() > maxCertificateMaterialBytes {
+			return fmt.Errorf("certificate path %q must be between 1 byte and %d bytes", candidate, maxCertificateMaterialBytes)
+		}
+		return nil
+	}
+
+	// Auto/self-signed certificate generation runs as root. Reject symlinks in
+	// every existing component so a panel path cannot redirect an atomic rename
+	// outside /etc/znode or overwrite another root-owned file.
+	current := string(filepath.Separator)
+	for _, component := range strings.Split(strings.TrimPrefix(clean, string(filepath.Separator)), string(filepath.Separator)) {
+		current = filepath.Join(current, component)
+		info, err := os.Lstat(current)
+		if os.IsNotExist(err) {
+			continue
+		}
+		if err != nil {
+			return fmt.Errorf("inspect certificate path %q: %w", candidate, err)
+		}
+		if info.Mode()&os.ModeSymlink != 0 {
+			return fmt.Errorf("certificate path %q contains a symbolic link", candidate)
+		}
+		if current != clean && !info.IsDir() {
+			return fmt.Errorf("certificate path %q contains a non-directory component", candidate)
+		}
+		if current == clean {
+			if !info.Mode().IsRegular() {
+				return fmt.Errorf("certificate path %q is not a regular file", candidate)
+			}
+			if info.Size() < 1 || info.Size() > maxCertificateMaterialBytes {
+				return fmt.Errorf("certificate path %q must be between 1 byte and %d bytes", candidate, maxCertificateMaterialBytes)
+			}
+		}
+	}
+	return nil
+}
+
+func validateCertificateMaterialPath(candidate string, privateKey, writable bool) error {
+	extension := strings.ToLower(filepath.Ext(candidate))
+	allowed := extension == ".pem"
+	if privateKey {
+		allowed = allowed || extension == ".key"
+	} else {
+		allowed = allowed || extension == ".cer" || extension == ".crt"
+	}
+	if !allowed {
+		kind := "certificate"
+		if privateKey {
+			kind = "private-key"
+		}
+		return fmt.Errorf("%s path has an unsupported extension", kind)
+	}
+	return validateCertificatePath(candidate, writable)
+}
+
+func (c *Controller) renewCertTask(ctx context.Context) error {
 	l, err := NewLego(c.info.Common.CertInfo)
 	if err != nil {
 		log.WithField("tag", c.tag).Info("new lego error: ", err)
 		return nil
 	}
-	err = l.RenewCert()
+	// Lego does not expose a context-aware renewal API. Isolate it from the
+	// controller lifecycle and stop waiting as soon as the task is cancelled.
+	// The detached operation only owns its local Lego client and certificate
+	// files; it never touches the controller/core after cancellation.
+	done := make(chan error, 1)
+	go func() { done <- l.RenewCertContext(ctx) }()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case err = <-done:
+	}
 	if err != nil {
 		log.WithField("tag", c.tag).Info("renew cert error: ", err)
 		return nil
 	}
-	return nil
+	// Certificate hashes are subscription credentials. Publish the new leaf
+	// and SPKI pins immediately after renewal so clients never receive a stale
+	// SHA256 until the next traffic-report interval.
+	return c.reportNodeStatus(ctx)
 }
 
 func (c *Controller) requestCert() error {
+	return c.requestCertContext(context.Background())
+}
+
+func (c *Controller) requestCertContext(ctx context.Context) error {
 	cert := c.info.Common.CertInfo
+	if cert == nil {
+		return fmt.Errorf("certificate settings are missing")
+	}
+	writable := cert.CertMode == "dns" || cert.CertMode == "http" || cert.CertMode == "auto" || cert.CertMode == "self"
+	if writable {
+		resolved, err := resolvedCertificateConfig(cert)
+		if err != nil {
+			return err
+		}
+		cert = resolved
+		c.info.Common.CertInfo = resolved
+	}
+	if cert.CertMode != "none" && cert.CertMode != "" {
+		if err := validateCertificateMaterialPath(cert.CertFile, false, writable); err != nil {
+			return err
+		}
+		if err := validateCertificateMaterialPath(cert.KeyFile, true, writable); err != nil {
+			return err
+		}
+		if filepath.Clean(cert.CertFile) == filepath.Clean(cert.KeyFile) {
+			return fmt.Errorf("certificate and private-key paths must be different")
+		}
+	}
 	switch cert.CertMode {
 	case "none", "":
 	case "file":
 		if cert.CertFile == "" || cert.KeyFile == "" {
 			return fmt.Errorf("cert file path or key file path not exist")
 		}
-	case "dns", "http":
+	case "dns", "http", "auto":
 		if cert.CertFile == "" || cert.KeyFile == "" {
 			return fmt.Errorf("cert file path or key file path not exist")
 		}
 		if file.IsExist(cert.CertFile) && file.IsExist(cert.KeyFile) {
 			return nil
 		}
+		if cert.CertMode == "auto" && (cert.Provider == "" || len(cert.DNSEnv) == 0) {
+			// Older panel rows enabled Auto TLS without persisting the DNS
+			// provider/token. Do not crash-loop the whole Agent; create a local
+			// certificate so the node can start and report a fingerprint.
+			return generateSelfSslCertificate(cert.CertDomain, cert.CertFile, cert.KeyFile)
+		}
 		l, err := NewLego(cert)
 		if err != nil {
+			if cert.FallbackSelfSigned {
+				return generateSelfSslCertificate(cert.CertDomain, cert.CertFile, cert.KeyFile)
+			}
 			return fmt.Errorf("create lego object error: %s", err)
 		}
-		err = l.CreateCert()
+		err = l.CreateCertContext(ctx)
 		if err != nil {
+			if cert.FallbackSelfSigned {
+				return generateSelfSslCertificate(cert.CertDomain, cert.CertFile, cert.KeyFile)
+			}
 			return fmt.Errorf("create lego cert error: %s", err)
 		}
 	case "self":
@@ -76,6 +224,9 @@ func (c *Controller) requestCert() error {
 }
 
 func generateSelfSslCertificate(domain, certPath, keyPath string) error {
+	lock := certificateOperationLock(certPath, keyPath)
+	lock.Lock()
+	defer lock.Unlock()
 	key, err := rsa.GenerateKey(rand.Reader, 2048)
 	if err != nil {
 		return fmt.Errorf("generate private key: %w", err)

@@ -1,5 +1,15 @@
 #!/bin/bash
 
+set -o pipefail
+umask 077
+
+# The manager downloads and launches a privileged installer. Do not let an
+# inherited search path, Bash startup file or loader configuration replace the
+# system helpers or inject code into those child processes.
+PATH=/usr/sbin:/usr/bin:/sbin:/bin
+export PATH
+unset BASH_ENV ENV CDPATH GLOBIGNORE LD_PRELOAD LD_LIBRARY_PATH OPENSSL_CONF
+
 red='\033[0;31m'
 green='\033[0;32m'
 yellow='\033[0;33m'
@@ -10,9 +20,63 @@ release_repo="AZZ-vopp/znode"
 release_branch="main"
 [[ -s /etc/znode/release-repo ]] && release_repo=$(tr -d '\r\n' < /etc/znode/release-repo)
 [[ -s /etc/znode/release-branch ]] && release_branch=$(tr -d '\r\n' < /etc/znode/release-branch)
-install_script_url="https://raw.githubusercontent.com/${release_repo}/${release_branch}/script/install.sh"
-manager_script_url="https://raw.githubusercontent.com/${release_repo}/${release_branch}/script/znode.sh"
+ZNODE_OPERATION_LOCK_FILE="/run/znode-operation.lock"
+ZNODE_OPERATION_LOCK_DIRECTORY="${ZNODE_OPERATION_LOCK_FILE}.d"
+ZNODE_OPERATION_LOCK_BACKEND=""
 
+acquire_znode_operation_lock() {
+    local owner="" stale_directory lock_parent
+    if [[ -n "$ZNODE_OPERATION_LOCK_BACKEND" ]]; then
+        return 0
+    fi
+
+    lock_parent="${ZNODE_OPERATION_LOCK_DIRECTORY%/*}"
+    mkdir -p "$lock_parent" || return 1
+    if ! mkdir "$ZNODE_OPERATION_LOCK_DIRECTORY" 2>/dev/null; then
+        if [[ -r "$ZNODE_OPERATION_LOCK_DIRECTORY/pid" ]]; then
+            owner=$(sed -n '1p' "$ZNODE_OPERATION_LOCK_DIRECTORY/pid")
+        fi
+        if [[ "$owner" =~ ^[0-9]+$ ]] && kill -0 "$owner" 2>/dev/null; then
+            echo -e "${red}Một thao tác cài đặt/rollback ZNode khác đang chạy; hãy thử lại sau.${plain}"
+            return 1
+        fi
+        if [[ ! "$owner" =~ ^[0-9]+$ ]]; then
+            echo -e "${red}Khóa thao tác ZNode không có chủ sở hữu hợp lệ; hãy kiểm tra $ZNODE_OPERATION_LOCK_DIRECTORY thủ công.${plain}"
+            return 1
+        fi
+        stale_directory="${ZNODE_OPERATION_LOCK_DIRECTORY}.stale.$$"
+        mv "$ZNODE_OPERATION_LOCK_DIRECTORY" "$stale_directory" 2>/dev/null || return 1
+        if ! mkdir "$ZNODE_OPERATION_LOCK_DIRECTORY" 2>/dev/null; then
+            rm -rf "$stale_directory"
+            return 1
+        fi
+        rm -rf "$stale_directory"
+    fi
+    printf '%s\n' "$$" > "$ZNODE_OPERATION_LOCK_DIRECTORY/pid" || {
+        rm -rf "$ZNODE_OPERATION_LOCK_DIRECTORY"
+        return 1
+    }
+    ZNODE_OPERATION_LOCK_BACKEND="mkdir"
+}
+
+release_znode_operation_lock() {
+    local owner=""
+    if [[ "$ZNODE_OPERATION_LOCK_BACKEND" == "mkdir" ]]; then
+        [[ -r "$ZNODE_OPERATION_LOCK_DIRECTORY/pid" ]] \
+            && owner=$(sed -n '1p' "$ZNODE_OPERATION_LOCK_DIRECTORY/pid")
+        if [[ "$owner" == "$$" ]]; then
+            rm -rf "$ZNODE_OPERATION_LOCK_DIRECTORY"
+        fi
+    fi
+    ZNODE_OPERATION_LOCK_BACKEND=""
+}
+
+if [[ ! "$release_repo" =~ ^[A-Za-z0-9][A-Za-z0-9_.-]*/[A-Za-z0-9][A-Za-z0-9_.-]*$ ]] \
+    || [[ ! "$release_branch" =~ ^[A-Za-z0-9][A-Za-z0-9._/-]*$ ]] \
+    || [[ "$release_branch" == *..* ]] || [[ "$release_branch" == *//* ]]; then
+    echo "Invalid ZNode release source in /etc/znode/release-{repo,branch}." >&2
+    exit 1
+fi
 # check root
 [[ $EUID -ne 0 ]] && echo -e "${red}Lỗi:${plain} Phải chạy script này bằng tài khoản root!\n" && exit 1
 
@@ -112,37 +176,306 @@ before_show_menu() {
     show_menu
 }
 
+validate_release_version() {
+    [[ "$1" =~ ^v?[0-9]+\.[0-9]+(\.[0-9]+)?([-+_][A-Za-z0-9.-]+)?$ ]]
+}
+
+sha256_file() {
+    openssl dgst -sha256 "$1" 2>/dev/null | awk '{print tolower($NF)}'
+}
+
+latest_release_version() {
+    local repository="$1"
+    local metadata version
+    metadata=$(curl --fail --location --silent --show-error --retry 3 --connect-timeout 15 \
+        --proto '=https' --tlsv1.2 \
+        "https://api.github.com/repos/${repository}/releases/latest") || return 1
+    version=$(printf '%s\n' "$metadata" | awk -F'"' '/"tag_name":/ {print $4; exit}')
+    validate_release_version "$version" || return 1
+    printf '%s\n' "$version"
+}
+
+download_verified_script_asset() {
+    local repository="$1"
+    local version="$2"
+    local asset_name="$3"
+    local destination="$4"
+    local metadata expected actual asset_url asset_size
+
+    validate_release_version "$version" || return 1
+    case "$asset_name" in
+        install.sh|znode.sh) ;;
+        *) return 1 ;;
+    esac
+
+    metadata=$(curl --fail --location --silent --show-error --retry 3 --connect-timeout 15 \
+        --proto '=https' --tlsv1.2 \
+        "https://api.github.com/repos/${repository}/releases/tags/${version}") || return 1
+    expected=$(printf '%s\n' "$metadata" | awk -v asset="$asset_name" '
+        /"name":/ { selected = index($0, "\"" asset "\"") > 0 }
+        selected && /"digest": "sha256:/ {
+            value=$0
+            sub(/^.*"digest": "sha256:/, "", value)
+            sub(/".*$/, "", value)
+            print tolower(value)
+            exit
+        }
+    ')
+    if [[ ! "$expected" =~ ^[a-f0-9]{64}$ ]]; then
+        echo -e "${red}Release ${version} không công bố SHA-256 cho ${asset_name}; từ chối chạy script đặc quyền.${plain}"
+        return 1
+    fi
+
+    asset_url="https://github.com/${repository}/releases/download/${version}/${asset_name}"
+    if ! curl --fail --location --silent --show-error --retry 3 --connect-timeout 15 \
+        --proto '=https' --tlsv1.2 "$asset_url" -o "$destination"; then
+        rm -f "$destination"
+        return 1
+    fi
+    asset_size=$(wc -c < "$destination" | tr -d '[:space:]')
+    actual=$(sha256_file "$destination")
+    if [[ ! "$asset_size" =~ ^[0-9]+$ ]] || (( asset_size < 1024 || asset_size > 1048576 )) \
+        || [[ ! "$actual" =~ ^[a-f0-9]{64}$ ]] || [[ "$actual" != "$expected" ]] \
+        || ! bash -n "$destination"; then
+        rm -f "$destination"
+        echo -e "${red}Script ${asset_name} không vượt qua xác minh SHA-256/cú pháp; từ chối thực thi.${plain}"
+        return 1
+    fi
+}
+
+run_installer() {
+    local temporary status trusted_installer_ref target_version=""
+    if [[ $# -gt 0 && "$1" != --* ]]; then
+        target_version="$1"
+        shift
+        if [[ ! "$target_version" =~ ^v?[0-9]+\.[0-9]+(\.[0-9]+)?([-+_][A-Za-z0-9.-]+)?$ ]]; then
+            echo -e "${red}Phiên bản ZNode đích không hợp lệ.${plain}"
+            return 1
+        fi
+    fi
+
+    # The requested binary version is data, never the source of installer
+    # code. Always run the loader from the latest trusted release so selecting
+    # an older runtime cannot revive an installer without checksum/rollback
+    # enforcement.
+    trusted_installer_ref=$(latest_release_version "$release_repo")
+    if [[ -z "$trusted_installer_ref" ]]; then
+        echo -e "${red}Không xác định được release tag hợp lệ cho installer.${plain}"
+        return 1
+    fi
+    temporary=$(mktemp) || return 1
+    if ! download_verified_script_asset "$release_repo" "$trusted_installer_ref" install.sh "$temporary"; then
+        rm -f "$temporary"
+        echo -e "${red}Không tải được installer đã xác minh từ release bảo mật mới nhất.${plain}"
+        return 1
+    fi
+    if [[ -n "$target_version" ]]; then
+        bash "$temporary" "$target_version" "$@"
+    else
+        bash "$temporary" "$trusted_installer_ref" "$@"
+    fi
+    status=$?
+    rm -f "$temporary"
+    return "$status"
+}
+
 install() {
-    bash <(curl -Ls "$install_script_url") --release-repo "$release_repo" --release-branch "$release_branch"
-    if [[ $? == 0 ]]; then
+    local install_status
+    run_installer --release-repo "$release_repo" --release-branch "$release_branch"
+    install_status=$?
+    if [[ $install_status == 0 ]]; then
         if [[ $# == 0 ]]; then
             start
         else
             start 0
         fi
     fi
+    return "$install_status"
 }
 
 update() {
+    local update_status
     if [[ $# == 0 ]]; then
         echo && echo -n -e "Nhập phiên bản cần cài (mặc định là mới nhất): " && read version
     else
         version=$2
     fi
     if [[ -n "$version" ]]; then
-        bash <(curl -Ls "$install_script_url") "$version" --release-repo "$release_repo" --release-branch "$release_branch"
+        run_installer "$version" --release-repo "$release_repo" --release-branch "$release_branch"
     else
-        bash <(curl -Ls "$install_script_url") --release-repo "$release_repo" --release-branch "$release_branch"
+        run_installer --release-repo "$release_repo" --release-branch "$release_branch"
     fi
-    if [[ $? == 0 ]]; then
+    update_status=$?
+    if [[ $update_status == 0 ]]; then
         echo -e "${green}Cập nhật hoàn tất và znode đã tự khởi động lại. Dùng znode log để xem nhật ký.${plain}"
-        exit
+        exit 0
     fi
 
     if [[ $# == 0 ]]; then
         before_show_menu
     fi
+    return "$update_status"
 }
+
+validate_runtime_geodata() {
+    local runtime_directory="$1"
+    local file
+    for file in geoip.dat geosite.dat; do
+        if [[ ! -s "$runtime_directory/$file" ]] \
+            || [[ $(wc -c < "$runtime_directory/$file") -lt 1024 ]]; then
+            echo -e "${red}Runtime dự phòng không chứa $file hợp lệ; từ chối rollback.${plain}"
+            return 1
+        fi
+    done
+}
+
+install_runtime_geodata() (
+    local runtime_directory="$1"
+    local destination="${2:-/etc/znode}"
+    local transaction_directory file restore_file
+
+    validate_runtime_geodata "$runtime_directory" || return 1
+    mkdir -p "$destination" || return 1
+    transaction_directory=$(mktemp -d "$destination/.geodata.XXXXXX") || return 1
+    trap 'rm -rf "$transaction_directory"' EXIT
+
+    for file in geoip.dat geosite.dat; do
+        install -m 0644 "$runtime_directory/$file" "$transaction_directory/new-$file" || return 1
+        if [[ -e "$destination/$file" ]]; then
+            cp -p "$destination/$file" "$transaction_directory/old-$file" || return 1
+        else
+            : > "$transaction_directory/no-old-$file"
+        fi
+    done
+
+    for file in geoip.dat geosite.dat; do
+        if ! mv -f "$transaction_directory/new-$file" "$destination/$file"; then
+            for restore_file in geoip.dat geosite.dat; do
+                if [[ -e "$transaction_directory/old-$restore_file" ]]; then
+                    mv -f "$transaction_directory/old-$restore_file" "$destination/$restore_file" || true
+                elif [[ -e "$transaction_directory/no-old-$restore_file" ]]; then
+                    rm -f "$destination/$restore_file"
+                fi
+            done
+            return 1
+        fi
+    done
+)
+
+swap_runtime_trees() {
+    local current_directory="${1:-/usr/local/znode}"
+    local previous_directory="${2:-/usr/local/znode.previous}"
+    local transaction_directory held_runtime transaction_parent
+
+    [[ -d "$current_directory" && -d "$previous_directory" ]] || return 1
+    transaction_parent="${current_directory%/*}"
+    transaction_directory=$(mktemp -d "$transaction_parent/.znode-swap.XXXXXX") || return 1
+    held_runtime="$transaction_directory/runtime"
+
+    if ! mv "$current_directory" "$held_runtime"; then
+        rmdir "$transaction_directory" 2>/dev/null || true
+        return 1
+    fi
+    if ! mv "$previous_directory" "$current_directory"; then
+        mv "$held_runtime" "$current_directory" || true
+        rmdir "$transaction_directory" 2>/dev/null || true
+        return 1
+    fi
+    if ! mv "$held_runtime" "$previous_directory"; then
+        mv "$current_directory" "$previous_directory" || true
+        mv "$held_runtime" "$current_directory" || true
+        rmdir "$transaction_directory" 2>/dev/null || true
+        return 1
+    fi
+    rmdir "$transaction_directory" 2>/dev/null || true
+}
+
+start_znode_service() {
+    if [[ x"${release}" == x"alpine" ]]; then
+        service znode start >/dev/null 2>&1
+    else
+        systemctl start znode >/dev/null 2>&1
+    fi
+}
+
+stop_znode_service() {
+    if [[ x"${release}" == x"alpine" ]]; then
+        service znode stop >/dev/null 2>&1 || true
+    else
+        systemctl stop znode >/dev/null 2>&1 || true
+    fi
+}
+
+restore_runtime_after_failed_rollback() {
+    if ! swap_runtime_trees; then
+        echo -e "${red}Không thể đưa runtime ban đầu trở lại vị trí hoạt động; giữ dịch vụ dừng.${plain}"
+        return 1
+    fi
+    if ! install_runtime_geodata /usr/local/znode; then
+        echo -e "${red}Runtime ban đầu đã trở lại nhưng GeoIP/GeoSite không thể khôi phục; giữ dịch vụ dừng.${plain}"
+        return 1
+    fi
+    start_znode_service || true
+    sleep 2
+    check_status
+}
+
+rollback() (
+    acquire_znode_operation_lock || return 1
+    trap release_znode_operation_lock EXIT
+    if [[ ! -x /usr/local/znode.previous/znode ]]; then
+        echo -e "${red}Chưa có bản trước để quay lại. Hãy cập nhật thành công ít nhất một lần trước.${plain}"
+        return 1
+    fi
+    local previous_version expected_checksum actual_checksum
+    if [[ ! -r /usr/local/znode.previous/.znode.sha256 ]]; then
+        echo -e "${red}Bản dự phòng không có checksum tin cậy; từ chối thực thi.${plain}"
+        return 1
+    fi
+    expected_checksum=$(awk 'NR==1 {print tolower($1)}' /usr/local/znode.previous/.znode.sha256)
+    actual_checksum=$(openssl dgst -sha256 /usr/local/znode.previous/znode 2>/dev/null | awk '{print tolower($NF)}')
+    if [[ ! "$expected_checksum" =~ ^[a-f0-9]{64}$ ]] \
+        || [[ ! "$actual_checksum" =~ ^[a-f0-9]{64}$ ]] \
+        || [[ "$expected_checksum" != "$actual_checksum" ]]; then
+        echo -e "${red}Checksum bản dự phòng không khớp; từ chối rollback.${plain}"
+        return 1
+    fi
+    previous_version=$(/usr/local/znode.previous/znode version 2>/dev/null | awk 'NR==1 {print $2}')
+    if [[ ! "$previous_version" =~ ^v?([0-9]+)\.([0-9]+) ]] || (( ${BASH_REMATCH[1]} < 1 )) || (( ${BASH_REMATCH[1]} == 1 && ${BASH_REMATCH[2]} < 2 )); then
+        echo -e "${red}Bản dự phòng ${previous_version:-không xác định} chưa hỗ trợ điều khiển Agent tự động; từ chối rollback để tránh mất kết nối quản trị.${plain}"
+        return 1
+    fi
+    if ! validate_runtime_geodata /usr/local/znode.previous; then
+        return 1
+    fi
+    echo -e "${yellow}Đang quay lại bản ZNode trước...${plain}"
+    stop_znode_service
+    if ! swap_runtime_trees; then
+        echo -e "${red}Không thể hoán đổi runtime; bản hiện hành được giữ nguyên.${plain}"
+        start_znode_service || true
+        return 1
+    fi
+    if ! install_runtime_geodata /usr/local/znode; then
+        echo -e "${red}Không thể kích hoạt GeoIP/GeoSite của bản rollback; đang khôi phục runtime ban đầu.${plain}"
+        restore_runtime_after_failed_rollback || true
+        return 1
+    fi
+    start_znode_service || true
+    sleep 2
+    if check_status; then
+        echo -e "${green}Đã quay lại bản trước. Dùng znode version và znode log để kiểm tra.${plain}"
+        return 0
+    fi
+
+    echo -e "${red}Bản rollback không khởi động; đang khôi phục runtime ban đầu.${plain}"
+    stop_znode_service
+    if restore_runtime_after_failed_rollback; then
+        echo -e "${red}Rollback thất bại; runtime và GeoIP/GeoSite ban đầu đã được khôi phục.${plain}"
+    else
+        echo -e "${red}Rollback thất bại và không thể tự khôi phục đầy đủ; dịch vụ được giữ dừng.${plain}"
+    fi
+    return 1
+)
 
 config() {
     echo "znode sẽ tự khởi động lại sau khi bạn chỉnh sửa cấu hình"
@@ -175,6 +508,8 @@ uninstall() {
         fi
         return 0
     fi
+    acquire_znode_operation_lock || return 1
+    trap release_znode_operation_lock EXIT
     if [[ x"${release}" == x"alpine" ]]; then
         service znode stop
         rc-update del znode
@@ -188,6 +523,8 @@ uninstall() {
     fi
     rm /etc/znode/ -rf
     rm /usr/local/znode/ -rf
+    rm /usr/local/znode.previous/ -rf
+    release_znode_operation_lock
 
     echo ""
     echo -e "Gỡ cài đặt thành công. Nếu muốn xóa cả script này, hãy thoát rồi chạy ${green}rm /usr/bin/znode -f${plain}"
@@ -317,14 +654,32 @@ show_log() {
 }
 
 update_shell() {
-    wget -O /usr/bin/znode -N --no-check-certificate "$manager_script_url"
-    if [[ $? != 0 ]]; then
+    local temporary manager_ref
+    manager_ref=$(latest_release_version "$release_repo")
+    if [[ -z "$manager_ref" ]]; then
+        echo -e "${red}Không xác định được release tag hợp lệ cho manager script.${plain}"
+        return 1
+    fi
+    acquire_znode_operation_lock || return 1
+    trap release_znode_operation_lock EXIT
+    temporary=$(mktemp /usr/bin/.znode.XXXXXX) || {
+        release_znode_operation_lock
+        return 1
+    }
+    if ! download_verified_script_asset "$release_repo" "$manager_ref" znode.sh "$temporary"; then
+        rm -f "$temporary"
         echo ""
         echo -e "${red}Tải script thất bại. Vui lòng kiểm tra kết nối tới GitHub.${plain}"
+        release_znode_operation_lock
         before_show_menu
     else
-        chmod +x /usr/bin/znode
-        echo -e "${green}Nâng cấp script thành công. Vui lòng chạy lại script.${plain}" && exit 0
+        if chmod 0755 "$temporary" && mv -f "$temporary" /usr/bin/znode; then
+            echo -e "${green}Nâng cấp script thành công. Vui lòng chạy lại script.${plain}" && exit 0
+        fi
+        rm -f "$temporary"
+        echo -e "${red}Không thể cài manager script theo giao dịch atomic; manager hiện tại được giữ nguyên.${plain}"
+        release_znode_operation_lock
+        return 1
     fi
 }
 
@@ -430,95 +785,10 @@ show_znode_version() {
     fi
 }
 
-generate_znode_config() {
-        local api_host="$1"
-        local node_id="$2"
-        local api_key="$3"
-
-        mkdir -p /etc/znode >/dev/null 2>&1
-        cat > /etc/znode/config.json <<EOF
-{
-    "Log": {
-        "Level": "warning",
-        "Output": "",
-        "Access": "none"
-    },
-    "ConnectionConfig": {
-        "Handshake": 4,
-        "ConnIdle": 30,
-        "UplinkOnly": 2,
-        "DownlinkOnly": 4,
-        "BufferSize": 16,
-        "DisableUDPContentSniffing": true
-    },
-    "Nodes": [
-        {
-            "ApiHost": "${api_host}",
-            "NodeID": ${node_id},
-            "ApiKey": "${api_key}",
-            "Timeout": 15,
-            "GlobalDeviceLimitConfig": {
-                "Enable": true,
-                "SyncEnabled": true,
-                "SyncChannel": "v2board:device-sync",
-                "RedisNetwork": "tcp",
-                "RedisAddr": "127.0.0.1:6379",
-                "RedisDB": 0,
-                "Timeout": 2,
-                "Expiry": 120,
-                "RefreshInterval": 40,
-                "MaxIPsPerUser": 256,
-                "KeyPrefix": "znode:device",
-                "FailClosed": false
-            }
-        }
-    ]
-}
-EOF
-        echo -e "${green}Đã tạo xong tệp cấu hình znode, đang khởi động lại dịch vụ.${plain}"
-        if [[ x"${release}" == x"alpine" ]]; then
-            service znode restart
-        else
-            systemctl restart znode
-        fi
-        sleep 2
-        check_status
-        echo -e ""
-        if [[ $? == 0 ]]; then
-            echo -e "${green}Khởi động lại znode thành công${plain}"
-        else
-            echo -e "${red}Có thể znode khởi động thất bại. Hãy dùng znode log để xem nhật ký.${plain}"
-        fi
-}
-
-
 generate_config_file() {
-    # Thu thập tham số tương tác và cung cấp giá trị mặc định mẫu
-    read -rp "Địa chỉ API panel [định dạng: https://example.com/]: " api_host
-    api_host=${api_host:-https://example.com/}
-    read -rp "ID node: " node_id
-    node_id=${node_id:-1}
-    read -rp "Khóa kết nối node: " api_key
-
-    # Tạo tệp cấu hình và ghi đè mẫu có thể đã được sao chép từ gói cài đặt
-    generate_znode_config "$api_host" "$node_id" "$api_key"
-}
-
-# Mở các cổng tường lửa
-open_ports() {
-    systemctl stop firewalld.service 2>/dev/null
-    systemctl disable firewalld.service 2>/dev/null
-    setenforce 0 2>/dev/null
-    ufw disable 2>/dev/null
-    iptables -P INPUT ACCEPT 2>/dev/null
-    iptables -P FORWARD ACCEPT 2>/dev/null
-    iptables -P OUTPUT ACCEPT 2>/dev/null
-    iptables -t nat -F 2>/dev/null
-    iptables -t mangle -F 2>/dev/null
-    iptables -F 2>/dev/null
-    iptables -X 2>/dev/null
-    netfilter-persistent save 2>/dev/null
-    echo -e "${green}Đã mở các cổng tường lửa thành công!${plain}"
+    echo -e "${red}Legacy global API-key enrollment is disabled.${plain}"
+    echo "Create or rotate a per-VPS Agent in ZBoard and run its enrollment command instead."
+    return 1
 }
 
 show_usage() {
@@ -533,9 +803,10 @@ show_usage() {
     echo "znode disable      - Tắt tự khởi động cùng hệ thống"
     echo "znode log          - Xem nhật ký znode"
     echo "znode x25519       - Tạo khóa x25519"
-    echo "znode generate     - Tạo tệp cấu hình znode"
+    echo "znode generate     - Hướng dẫn enrollment Agent qua ZBoard"
     echo "znode update       - Cập nhật znode"
     echo "znode update x.x.x - Cài phiên bản znode chỉ định"
+    echo "znode rollback     - Quay lại bản znode trước đó"
     echo "znode install      - Cài đặt znode"
     echo "znode uninstall    - Gỡ cài đặt znode"
     echo "znode version      - Xem phiên bản znode"
@@ -563,13 +834,12 @@ show_menu() {
 ————————————————
   ${green}11.${plain} Xem phiên bản znode
   ${green}12.${plain} Nâng cấp script quản lý znode
-  ${green}13.${plain} Tạo tệp cấu hình znode
-  ${green}14.${plain} Mở toàn bộ cổng mạng trên VPS
-  ${green}15.${plain} Thoát script
+  ${green}13.${plain} Hướng dẫn enrollment Agent qua ZBoard
+  ${green}14.${plain} Thoát script
  "
  # Có thể bổ sung chức năng mới vào menu phía trên
     show_status
-    echo && read -rp "Vui lòng chọn [0-15]: " num
+    echo && read -rp "Vui lòng chọn [0-14]: " num
 
     case "${num}" in
         0) config ;;
@@ -586,8 +856,7 @@ show_menu() {
         11) check_install && show_znode_version ;;
         12) update_shell ;;
         13) generate_config_file ;;
-        14) open_ports ;;
-        15) exit ;;
+        14) exit ;;
         *) echo -e "${red}Vui lòng nhập đúng một số từ 0 đến 15.${plain}" ;;
     esac
 }
@@ -603,6 +872,7 @@ if [[ $# > 0 ]]; then
         "disable") check_install 0 && disable 0 ;;
         "log") check_install 0 && show_log 0 ;;
         "update") check_install 0 && update 0 $2 ;;
+        "rollback") check_install 0 && rollback 0 ;;
         "config") config $* ;;
         "generate") generate_config_file ;;
         "install") check_uninstall 0 && install 0 ;;
