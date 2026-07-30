@@ -22,10 +22,12 @@ func (c *Controller) reportUserTrafficTask(ctx context.Context) (err error) {
 
 	var reportmin = 0
 	var devicemin = 0
+	c.userSyncMu.Lock()
 	if c.info.Common.BaseConfig != nil {
 		reportmin = c.info.Common.BaseConfig.NodeReportMinTraffic
 		devicemin = c.info.Common.BaseConfig.DeviceOnlineMinTraffic
 	}
+	c.userSyncMu.Unlock()
 	// A report is an immutable, idempotent batch. Counters are reset when the
 	// batch is cut, but the batch remains in memory until the panel explicitly
 	// acknowledges a 2xx response. Network errors therefore retry the same ID

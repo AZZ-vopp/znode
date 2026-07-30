@@ -3,6 +3,7 @@ package node
 import (
 	"context"
 	"errors"
+	"reflect"
 	"time"
 
 	panel "github.com/AZZ-vopp/znode/api/v2board"
@@ -62,6 +63,15 @@ func (c *Controller) nodeInfoMonitor(ctx context.Context) (err error) {
 		return nil
 	}
 	if newN != nil {
+		if reportingThresholdOnlyChange(c.info, newN) {
+			c.applyReportingThresholds(newN)
+			log.WithFields(log.Fields{
+				"tag":                       c.tag,
+				"node_report_min_traffic":   newN.Common.BaseConfig.NodeReportMinTraffic,
+				"device_online_min_traffic": newN.Common.BaseConfig.DeviceOnlineMinTraffic,
+			}).Info("Applied reporting thresholds without reloading Xray")
+			return c.syncUsers(ctx)
+		}
 		log.WithFields(log.Fields{
 			"tag": c.tag,
 		}).Error("Got new node info, reload")
@@ -77,6 +87,41 @@ func (c *Controller) nodeInfoMonitor(ctx context.Context) (err error) {
 	log.WithField("tag", c.tag).Debug("Node info no change")
 
 	return c.syncUsers(ctx)
+}
+
+// reportingThresholdOnlyChange identifies panel changes that affect only
+// traffic/online report filtering. Those values are consumed by the periodic
+// reporter and do not alter an inbound, route, certificate or Xray policy, so
+// draining every live connection for them is both unnecessary and disruptive.
+func reportingThresholdOnlyChange(current, next *panel.NodeInfo) bool {
+	if current == nil || next == nil || current.Common == nil || next.Common == nil ||
+		current.Common.BaseConfig == nil || next.Common.BaseConfig == nil {
+		return false
+	}
+
+	currentCopy := *current
+	nextCopy := *next
+	currentCommon := *current.Common
+	nextCommon := *next.Common
+	currentCommon.BaseConfig = nil
+	nextCommon.BaseConfig = nil
+	currentCopy.Common = &currentCommon
+	nextCopy.Common = &nextCommon
+
+	return reflect.DeepEqual(currentCopy, nextCopy)
+}
+
+func (c *Controller) applyReportingThresholds(next *panel.NodeInfo) {
+	if next == nil || next.Common == nil || next.Common.BaseConfig == nil {
+		return
+	}
+	c.userSyncMu.Lock()
+	defer c.userSyncMu.Unlock()
+	if c.info == nil || c.info.Common == nil {
+		return
+	}
+	baseConfig := *next.Common.BaseConfig
+	c.info.Common.BaseConfig = &baseConfig
 }
 
 func (c *Controller) refreshUsersImmediately() {
