@@ -1120,8 +1120,10 @@ RestartSec=10
 WantedBy=multi-user.target
 EOF
         systemctl daemon-reload
-        systemctl stop znode
         systemctl enable znode
+        # Keep the old runtime serving while the new tree, service unit and
+        # configuration are staged. Activation below performs one short
+        # restart instead of leaving every inbound offline during the update.
         echo -e "${green}Đã cài znode ${last_version}${plain} và bật tự khởi động cùng hệ thống."
     fi
 
@@ -1145,7 +1147,7 @@ EOF
         if [[ x"${release}" == x"alpine" ]]; then
             service znode restart
         else
-            systemctl start znode
+            systemctl restart znode
         fi
         sleep 2
         check_status
