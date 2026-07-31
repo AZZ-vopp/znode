@@ -142,6 +142,51 @@ type EncSettings struct {
 	PrivateKey    string `json:"private_key"`
 }
 
+// UnmarshalJSON keeps compatibility with older panel rows which serialized
+// encryption_settings as an array (or null) instead of the object expected by
+// ZNode.  The current object form is decoded normally; a legacy array is
+// accepted and its first object element is used when present.  Unknown or
+// empty legacy values intentionally fall back to zero values so one malformed
+// optional setting cannot prevent the whole node from reloading.
+func (e *EncSettings) UnmarshalJSON(data []byte) error {
+	if e == nil {
+		return fmt.Errorf("cannot unmarshal encryption settings into nil receiver")
+	}
+	*e = EncSettings{}
+	value := strings.TrimSpace(string(data))
+	if value == "" || value == "null" {
+		return nil
+	}
+	if strings.HasPrefix(value, "{") {
+		type encSettings EncSettings
+		var decoded encSettings
+		if err := json.Unmarshal(data, &decoded); err != nil {
+			return err
+		}
+		*e = EncSettings(decoded)
+		return nil
+	}
+	if strings.HasPrefix(value, "[") {
+		var legacy []json.RawMessage
+		if err := json.Unmarshal(data, &legacy); err != nil {
+			return err
+		}
+		for _, item := range legacy {
+			if strings.HasPrefix(strings.TrimSpace(string(item)), "{") {
+				type encSettings EncSettings
+				var decoded encSettings
+				if err := json.Unmarshal(item, &decoded); err != nil {
+					return err
+				}
+				*e = EncSettings(decoded)
+				break
+			}
+		}
+		return nil
+	}
+	return fmt.Errorf("encryption_settings must be an object, array, or null")
+}
+
 func (c *Client) GetNodeInfo(ctx context.Context) (node *NodeInfo, err error) {
 	const path = "/api/v2/server/config"
 	r, err := c.client.
