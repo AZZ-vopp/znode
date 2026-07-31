@@ -191,13 +191,13 @@ EOF
     chmod 755 "$schedule_dir/znode-log-cleanup"
 }
 
-# Upgrade only the previous low-memory defaults. Values that the operator has
-# customized are intentionally left untouched.
+# Upgrade legacy defaults that either starved video buffers or held the first
+# UDP/QUIC packets for content sniffing. TCP/TLS domain routing remains active.
 migrate_tiktok_compat_profile() {
     local config_file="/etc/znode/config.json"
     local temporary
     [[ -f "$config_file" ]] || return 0
-    if ! grep -Eq '"ConnIdle"[[:space:]]*:[[:space:]]*30([[:space:]]*,)|"BufferSize"[[:space:]]*:[[:space:]]*16([[:space:]]*,)|"DisableUDPContentSniffing"[[:space:]]*:[[:space:]]*true' "$config_file"; then
+    if ! grep -Eq '"ConnIdle"[[:space:]]*:[[:space:]]*30([[:space:]]*,)|"BufferSize"[[:space:]]*:[[:space:]]*16([[:space:]]*,)|"DisableUDPContentSniffing"[[:space:]]*:[[:space:]]*false' "$config_file"; then
         return 0
     fi
     temporary=$(mktemp "${config_file}.XXXXXX") || return 1
@@ -205,7 +205,7 @@ migrate_tiktok_compat_profile() {
     sed -E \
         -e 's/"ConnIdle"[[:space:]]*:[[:space:]]*30[[:space:]]*,/"ConnIdle": 120,/' \
         -e 's/"BufferSize"[[:space:]]*:[[:space:]]*16[[:space:]]*,/"BufferSize": 128,/' \
-        -e 's/"DisableUDPContentSniffing"[[:space:]]*:[[:space:]]*true/"DisableUDPContentSniffing": false/' \
+        -e 's/"DisableUDPContentSniffing"[[:space:]]*:[[:space:]]*false/"DisableUDPContentSniffing": true/' \
         "$config_file" > "$temporary"
 
     chmod 600 "$temporary"
@@ -687,7 +687,7 @@ generate_znode_agent_config() {
         "UplinkOnly": 2,
         "DownlinkOnly": 4,
         "BufferSize": 128,
-        "DisableUDPContentSniffing": false,
+        "DisableUDPContentSniffing": true,
         "MaxConnectionsPerUser": 128,
         "MaxConnections": 32768
     },
