@@ -271,11 +271,14 @@ ensure_zboard_config_type() {
     echo -e "${green}Đã khóa cấu hình ZNode với type=zboard.${plain}"
 }
 
-reject_legacy_v2node_config() {
+allow_legacy_v2node_config() {
+    # v2node and ZNode may coexist. Never import or rewrite the legacy config;
+    # ZNode always creates its own /etc/znode/config.json from the Agent
+    # command. Operators are responsible for assigning distinct listen ports.
     if [[ -f /etc/v2node/config.json && ! -f /etc/znode/config.json ]]; then
-        echo -e "${red}Không nhập cấu hình v2node cũ. Hãy cài mới bằng lệnh Agent do ZBoard cung cấp.${plain}"
-        return 1
+        echo -e "${yellow}Phát hiện cấu hình v2node cũ; giữ nguyên và cài ZNode độc lập. Hãy bảo đảm hai dịch vụ dùng cổng khác nhau.${plain}"
     fi
+    return 0
 }
 
 parse_args() {
@@ -1215,7 +1218,7 @@ trap 'exit 129' HUP
 trap 'exit 130' INT
 trap 'exit 143' TERM
 validate_agent_args
-reject_legacy_v2node_config || exit 1
+allow_legacy_v2node_config || exit 1
 ensure_zboard_config_type || exit 1
 validate_existing_agent_binding
 echo -e "${green}Bắt đầu cài đặt${plain}"
