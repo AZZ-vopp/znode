@@ -9,6 +9,20 @@ import (
 	coreConf "github.com/xtls/xray-core/infra/conf"
 )
 
+func TestUnmarshalNetworkSettingsLegacyArray(t *testing.T) {
+	var got coreConf.TCPConfig
+	if err := unmarshalNetworkSettings(json.RawMessage(`[{"acceptProxyProtocol":true}]`), &got); err != nil {
+		t.Fatalf("decode legacy network settings: %v", err)
+	}
+}
+
+func TestUnmarshalNetworkSettingsEmptyArray(t *testing.T) {
+	var got coreConf.TCPConfig
+	if err := unmarshalNetworkSettings(json.RawMessage(`[]`), &got); err != nil {
+		t.Fatalf("decode empty network settings: %v", err)
+	}
+}
+
 func buildSniffingSettings(t *testing.T, routes []panel.Route) *proxyman.SniffingConfig {
 	t.Helper()
 	inbound, err := buildInbound(&panel.NodeInfo{
