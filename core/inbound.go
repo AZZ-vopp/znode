@@ -121,7 +121,7 @@ func buildInbound(nodeInfo *panel.NodeInfo, tag string) (*core.InboundHandlerCon
 	// Set network protocol
 	if len(nodeInfo.Common.NetworkSettings) > 0 {
 		n := &NetworkSettingsProxyProtocol{}
-		err := json.Unmarshal(nodeInfo.Common.NetworkSettings, n)
+		err := unmarshalNetworkSettings(nodeInfo.Common.NetworkSettings, n)
 		if err != nil {
 			return nil, fmt.Errorf("unmarshal network settings error: %s", err)
 		}

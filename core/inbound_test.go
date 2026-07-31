@@ -118,6 +118,21 @@ func TestBuildInboundRejectsUnknownSecurityMode(t *testing.T) {
 	}
 }
 
+func TestBuildInboundAcceptsLegacyArrayNetworkSettings(t *testing.T) {
+	if _, err := buildInbound(&panel.NodeInfo{
+		Type:     "vmess",
+		Security: panel.None,
+		Common: &panel.CommonNode{
+			ListenIP:        "0.0.0.0",
+			ServerPort:      443,
+			Network:         "tcp",
+			NetworkSettings: json.RawMessage(`[{"acceptProxyProtocol":false}]`),
+		},
+	}, "legacy-array"); err != nil {
+		t.Fatalf("legacy array network settings must build an inbound: %v", err)
+	}
+}
+
 func TestForwardedClientIPAllowsConfiguredPublicOrLoopbackListener(t *testing.T) {
 	proxySettings := json.RawMessage(`{"acceptProxyProtocol":true}`)
 	for name, mutate := range map[string]func(*panel.CommonNode){
