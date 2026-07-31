@@ -65,8 +65,12 @@ func (t *deviceTracker) Observe(ctx context.Context, remote *redisDeviceStore, f
 			t.mu.Unlock()
 			return true, nil
 		}
-		aliveCount := t.aliveCount(uid)
-		if limit > 0 && maxInt(aliveCount, len(entries)) >= limit {
+		// The panel alive count is a delayed aggregate and may still include this
+		// same device after a ZNode reload. Using it for admission blocks the
+		// first reconnect until the cache expires. Redis, when configured, owns
+		// the cross-node exact-IP decision; otherwise enforce only the bounded
+		// local set that this process can identify safely.
+		if remote == nil && limit > 0 && len(entries) >= limit {
 			t.mu.Unlock()
 			return false, nil
 		}
@@ -170,11 +174,4 @@ func (t *deviceTracker) Snapshot(now time.Time) ([]panel.OnlineUser, map[string]
 		}
 	}
 	return online, active
-}
-
-func maxInt(a, b int) int {
-	if a > b {
-		return a
-	}
-	return b
 }

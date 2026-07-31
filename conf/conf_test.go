@@ -29,7 +29,7 @@ func TestLoadDefaultsAndRedisConfig(t *testing.T) {
 	if err := c.LoadFromPath(path); err != nil {
 		t.Fatal(err)
 	}
-	if c.ConnectionConfig.ConnIdle != 120 || c.ConnectionConfig.BufferSize != 128 || c.ConnectionConfig.DisableUDPContentSniffing {
+	if c.ConnectionConfig.ConnIdle != 120 || c.ConnectionConfig.BufferSize != 128 || !c.ConnectionConfig.DisableUDPContentSniffing {
 		t.Fatalf("unexpected connection defaults: %+v", c.ConnectionConfig)
 	}
 	device := c.NodeConfigs[0].GlobalDeviceLimitConfig

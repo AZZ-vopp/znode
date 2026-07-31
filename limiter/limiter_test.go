@@ -133,12 +133,12 @@ func TestDeviceTrackerBoundsUnlimitedUser(t *testing.T) {
 	}
 }
 
-func TestDeviceTrackerUsesPanelAliveAsFallback(t *testing.T) {
+func TestDeviceTrackerDoesNotRejectReconnectFromStalePanelAliveCount(t *testing.T) {
 	tracker := newDeviceTracker(nil)
 	tracker.SetAliveList(map[int]int{42: 1})
 	now := time.Now()
-	if allowed, err := tracker.Observe(context.Background(), nil, false, "user", "192.0.2.9", 42, 1, now); allowed || err != nil {
-		t.Fatalf("panel alive count should consume the only slot: allowed=%v err=%v", allowed, err)
+	if allowed, err := tracker.Observe(context.Background(), nil, false, "user", "192.0.2.9", 42, 1, now); !allowed || err != nil {
+		t.Fatalf("stale panel alive count blocked the first reconnect: allowed=%v err=%v", allowed, err)
 	}
 }
 

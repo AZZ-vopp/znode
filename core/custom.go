@@ -3,7 +3,6 @@ package core
 import (
 	"encoding/json"
 	"fmt"
-	"net"
 	"strings"
 
 	panel "github.com/AZZ-vopp/znode/api/v2board"
@@ -13,26 +12,6 @@ import (
 	"github.com/xtls/xray-core/core"
 	coreConf "github.com/xtls/xray-core/infra/conf"
 )
-
-// hasPublicIPv6 checks if the machine has a public IPv6 address
-func hasPublicIPv6() bool {
-	addrs, err := net.InterfaceAddrs()
-	if err != nil {
-		return false
-	}
-	for _, addr := range addrs {
-		ipNet, ok := addr.(*net.IPNet)
-		if !ok {
-			continue
-		}
-		ip := ipNet.IP
-		// Check if it's IPv6, not loopback, not link-local, not private/ULA
-		if ip.To4() == nil && !ip.IsLoopback() && !ip.IsLinkLocalUnicast() && !ip.IsPrivate() {
-			return true
-		}
-	}
-	return false
-}
 
 func hasOutboundWithTag(list []*core.OutboundHandlerConfig, tag string) bool {
 	for _, o := range list {
@@ -68,11 +47,11 @@ func resolveRouteOutbound(value *string, existing []*core.OutboundHandlerConfig)
 }
 
 func GetCustomConfig(infos []*panel.NodeInfo) (*dns.Config, []*core.OutboundHandlerConfig, *router.Config, error) {
-	//dns
-	queryStrategy := "UseIPv4v6"
-	if !hasPublicIPv6() {
-		queryStrategy = "UseIPv4"
-	}
+	// Prefer the stable IPv4 egress used by the panel's advertised VPS
+	// address. Merely having a public IPv6 address on an interface does not
+	// prove that the VPS has a working IPv6 route; broken/black-holed IPv6 is a
+	// common cause of intermittent QUIC failures in TikTok and Meta apps.
+	queryStrategy := "UseIPv4"
 	coreDnsConfig := &coreConf.DNSConfig{
 		Servers: []*coreConf.NameServerConfig{
 			{

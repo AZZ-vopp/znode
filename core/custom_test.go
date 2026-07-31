@@ -5,8 +5,37 @@ import (
 	"testing"
 
 	panel "github.com/AZZ-vopp/znode/api/v2board"
+	"github.com/xtls/xray-core/app/dns"
 	coreConf "github.com/xtls/xray-core/infra/conf"
+	"github.com/xtls/xray-core/proxy/freedom"
+	"github.com/xtls/xray-core/transport/internet"
 )
+
+func TestDefaultEgressKeepsDNSAndFreedomOnIPv4(t *testing.T) {
+	dnsConfig, outbounds, _, err := GetCustomConfig([]*panel.NodeInfo{{
+		Id: 1, Tag: "node", Common: &panel.CommonNode{},
+	}})
+	if err != nil {
+		t.Fatalf("build custom config: %v", err)
+	}
+	if dnsConfig.GetQueryStrategy() != dns.QueryStrategy_USE_IP4 {
+		t.Fatalf("DNS query strategy = %s, want IPv4", dnsConfig.GetQueryStrategy())
+	}
+	if len(outbounds) == 0 || outbounds[0].ProxySettings == nil {
+		t.Fatal("default freedom outbound is missing")
+	}
+	instance, err := outbounds[0].ProxySettings.GetInstance()
+	if err != nil {
+		t.Fatalf("decode freedom outbound: %v", err)
+	}
+	settings, ok := instance.(*freedom.Config)
+	if !ok {
+		t.Fatalf("default outbound settings type = %T", instance)
+	}
+	if settings.GetDomainStrategy() != internet.DomainStrategy_USE_IP4 {
+		t.Fatalf("freedom domain strategy = %s, want IPv4", settings.GetDomainStrategy())
+	}
+}
 
 func TestCustomRoutingRejectsMalformedOrUnsupportedRules(t *testing.T) {
 	malformed := "{"

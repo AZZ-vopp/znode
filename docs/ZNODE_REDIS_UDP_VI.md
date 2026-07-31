@@ -14,7 +14,7 @@ Redis; key được băm SHA-256):
     "UplinkOnly": 2,
     "DownlinkOnly": 4,
     "BufferSize": 128,
-    "DisableUDPContentSniffing": false
+    "DisableUDPContentSniffing": true
   },
   "Nodes": [
     {
@@ -86,13 +86,13 @@ không làm Pub/Sub nhanh hơn. Redis nên nằm cùng private network với ZNo
   luồng video UDP/QUIC, nhưng vẫn thấp hơn mặc định 512 KiB của Xray trên amd64.
 - `ConnIdle` mặc định 120 giây để các luồng video tải trước không bị ngắt quá
   sớm trong lúc tạm thời không truyền dữ liệu.
-- `DisableUDPContentSniffing=false` cho phép nhận diện hostname QUIC. Có thể đặt
-  thành `true` trên node rất ít RAM nếu không dùng route theo hostname UDP và
-  chấp nhận việc rule hostname không nhận diện được QUIC.
+- `DisableUDPContentSniffing=true` không giữ gói QUIC đầu tiên để đọc nội dung.
+  TCP/TLS vẫn được sniff khi có rule hostname; rule hostname riêng cho UDP/QUIC
+  cần đặt lại thành `false` và chấp nhận độ trễ đầu phiên trên đường truyền xa.
 - Sniffing inbound mặc định tắt khi node không có rule domain/protocol. Khi có
   rule cần nhận diện nội dung, ZNode dùng `routeOnly=true`: hostname chỉ phục vụ
   chọn route, không thay IP đích bằng kết quả DNS của VPS. Cơ chế này tránh lỗi
-  CDN Meta trên một số nhà mạng/VPS nhưng vẫn giữ được rule TikTok theo domain.
+  CDN Meta trên một số nhà mạng/VPS.
 - LinkManager tự loại khỏi `sync.Map` khi user không còn link; bucket speed của
   user hết TTL cũng được thu hồi.
 

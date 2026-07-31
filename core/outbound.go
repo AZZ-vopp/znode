@@ -18,7 +18,10 @@ func buildDefaultOutbound() (*core.OutboundHandlerConfig, error) {
 	//outboundDetourConfig.SendThrough = &sendthrough
 
 	proxySetting := &conf.FreedomConfig{
-		DomainStrategy: "UseIPv4v6",
+		// Keep every connection on the same Vietnamese VPS IPv4 egress. A
+		// configured-but-unusable IPv6 route otherwise makes applications that
+		// prefer QUIC fail intermittently and can expose a different geo region.
+		DomainStrategy: "UseIPv4",
 		FinalRules:     privateDestinationFinalRules(),
 	}
 	var setting json.RawMessage
