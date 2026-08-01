@@ -51,7 +51,7 @@ func (t *Task) Start(first bool) error {
 		defer timer.Stop()
 		if first {
 			if err := t.executeWithTimeout(stop); err != nil {
-				return
+				log.Errorf("Task %s initial execution error: %v; retrying after %s", t.Name, err, t.Interval)
 			}
 		}
 
@@ -65,8 +65,10 @@ func (t *Task) Start(first bool) error {
 			}
 
 			if err := t.executeWithTimeout(stop); err != nil {
-				log.Errorf("Task %s execution error: %v", t.Name, err)
-				return
+				// Panel outages are expected control-plane failures, not a reason to
+				// permanently stop traffic/accounting synchronization. Keep the
+				// periodic worker alive so it heals without restarting Xray.
+				log.Errorf("Task %s execution error: %v; keeping runtime and retrying", t.Name, err)
 			}
 		}
 	}(stop, done)

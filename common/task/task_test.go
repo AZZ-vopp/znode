@@ -2,6 +2,8 @@ package task
 
 import (
 	"context"
+	"errors"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -43,4 +45,32 @@ func TestCloseWaitsForActiveExecutionToObserveCancellation(t *testing.T) {
 	default:
 		t.Fatal("task close returned before the callback finished")
 	}
+}
+
+func TestTaskRetriesAfterTransientPanelFailure(t *testing.T) {
+	var attempts atomic.Int32
+	recovered := make(chan struct{})
+	task := &Task{
+		Name:     "panel-recovery-test",
+		Interval: 10 * time.Millisecond,
+		Execute: func(context.Context) error {
+			attempt := attempts.Add(1)
+			if attempt < 3 {
+				return errors.New("panel unavailable")
+			}
+			if attempt == 3 {
+				close(recovered)
+			}
+			return nil
+		},
+	}
+	if err := task.Start(true); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-recovered:
+	case <-time.After(time.Second):
+		t.Fatalf("task did not recover; attempts=%d", attempts.Load())
+	}
+	task.Close()
 }

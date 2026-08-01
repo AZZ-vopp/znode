@@ -57,10 +57,16 @@ func serverHandle(_ *cobra.Command, _ []string) {
 		log.Warn("geoip.dat and geosite.dat were not found together; geoip:/geosite: routing rules may fail")
 	}
 
-	prepared, err := prepareRuntime(config)
+	prepared, err := prepareInitialRuntime(config)
 	if err != nil {
 		log.WithField("err", err).Error("Prepare node runtime failed")
 		return
+	}
+	if prepared.offline {
+		log.WithFields(log.Fields{
+			"err":   prepared.offlineCause,
+			"nodes": len(prepared.config.NodeConfigs),
+		}).Warn("Panel unavailable; starting last-known-good offline runtime")
 	}
 	applyLogConfig(prepared.config)
 
@@ -76,7 +82,8 @@ func serverHandle(_ *cobra.Command, _ []string) {
 
 	limiter.Init()
 	reloadCh := make(chan struct{}, 1)
-	running, err := startPreparedRuntime(prepared, reloadCh)
+	snapshotCh := make(chan struct{}, 1)
+	running, err := startPreparedRuntime(prepared, reloadCh, snapshotCh)
 	if err != nil {
 		log.WithField("err", err).Error("Start runtime failed")
 		return
@@ -84,6 +91,9 @@ func serverHandle(_ *cobra.Command, _ []string) {
 	defer func() { closeRuntimeUntilDurable(running) }()
 	logRevokedAssignment(running.assignment)
 	log.WithField("nodes", len(running.config.NodeConfigs)).Info("Nodes started")
+	if err := persistRuntimeSnapshot(running.preparedRuntime); err != nil {
+		log.WithField("err", err).Warn("Persist last-known-good runtime snapshot failed")
+	}
 
 	agentMonitor := agent.NewMonitor(reloadCh)
 	if err := agentMonitor.MarkApplied(running.config.AgentConfig, running.assignment); err != nil {
@@ -126,11 +136,18 @@ func serverHandle(_ *cobra.Command, _ []string) {
 				continue
 			}
 			running = newRuntime
+			if err := persistRuntimeSnapshot(running.preparedRuntime); err != nil {
+				log.WithField("err", err).Warn("Persist last-known-good runtime snapshot failed")
+			}
 			logRevokedAssignment(running.assignment)
 			if err := agentMonitor.MarkApplied(running.config.AgentConfig, running.assignment); err != nil {
 				log.WithField("err", err).Warn("Update agent manifest monitor failed")
 			}
 			log.WithField("nodes", len(running.config.NodeConfigs)).Info("Reload successful")
+		case <-snapshotCh:
+			if err := persistRuntimeSnapshot(running.preparedRuntime); err != nil {
+				log.WithField("err", err).Warn("Refresh last-known-good runtime snapshot failed")
+			}
 		}
 	}
 }
@@ -142,9 +159,11 @@ func logRevokedAssignment(assignment agent.Assignment) {
 }
 
 type preparedRuntime struct {
-	config     *conf.Conf
-	nodes      *node.Node
-	assignment agent.Assignment
+	config       *conf.Conf
+	nodes        *node.Node
+	assignment   agent.Assignment
+	offline      bool
+	offlineCause error
 }
 
 type runningRuntime struct {
@@ -174,9 +193,12 @@ func prepareRuntime(configPath string) (*preparedRuntime, error) {
 	return &preparedRuntime{config: newConf, nodes: newNodes, assignment: assignment}, nil
 }
 
-func startPreparedRuntime(prepared *preparedRuntime, reloadCh chan struct{}) (*runningRuntime, error) {
+func startPreparedRuntime(prepared *preparedRuntime, reloadCh chan struct{}, snapshotChannels ...chan struct{}) (*runningRuntime, error) {
 	newCore := core.New(prepared.config)
 	newCore.ReloadCh = reloadCh
+	if len(snapshotChannels) > 0 {
+		newCore.SnapshotCh = snapshotChannels[0]
+	}
 	if err := newCore.Start(prepared.nodes.NodeInfos); err != nil {
 		return nil, err
 	}
@@ -200,6 +222,9 @@ func reloadRuntime(configPath string, old *runningRuntime, reloadCh chan struct{
 	// old ports are still listening.
 	newCore := core.New(prepared.config)
 	newCore.ReloadCh = reloadCh
+	if old != nil && old.core != nil {
+		newCore.SnapshotCh = old.core.SnapshotCh
+	}
 	if err := newCore.Start(prepared.nodes.NodeInfos); err != nil {
 		return nil, err
 	}
@@ -238,7 +263,7 @@ func restorePreviousRuntime(old *runningRuntime, reloadCh chan struct{}) error {
 	if old == nil || old.preparedRuntime == nil {
 		return fmt.Errorf("previous runtime is unavailable")
 	}
-	restored, err := startPreparedRuntime(old.preparedRuntime, reloadCh)
+	restored, err := startPreparedRuntime(old.preparedRuntime, reloadCh, old.core.SnapshotCh)
 	if err != nil {
 		return err
 	}

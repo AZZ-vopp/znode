@@ -19,6 +19,7 @@ import (
 const agentManifestPath = "/api/v2/server/agent/config"
 const agentMaintenanceReportPath = "/api/v2/server/agent/maintenance/report"
 const agentCertificateReportPath = "/api/v2/server/agent/certificate/report"
+const agentAuthorizationHeader = "X-ZBoard-Agent-Authorization"
 
 const maxAgentNodes = 10000
 
@@ -100,6 +101,13 @@ func (c *AgentClient) GetManifest(ctx context.Context) (*AgentManifest, error) {
 		return nil, fmt.Errorf("get agent manifest: received nil response")
 	}
 	if response.StatusCode() == http.StatusUnauthorized || response.StatusCode() == http.StatusForbidden {
+		// A CDN, WAF or maintenance proxy may generate a generic 401/403 while
+		// the panel is unavailable. Only an authenticated ZBoard response carries
+		// this explicit marker; generic denials are transient control-plane errors
+		// and must never tear down healthy VPN inbounds.
+		if !strings.EqualFold(strings.TrimSpace(response.Header().Get(agentAuthorizationHeader)), "revoked") {
+			return nil, fmt.Errorf("get agent manifest: unconfirmed authorization response HTTP %d", response.StatusCode())
+		}
 		return &AgentManifest{
 			Revision:             fmt.Sprintf("authorization-revoked:%d", response.StatusCode()),
 			Nodes:                make([]int, 0),

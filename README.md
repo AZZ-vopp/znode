@@ -14,6 +14,8 @@ Redis.
 - Tối ưu bộ đếm traffic và UDP để giảm CPU/RAM.
 - Gửi CPU, RAM, disk và tốc độ mạng về ZBoard.
 - TLS tự ký và SHA-256 certificate pinning.
+- Last-known-good offline runtime: panel mất kết nối hoặc ZNode khởi động lại
+  trong lúc web sập vẫn giữ node và user cuối cùng hoạt động.
 - Chỉ kết nối với ZBoard bằng nhận diện hai chiều, không chạy với V2Board gốc.
 
 Xem thêm [tài liệu Redis và tối ưu UDP](docs/ZNODE_REDIS_UDP_VI.md).
@@ -51,7 +53,7 @@ hoặc tự thay URL tải bằng nguồn không tin cậy.
 
 ## Biên dịch
 
-Yêu cầu Go 1.26.1 và experiment JSON v2:
+Yêu cầu Go 1.26.5 và experiment JSON v2:
 
 ```bash
 GOEXPERIMENT=jsonv2 go test ./...
@@ -74,6 +76,14 @@ Giữ cùng channel đã cấu hình trên panel, mặc định `v2board:device-
 Thông tin Agent được lưu tại `/etc/znode/config.json` với quyền `0600`. Không
 chia sẻ Agent token hoặc sao chép file này sang VPS khác.
 Mọi cấu hình hợp lệ phải có trường `"type": "zboard"` ở cấp cao nhất.
+
+Sau lần khởi động online thành công, ZNode ghi snapshot nguyên tử tại
+`/var/lib/znode/runtime.snapshot`. File có quyền `0600`, được xác thực HMAC bằng
+Agent token và chỉ được dùng khi API ZBoard không truy cập được. Snapshot không
+có thời hạn tự hết hiệu lực để VPS tiếp tục phục vụ trong sự cố dài; khi panel
+trở lại, các task tự đồng bộ cấu hình, user và traffic đang chờ. Chỉ phản hồi
+thu hồi Agent có marker riêng từ ứng dụng ZBoard mới được phép gỡ các inbound;
+trang lỗi `401/403` chung từ CDN/WAF không làm node dừng.
 
 ## Giấy phép
 

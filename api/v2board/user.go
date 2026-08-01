@@ -265,6 +265,15 @@ func validateUserList(users []UserInfo) error {
 	return nil
 }
 
+// ValidateUserListSnapshot applies the same semantic bounds to data restored
+// from the root-owned offline runtime snapshot as to a live panel response.
+func ValidateUserListSnapshot(users []UserInfo) error {
+	if len(users) > maxPanelUsers {
+		return fmt.Errorf("too many users")
+	}
+	return validateUserList(users)
+}
+
 // GetUserAlive will fetch the alive_ip count for users
 func (c *Client) GetUserAlive(ctx context.Context) (map[int]int, error) {
 	const path = "/api/v1/server/UniProxy/alivelist"

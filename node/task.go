@@ -65,6 +65,7 @@ func (c *Controller) nodeInfoMonitor(ctx context.Context) (err error) {
 	if newN != nil {
 		if reportingThresholdOnlyChange(c.info, newN) {
 			c.applyReportingThresholds(newN)
+			c.server.RequestSnapshot()
 			log.WithFields(log.Fields{
 				"tag":                       c.tag,
 				"node_report_min_traffic":   newN.Common.BaseConfig.NodeReportMinTraffic,
@@ -239,6 +240,9 @@ func (c *Controller) syncUsers(ctx context.Context) (err error) {
 	}
 	c.userList = newU
 	log.WithField("tag", c.tag).Infof("%d user deleted, %d user added, %d user modified", len(deleted), len(added), len(modified))
+	if len(deleted) > 0 || len(added) > 0 || len(modified) > 0 {
+		c.server.RequestSnapshot()
+	}
 	return nil
 }
 

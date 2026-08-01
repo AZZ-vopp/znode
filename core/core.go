@@ -29,12 +29,26 @@ type AddUsersParams struct {
 type V2Core struct {
 	Config     *conf.Conf
 	ReloadCh   chan struct{}
+	SnapshotCh chan struct{}
 	access     sync.Mutex
 	Server     *core.Instance
 	users      *UserMap
 	ihm        inbound.Manager
 	ohm        outbound.Manager
 	dispatcher *dispatcher.DefaultDispatcher
+}
+
+// RequestSnapshot coalesces last-known-good persistence requests. User sync
+// may update several logical nodes at once; one whole-runtime snapshot after
+// those changes is sufficient.
+func (v *V2Core) RequestSnapshot() {
+	if v == nil || v.SnapshotCh == nil {
+		return
+	}
+	select {
+	case v.SnapshotCh <- struct{}{}:
+	default:
+	}
 }
 
 type UserMap struct {

@@ -2,8 +2,10 @@ package node
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 	"sync"
 
 	panel "github.com/AZZ-vopp/znode/api/v2board"
@@ -15,6 +17,15 @@ import (
 type Node struct {
 	controllers []*Controller
 	NodeInfos   []*panel.NodeInfo
+}
+
+// RuntimeSnapshot is the last fully prepared desired state required to start
+// Xray without reaching the panel. It intentionally excludes Agent tokens;
+// callers rebuild per-node clients from the live root-owned config file.
+type RuntimeSnapshot struct {
+	NodeInfos []*panel.NodeInfo  `json:"node_infos"`
+	Users     [][]panel.UserInfo `json:"users"`
+	Alive     []map[int]int      `json:"alive"`
 }
 
 type controllerCloseResult struct {
@@ -51,6 +62,97 @@ func NewContext(ctx context.Context, nodes []conf.NodeConfig) (*Node, error) {
 		return nil, err
 	}
 	return n, nil
+}
+
+// NewFromRuntimeSnapshot prepares controllers from a previously validated
+// last-known-good state. Background polling still uses fresh API clients and
+// resumes automatically when the panel becomes available again.
+func NewFromRuntimeSnapshot(nodes []conf.NodeConfig, snapshot RuntimeSnapshot) (*Node, error) {
+	if len(nodes) != len(snapshot.NodeInfos) || len(nodes) != len(snapshot.Users) || len(nodes) != len(snapshot.Alive) {
+		return nil, fmt.Errorf("runtime snapshot shape does not match assigned nodes")
+	}
+	n := &Node{
+		controllers: make([]*Controller, len(nodes)),
+		NodeInfos:   make([]*panel.NodeInfo, len(nodes)),
+	}
+	for i := range nodes {
+		info := snapshot.NodeInfos[i]
+		if info == nil || info.Common == nil {
+			return nil, fmt.Errorf("runtime snapshot node %d is empty", i)
+		}
+		if info.Id != nodes[i].NodeID {
+			return nil, fmt.Errorf("runtime snapshot node ID %d does not match assignment %d", info.Id, nodes[i].NodeID)
+		}
+		if !strings.EqualFold(strings.TrimSpace(info.Common.PanelType), conf.RequiredPanelType) {
+			return nil, fmt.Errorf("runtime snapshot node %d has invalid panel type %q", info.Id, info.Common.PanelType)
+		}
+		if err := panel.ValidateUserListSnapshot(snapshot.Users[i]); err != nil {
+			return nil, fmt.Errorf("runtime snapshot users for node %d: %w", info.Id, err)
+		}
+		client, err := panel.New(&nodes[i])
+		if err != nil {
+			return nil, err
+		}
+		controller := NewController(client, &nodes[i], info)
+		controller.tag = info.Tag
+		controller.userList = append([]panel.UserInfo(nil), snapshot.Users[i]...)
+		controller.aliveMap = cloneAliveMap(snapshot.Alive[i])
+		controller.prepared = true
+		n.controllers[i] = controller
+		n.NodeInfos[i] = info
+	}
+	if err := ValidateUniqueServerPorts(n.NodeInfos); err != nil {
+		return nil, err
+	}
+	return n, nil
+}
+
+// RuntimeSnapshot returns an isolated copy suitable for atomic persistence.
+func (n *Node) RuntimeSnapshot() (RuntimeSnapshot, error) {
+	snapshot := RuntimeSnapshot{
+		NodeInfos: make([]*panel.NodeInfo, len(n.controllers)),
+		Users:     make([][]panel.UserInfo, len(n.controllers)),
+		Alive:     make([]map[int]int, len(n.controllers)),
+	}
+	for i, controller := range n.controllers {
+		if controller == nil {
+			return RuntimeSnapshot{}, fmt.Errorf("runtime snapshot controller %d is empty", i)
+		}
+		controller.userSyncMu.Lock()
+		info, err := cloneNodeInfo(controller.info)
+		if err != nil {
+			controller.userSyncMu.Unlock()
+			return RuntimeSnapshot{}, fmt.Errorf("clone runtime node %d: %w", i, err)
+		}
+		snapshot.NodeInfos[i] = info
+		snapshot.Users[i] = append([]panel.UserInfo(nil), controller.userList...)
+		snapshot.Alive[i] = cloneAliveMap(controller.aliveMap)
+		controller.userSyncMu.Unlock()
+	}
+	return snapshot, nil
+}
+
+func cloneNodeInfo(source *panel.NodeInfo) (*panel.NodeInfo, error) {
+	if source == nil {
+		return nil, fmt.Errorf("node info is empty")
+	}
+	encoded, err := json.Marshal(source)
+	if err != nil {
+		return nil, err
+	}
+	var cloned panel.NodeInfo
+	if err := json.Unmarshal(encoded, &cloned); err != nil {
+		return nil, err
+	}
+	return &cloned, nil
+}
+
+func cloneAliveMap(source map[int]int) map[int]int {
+	cloned := make(map[int]int, len(source))
+	for id, count := range source {
+		cloned[id] = count
+	}
+	return cloned
 }
 
 // ValidateUniqueServerPorts performs an agent-side preflight before any

@@ -120,6 +120,7 @@ func TestAgentClientRejectsHTTP200AuthFailure(t *testing.T) {
 
 func TestAgentClientFailsClosedWhenAuthorizationIsRevoked(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set(agentAuthorizationHeader, "revoked")
 		http.Error(w, `{"status":"fail","message":"token is error"}`, http.StatusUnauthorized)
 	}))
 	defer server.Close()
@@ -136,6 +137,23 @@ func TestAgentClientFailsClosedWhenAuthorizationIsRevoked(t *testing.T) {
 	}
 	if !manifest.AuthorizationRevoked || len(manifest.Nodes) != 0 || manifest.EffectiveRevision() == "" {
 		t.Fatalf("authorization denial did not produce a revoked empty manifest: %+v", manifest)
+	}
+}
+
+func TestAgentClientKeepsRuntimeForGenericCDNAuthorizationPage(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, "cloud edge temporarily unavailable", http.StatusForbidden)
+	}))
+	defer server.Close()
+
+	client, err := NewAgentClient(conf.AgentConfig{
+		Enable: true, APIHost: server.URL, AgentID: "agent", AgentToken: "token",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if manifest, err := client.GetManifest(context.Background()); err == nil || manifest != nil {
+		t.Fatalf("generic edge denial was treated as an authoritative revocation: manifest=%+v err=%v", manifest, err)
 	}
 }
 
