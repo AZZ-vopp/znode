@@ -2,7 +2,9 @@ package node
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"sync"
 
 	panel "github.com/AZZ-vopp/znode/api/v2board"
 	"github.com/AZZ-vopp/znode/conf"
@@ -13,6 +15,12 @@ import (
 type Node struct {
 	controllers []*Controller
 	NodeInfos   []*panel.NodeInfo
+}
+
+type controllerCloseResult struct {
+	controller *Controller
+	wasActive  bool
+	err        error
 }
 
 func New(nodes []conf.NodeConfig) (*Node, error) {
@@ -107,32 +115,63 @@ func (n *Node) Start(nodes []conf.NodeConfig, core *core.V2Core) error {
 }
 
 func (n *Node) Close() error {
-	closed := make([]*Controller, 0, len(n.controllers))
-	for _, c := range n.controllers {
+	results := closeControllersConcurrently(n.controllers, func(controller *Controller) error {
+		return controller.Close()
+	})
+
+	var closeErr error
+	for _, result := range results {
+		if result.err != nil {
+			log.Errorf("close controller failed: %v", result.err)
+			closeErr = errors.Join(closeErr, result.err)
+		}
+	}
+	if closeErr == nil {
+		return nil
+	}
+
+	// Closing a multi-node Agent is transactional from the caller's
+	// perspective. A controller whose Close failed restores itself. Bring every
+	// other controller that closed successfully back before reload reports that
+	// it retained the previous runtime. Restore in reverse configuration order,
+	// matching the previous sequential rollback behavior.
+	var restoreErr error
+	for index := len(results) - 1; index >= 0; index-- {
+		result := results[index]
+		if result.controller == nil || !result.wasActive || result.err != nil {
+			continue
+		}
+		if err := result.controller.Start(result.controller.server); err != nil {
+			restoreErr = errors.Join(restoreErr, err)
+		}
+	}
+	if restoreErr != nil {
+		return fmt.Errorf("close node controllers: %w; restore previous controllers: %v", closeErr, restoreErr)
+	}
+	return fmt.Errorf("close node controllers: %w; previous controllers restored", closeErr)
+}
+
+func closeControllersConcurrently(controllers []*Controller, closeController func(*Controller) error) []controllerCloseResult {
+	results := make([]controllerCloseResult, len(controllers))
+	var wait sync.WaitGroup
+	for index, c := range controllers {
 		if c == nil {
 			continue
 		}
+
+		// Each controller owns a distinct inbound/tag. Closing them concurrently
+		// makes the traffic-drain deadline apply once per Agent instead of once
+		// per node (N nodes previously took up to N * 5 seconds).
+		c.userSyncMu.Lock()
 		wasActive := c.started
-		if err := c.Close(); err != nil {
-			log.Errorf("close controller failed: %v", err)
-			// Closing a multi-node Agent is transactional from the caller's
-			// perspective. Controllers closed earlier in this pass must be brought
-			// back before reload reports that it retained the previous runtime.
-			var restoreErr error
-			for index := len(closed) - 1; index >= 0; index-- {
-				controller := closed[index]
-				if startErr := controller.Start(controller.server); startErr != nil && restoreErr == nil {
-					restoreErr = startErr
-				}
-			}
-			if restoreErr != nil {
-				return fmt.Errorf("close node controllers: %w; restore previous controllers: %v", err, restoreErr)
-			}
-			return fmt.Errorf("close node controllers: %w; previous controllers restored", err)
-		}
-		if wasActive {
-			closed = append(closed, c)
-		}
+		c.userSyncMu.Unlock()
+		results[index] = controllerCloseResult{controller: c, wasActive: wasActive}
+		wait.Add(1)
+		go func(index int, controller *Controller) {
+			defer wait.Done()
+			results[index].err = closeController(controller)
+		}(index, c)
 	}
-	return nil
+	wait.Wait()
+	return results
 }

@@ -108,3 +108,45 @@ func TestMultiNodeCloseRestoresEarlierControllersWhenLaterSpoolFails(t *testing.
 		t.Fatalf("traffic spool directory disappeared: %v", err)
 	}
 }
+
+func TestCloseControllersStartsEveryDrainConcurrently(t *testing.T) {
+	controllers := []*Controller{{}, {}, {}}
+	started := make(chan *Controller, len(controllers))
+	release := make(chan struct{})
+	done := make(chan []controllerCloseResult, 1)
+
+	go func() {
+		done <- closeControllersConcurrently(controllers, func(controller *Controller) error {
+			started <- controller
+			<-release
+			return nil
+		})
+	}()
+
+	seen := make(map[*Controller]bool, len(controllers))
+	deadline := time.NewTimer(time.Second)
+	defer deadline.Stop()
+	for len(seen) < len(controllers) {
+		select {
+		case controller := <-started:
+			seen[controller] = true
+		case <-deadline.C:
+			t.Fatalf("only %d/%d controller drains started concurrently", len(seen), len(controllers))
+		}
+	}
+	close(release)
+
+	select {
+	case results := <-done:
+		if len(results) != len(controllers) {
+			t.Fatalf("got %d close results, want %d", len(results), len(controllers))
+		}
+		for index, result := range results {
+			if result.controller != controllers[index] || result.err != nil {
+				t.Fatalf("unexpected result %d: %#v", index, result)
+			}
+		}
+	case <-time.After(time.Second):
+		t.Fatal("parallel controller close did not finish after drains were released")
+	}
+}
