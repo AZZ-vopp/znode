@@ -1,5 +1,15 @@
 #!/bin/bash
 
+set -o pipefail
+umask 077
+
+# This installer runs as root. Resolve every helper from operating-system
+# directories only and prevent child Bash/dynamic-loader processes from
+# inheriting attacker-selected startup code from the invoking shell.
+PATH=/usr/sbin:/usr/bin:/sbin:/bin
+export PATH
+unset BASH_ENV ENV CDPATH GLOBIGNORE LD_PRELOAD LD_LIBRARY_PATH OPENSSL_CONF
+
 red='\033[0;31m'
 green='\033[0;32m'
 yellow='\033[0;33m'
@@ -42,34 +52,104 @@ NODE_ID_ARG=""
 API_KEY_ARG=""
 AGENT_ID_ARG=""
 AGENT_TOKEN_ARG=""
+AGENT_TOKEN_STDIN=false
 POLL_INTERVAL_ARG="15"
 RELEASE_REPO_ARG="${ZNODE_RELEASE_REPO:-AZZ-vopp/znode}"
 RELEASE_BRANCH_ARG="${ZNODE_RELEASE_BRANCH:-main}"
-GEODATA_BASE_URL="${ZNODE_GEODATA_URL:-https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download}"
+ZNODE_OPERATION_LOCK_FILE="/run/znode-operation.lock"
+ZNODE_OPERATION_LOCK_DIRECTORY="${ZNODE_OPERATION_LOCK_FILE}.d"
+ZNODE_OPERATION_LOCK_BACKEND=""
+
+acquire_znode_operation_lock() {
+    local owner="" stale_directory lock_parent
+    if [[ -n "$ZNODE_OPERATION_LOCK_BACKEND" ]]; then
+        return 0
+    fi
+
+    lock_parent="${ZNODE_OPERATION_LOCK_DIRECTORY%/*}"
+    mkdir -p "$lock_parent" || return 1
+    if ! mkdir "$ZNODE_OPERATION_LOCK_DIRECTORY" 2>/dev/null; then
+        if [[ -r "$ZNODE_OPERATION_LOCK_DIRECTORY/pid" ]]; then
+            owner=$(sed -n '1p' "$ZNODE_OPERATION_LOCK_DIRECTORY/pid")
+        fi
+        if [[ "$owner" =~ ^[0-9]+$ ]] && kill -0 "$owner" 2>/dev/null; then
+            echo -e "${red}Một thao tác cài đặt/rollback ZNode khác đang chạy; hãy thử lại sau.${plain}"
+            return 1
+        fi
+        if [[ ! "$owner" =~ ^[0-9]+$ ]]; then
+            echo -e "${red}Khóa thao tác ZNode không có chủ sở hữu hợp lệ; hãy kiểm tra $ZNODE_OPERATION_LOCK_DIRECTORY thủ công.${plain}"
+            return 1
+        fi
+        stale_directory="${ZNODE_OPERATION_LOCK_DIRECTORY}.stale.$$"
+        mv "$ZNODE_OPERATION_LOCK_DIRECTORY" "$stale_directory" 2>/dev/null || return 1
+        if ! mkdir "$ZNODE_OPERATION_LOCK_DIRECTORY" 2>/dev/null; then
+            rm -rf "$stale_directory"
+            return 1
+        fi
+        rm -rf "$stale_directory"
+    fi
+    printf '%s\n' "$$" > "$ZNODE_OPERATION_LOCK_DIRECTORY/pid" || {
+        rm -rf "$ZNODE_OPERATION_LOCK_DIRECTORY"
+        return 1
+    }
+    ZNODE_OPERATION_LOCK_BACKEND="mkdir"
+}
+
+release_znode_operation_lock() {
+    local owner=""
+    if [[ "$ZNODE_OPERATION_LOCK_BACKEND" == "mkdir" ]]; then
+        [[ -r "$ZNODE_OPERATION_LOCK_DIRECTORY/pid" ]] \
+            && owner=$(sed -n '1p' "$ZNODE_OPERATION_LOCK_DIRECTORY/pid")
+        if [[ "$owner" == "$$" ]]; then
+            rm -rf "$ZNODE_OPERATION_LOCK_DIRECTORY"
+        fi
+    fi
+    ZNODE_OPERATION_LOCK_BACKEND=""
+}
+
+validate_geodata() {
+    local release_directory="${1:-/usr/local/znode}"
+    local file
+
+    for file in geoip.dat geosite.dat; do
+        if [[ ! -s "$release_directory/$file" ]] || [[ $(wc -c < "$release_directory/$file") -lt 1024 ]]; then
+            echo -e "${red}Gói phát hành đã xác minh không chứa $file hợp lệ; từ chối trộn dữ liệu ngoài release.${plain}"
+            return 1
+        fi
+    done
+}
 
 install_geodata() (
+    local release_directory="${1:-/usr/local/znode}"
     local destination="/etc/znode"
-    local temporary
-    temporary=$(mktemp -d) || return 1
-    trap 'rm -rf "$temporary"' EXIT
+    local transaction_directory file restore_file
 
+    validate_geodata "$release_directory" || return 1
     mkdir -p "$destination"
+    transaction_directory=$(mktemp -d "$destination/.geodata.XXXXXX") || return 1
+    trap 'rm -rf "$transaction_directory"' EXIT
+
+    # Stage both new files and backups on the destination filesystem. Each
+    # rename is atomic; if either commit fails, restore the complete old pair.
     for file in geoip.dat geosite.dat; do
-        if [[ -s "/usr/local/znode/$file" ]] && [[ $(wc -c < "/usr/local/znode/$file") -ge 1024 ]]; then
-            install -m 0644 "/usr/local/znode/$file" "$destination/$file"
-            continue
+        install -m 0644 "$release_directory/$file" "$transaction_directory/new-$file" || return 1
+        if [[ -e "$destination/$file" ]]; then
+            cp -p "$destination/$file" "$transaction_directory/old-$file" || return 1
+        else
+            : > "$transaction_directory/no-old-$file"
         fi
-        echo -e "${yellow}Không có $file trong gói phát hành, đang tải dữ liệu định tuyến mới nhất...${plain}"
-        if ! curl --fail --location --silent --show-error --retry 3 --connect-timeout 15 \
-            "$GEODATA_BASE_URL/$file" -o "$temporary/$file"; then
-            echo -e "${red}Không thể tải $file.${plain}"
+    done
+    for file in geoip.dat geosite.dat; do
+        if ! mv -f "$transaction_directory/new-$file" "$destination/$file"; then
+            for restore_file in geoip.dat geosite.dat; do
+                if [[ -e "$transaction_directory/old-$restore_file" ]]; then
+                    mv -f "$transaction_directory/old-$restore_file" "$destination/$restore_file" || true
+                elif [[ -e "$transaction_directory/no-old-$restore_file" ]]; then
+                    rm -f "$destination/$restore_file"
+                fi
+            done
             return 1
         fi
-        if [[ $(wc -c < "$temporary/$file") -lt 1024 ]]; then
-            echo -e "${red}$file tải về không hợp lệ hoặc đã bị cắt ngắn.${plain}"
-            return 1
-        fi
-        install -m 0644 "$temporary/$file" "$destination/$file"
     done
     echo -e "${green}Đã cài geoip.dat và geosite.dat vào $destination.${plain}"
 )
@@ -111,26 +191,95 @@ EOF
     chmod 755 "$schedule_dir/znode-log-cleanup"
 }
 
-# Upgrade only the previous low-memory defaults. Values that the operator has
-# customized are intentionally left untouched.
+# Upgrade legacy defaults that either starved video buffers or held the first
+# UDP/QUIC packets for content sniffing. TCP/TLS domain routing remains active.
 migrate_tiktok_compat_profile() {
     local config_file="/etc/znode/config.json"
     local temporary
     [[ -f "$config_file" ]] || return 0
-    if ! grep -Eq '"ConnIdle"[[:space:]]*:[[:space:]]*30([[:space:]]*,)|"BufferSize"[[:space:]]*:[[:space:]]*16([[:space:]]*,)|"DisableUDPContentSniffing"[[:space:]]*:[[:space:]]*true' "$config_file"; then
+    if ! grep -Eq '"Handshake"[[:space:]]*:[[:space:]]*4([[:space:]]*,)|"ConnIdle"[[:space:]]*:[[:space:]]*30([[:space:]]*,)|"BufferSize"[[:space:]]*:[[:space:]]*16([[:space:]]*,)|"DisableUDPContentSniffing"[[:space:]]*:[[:space:]]*false' "$config_file"; then
         return 0
     fi
     temporary=$(mktemp "${config_file}.XXXXXX") || return 1
 
     sed -E \
+        -e 's/"Handshake"[[:space:]]*:[[:space:]]*4[[:space:]]*,/"Handshake": 15,/' \
         -e 's/"ConnIdle"[[:space:]]*:[[:space:]]*30[[:space:]]*,/"ConnIdle": 120,/' \
         -e 's/"BufferSize"[[:space:]]*:[[:space:]]*16[[:space:]]*,/"BufferSize": 128,/' \
-        -e 's/"DisableUDPContentSniffing"[[:space:]]*:[[:space:]]*true/"DisableUDPContentSniffing": false/' \
+        -e 's/"DisableUDPContentSniffing"[[:space:]]*:[[:space:]]*false/"DisableUDPContentSniffing": true/' \
         "$config_file" > "$temporary"
 
     chmod 600 "$temporary"
     mv -f "$temporary" "$config_file"
     echo -e "${green}Đã nâng cấu hình UDP/QUIC để ổn định TikTok và video.${plain}"
+}
+
+secure_znode_config_permissions() {
+    local config_file="/etc/znode/config.json"
+    [[ -e "$config_file" ]] || return 0
+    if [[ -L "$config_file" ]] || [[ ! -f "$config_file" ]]; then
+        echo -e "${red}Từ chối cấu hình ZNode không phải regular file.${plain}"
+        return 1
+    fi
+    chown root:root "$config_file" && chmod 600 "$config_file"
+}
+
+# Bind every installed runtime to ZBoard. Existing ZNode configs are upgraded
+# in place, while an explicit incompatible type is never overwritten.
+ensure_zboard_config_type() {
+    local config_file="/etc/znode/config.json"
+    local temporary
+    [[ -f "$config_file" ]] || return 0
+
+    if grep -Eqi '"type"[[:space:]]*:' "$config_file"; then
+        if grep -Eqi '"type"[[:space:]]*:[[:space:]]*"zboard"' "$config_file"; then
+            secure_znode_config_permissions
+            return $?
+        fi
+        echo -e "${red}Cấu hình ZNode có type không tương thích; yêu cầu type=zboard.${plain}"
+        return 1
+    fi
+
+    temporary=$(mktemp "${config_file}.XXXXXX") || return 1
+    if ! awk '
+        BEGIN { inserted = 0 }
+        !inserted {
+            position = index($0, "{")
+            if (position > 0) {
+                print substr($0, 1, position)
+                print "    \"type\": \"zboard\","
+                remainder = substr($0, position + 1)
+                if (length(remainder) > 0) print remainder
+                inserted = 1
+                next
+            }
+        }
+        { print }
+        END { if (!inserted) exit 2 }
+    ' "$config_file" > "$temporary"; then
+        rm -f "$temporary"
+        echo -e "${red}Không thể thêm type=zboard vào cấu hình hiện tại.${plain}"
+        return 1
+    fi
+    if ! grep -Eqi '"type"[[:space:]]*:[[:space:]]*"zboard"' "$temporary"; then
+        rm -f "$temporary"
+        echo -e "${red}Không thể xác nhận type=zboard trong cấu hình mới.${plain}"
+        return 1
+    fi
+    chmod 600 "$temporary"
+    mv -f "$temporary" "$config_file"
+    secure_znode_config_permissions || return 1
+    echo -e "${green}Đã khóa cấu hình ZNode với type=zboard.${plain}"
+}
+
+allow_legacy_v2node_config() {
+    # v2node and ZNode may coexist. Never import or rewrite the legacy config;
+    # ZNode always creates its own /etc/znode/config.json from the Agent
+    # command. Operators are responsible for assigning distinct listen ports.
+    if [[ -f /etc/v2node/config.json && ! -f /etc/znode/config.json ]]; then
+        echo -e "${yellow}Phát hiện cấu hình v2node cũ; giữ nguyên và cài ZNode độc lập. Hãy bảo đảm hai dịch vụ dùng cổng khác nhau.${plain}"
+    fi
+    return 0
 }
 
 parse_args() {
@@ -145,7 +294,10 @@ parse_args() {
             --agent-id)
                 AGENT_ID_ARG="$2"; shift 2 ;;
             --agent-token)
-                AGENT_TOKEN_ARG="$2"; shift 2 ;;
+                echo -e "${red}--agent-token is disabled because command-line secrets leak through process lists and shell history. Use --agent-token-stdin.${plain}"
+                exit 1 ;;
+            --agent-token-stdin)
+                AGENT_TOKEN_STDIN=true; shift ;;
             --poll-interval)
                 POLL_INTERVAL_ARG="$2"; shift 2 ;;
             --release-repo)
@@ -153,8 +305,7 @@ parse_args() {
             --release-branch)
                 RELEASE_BRANCH_ARG="$2"; shift 2 ;;
             -h|--help)
-                echo "Agent: $0 [version] --api-host URL --agent-id ID --agent-token TOKEN [--poll-interval SEC] [--release-repo OWNER/REPO]"
-                echo "Legacy: $0 [version] --api-host URL --node-id ID --api-key KEY"
+                echo "Agent: $0 [version] --api-host URL --agent-id ID --agent-token-stdin [--poll-interval SEC] [--release-repo OWNER/REPO]"
                 exit 0 ;;
             --*)
                 echo "Tham số không xác định: $1"; exit 1 ;;
@@ -169,30 +320,93 @@ parse_args() {
     done
 }
 
+load_agent_token() {
+    if [[ "$AGENT_TOKEN_STDIN" != true ]]; then
+        return 0
+    fi
+    if [[ -n "$AGENT_TOKEN_ARG" ]]; then
+        echo -e "${red}Use only one of --agent-token or --agent-token-stdin.${plain}"
+        exit 1
+    fi
+    if ! IFS= read -r AGENT_TOKEN_ARG || [[ -z "$AGENT_TOKEN_ARG" ]]; then
+        echo -e "${red}Could not read the Agent token from standard input.${plain}"
+        exit 1
+    fi
+}
+
 validate_release_source() {
-    if [[ ! "$RELEASE_REPO_ARG" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]]; then
+    if [[ ! "$RELEASE_REPO_ARG" =~ ^[A-Za-z0-9][A-Za-z0-9_.-]*/[A-Za-z0-9][A-Za-z0-9_.-]*$ ]]; then
         echo -e "${red}Invalid --release-repo; expected OWNER/REPO.${plain}"
         exit 1
     fi
-    if [[ ! "$RELEASE_BRANCH_ARG" =~ ^[A-Za-z0-9._/-]+$ ]]; then
+    if [[ ! "$RELEASE_BRANCH_ARG" =~ ^[A-Za-z0-9][A-Za-z0-9._/-]*$ ]] \
+        || [[ "$RELEASE_BRANCH_ARG" == *..* ]] || [[ "$RELEASE_BRANCH_ARG" == *//* ]]; then
         echo -e "${red}Invalid --release-branch.${plain}"
         exit 1
     fi
 }
 
-validate_agent_args() {
-    if [[ -z "$AGENT_ID_ARG" && -z "$AGENT_TOKEN_ARG" ]]; then
-        return 0
+https_api_origin() {
+    local api_host="$1"
+    local remainder authority host port normalized_host port_number
+
+    if [[ ! "$api_host" =~ ^https:// ]] \
+        || [[ "$api_host" == *\?* ]] \
+        || [[ "$api_host" == *\#* ]] \
+        || [[ "$api_host" == *\"* ]] \
+        || [[ "$api_host" == *\\* ]] \
+        || [[ "$api_host" =~ [[:space:]] ]]; then
+        return 1
     fi
-    if [[ -z "$API_HOST_ARG" || -z "$AGENT_ID_ARG" || -z "$AGENT_TOKEN_ARG" ]]; then
-        echo -e "${red}Agent install requires --api-host, --agent-id and --agent-token together.${plain}"
+
+    remainder="${api_host#https://}"
+    authority="${remainder%%/*}"
+    if [[ -z "$authority" || "$authority" == *@* ]] \
+        || [[ ! "$authority" =~ ^(\[[0-9A-Fa-f:.]+\]|[A-Za-z0-9][A-Za-z0-9.-]*)(:([0-9]{1,5}))?$ ]]; then
+        return 1
+    fi
+
+    host="${BASH_REMATCH[1]}"
+    port="${BASH_REMATCH[3]}"
+    if [[ -n "$port" ]]; then
+        port_number=$((10#$port))
+        if (( port_number < 1 || port_number > 65535 )); then
+            return 1
+        fi
+    fi
+
+    normalized_host=$(printf '%s' "$host" | tr '[:upper:]' '[:lower:]')
+    if [[ -z "$port" || "$port_number" -eq 443 ]]; then
+        printf 'https://%s\n' "$normalized_host"
+    else
+        printf 'https://%s:%d\n' "$normalized_host" "$port_number"
+    fi
+}
+
+validate_https_api_host() {
+    https_api_origin "$1" >/dev/null
+}
+
+validate_agent_args() {
+    if [[ -n "$NODE_ID_ARG" || -n "$API_KEY_ARG" ]]; then
+        echo -e "${red}Legacy --node-id/--api-key enrollment is disabled. Use the per-VPS Agent command from ZBoard.${plain}"
         exit 1
     fi
-    if [[ ! "$API_HOST_ARG" =~ ^https?:// ]] ||
-       [[ "$API_HOST_ARG" == *\"* ]] ||
-       [[ "$API_HOST_ARG" == *\\* ]] ||
-       [[ "$API_HOST_ARG" =~ [[:space:]] ]]; then
-        echo -e "${red}Invalid --api-host; expected an HTTP(S) URL without quotes, backslashes or spaces.${plain}"
+    if [[ -z "$AGENT_ID_ARG" && -z "$AGENT_TOKEN_ARG" ]]; then
+        if [[ -r /etc/znode/config.json ]] \
+            && grep -Eq '"AgentID"[[:space:]]*:[[:space:]]*"[^"]+"' /etc/znode/config.json \
+            && grep -Eq '"AgentToken"[[:space:]]*:[[:space:]]*"[^"]+"' /etc/znode/config.json; then
+            return 0
+        fi
+        echo -e "${red}A new ZNode install requires the per-VPS Agent command generated by ZBoard.${plain}"
+        exit 1
+    fi
+    if [[ -z "$API_HOST_ARG" || -z "$AGENT_ID_ARG" || -z "$AGENT_TOKEN_ARG" ]]; then
+        echo -e "${red}Agent install requires --api-host, --agent-id and a token from --agent-token-stdin.${plain}"
+        exit 1
+    fi
+    if ! validate_https_api_host "$API_HOST_ARG"; then
+        echo -e "${red}Invalid --api-host; expected an HTTPS URL without quotes, backslashes or spaces.${plain}"
         exit 1
     fi
     if [[ ! "$AGENT_ID_ARG" =~ ^[A-Za-z0-9._~-]+$ ]]; then
@@ -209,19 +423,62 @@ validate_agent_args() {
     fi
 }
 
+rewrite_agent_token() {
+    local input_file="$1"
+    local output_file="$2"
+    local new_token="$3"
+    local updated_token line
+    local replaced_count=0
+    local unsafe_token_line=false
+
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        if [[ "$line" =~ ^([[:space:]]*)\"AgentToken\"[[:space:]]*:[[:space:]]*\"[^\"]*\"([[:space:]]*)(,?)([[:space:]]*)$ ]]; then
+            printf '%s"AgentToken": "%s"%s%s%s\n' \
+                "${BASH_REMATCH[1]}" "$new_token" \
+                "${BASH_REMATCH[2]}" "${BASH_REMATCH[3]}" "${BASH_REMATCH[4]}"
+            ((replaced_count += 1))
+        elif [[ "$line" =~ ^[[:space:]]*\"AgentToken\"[[:space:]]*: ]]; then
+            printf '%s\n' "$line"
+            unsafe_token_line=true
+        else
+            printf '%s\n' "$line"
+        fi
+    done < "$input_file" > "$output_file"
+
+    updated_token=$(sed -n 's/^[[:space:]]*"AgentToken"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$output_file" | head -n 1)
+    [[ "$unsafe_token_line" != true && "$replaced_count" -eq 1 && "$updated_token" == "$new_token" ]]
+}
+
 validate_existing_agent_binding() {
-    if [[ -z "$AGENT_ID_ARG" || ! -f /etc/znode/config.json ]]; then
+    if [[ ! -f /etc/znode/config.json ]]; then
         return 0
     fi
 
-    local existing_agent_id
+    local existing_agent_id existing_api_host normalized_existing_host normalized_supplied_host
     existing_agent_id=$(sed -n 's/^[[:space:]]*"AgentID"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' /etc/znode/config.json | head -n 1)
     if [[ -z "$existing_agent_id" ]]; then
         echo -e "${red}This VPS already has a manual znode config. Back it up and remove /etc/znode/config.json before enrolling an agent.${plain}"
         exit 1
     fi
+
+    existing_api_host=$(sed -n 's/^[[:space:]]*"ApiHost"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' /etc/znode/config.json | head -n 1)
+    if ! validate_https_api_host "$existing_api_host"; then
+        echo -e "${red}Existing Agent.ApiHost is missing or does not use HTTPS; refusing to install or rotate credentials until the config is migrated.${plain}"
+        exit 1
+    fi
+
+    if [[ -z "$AGENT_ID_ARG" ]]; then
+        return 0
+    fi
     if [[ "$existing_agent_id" != "$AGENT_ID_ARG" ]]; then
         echo -e "${red}This VPS is already enrolled as agent ${existing_agent_id}; refusing to replace it with ${AGENT_ID_ARG}.${plain}"
+        exit 1
+    fi
+
+    normalized_existing_host=$(https_api_origin "$existing_api_host") || exit 1
+    normalized_supplied_host=$(https_api_origin "$API_HOST_ARG") || exit 1
+    if [[ "$normalized_existing_host" != "$normalized_supplied_host" ]]; then
+        echo -e "${red}This VPS is bound to a different ApiHost; refusing to rotate its token or retarget the panel automatically.${plain}"
         exit 1
     fi
 
@@ -237,15 +494,17 @@ validate_existing_agent_binding() {
     fi
     if [[ "$existing_agent_token" != "$AGENT_TOKEN_ARG" ]]; then
         local updated_config
-        updated_config=$(mktemp /etc/znode/config.json.XXXXXX)
-        sed "s|^\([[:space:]]*\"AgentToken\"[[:space:]]*:[[:space:]]*\"\)[^\"]*\(\".*\)$|\1${AGENT_TOKEN_ARG}\2|" /etc/znode/config.json > "$updated_config"
-        if ! grep -q "\"AgentToken\"[[:space:]]*:[[:space:]]*\"${AGENT_TOKEN_ARG}\"" "$updated_config"; then
+        updated_config=$(mktemp /etc/znode/config.json.XXXXXX) || exit 1
+        if ! rewrite_agent_token /etc/znode/config.json "$updated_config" "$AGENT_TOKEN_ARG"; then
             rm -f "$updated_config"
             echo -e "${red}Could not update AgentToken safely.${plain}"
             exit 1
         fi
-        chmod 600 "$updated_config"
-        mv -f "$updated_config" /etc/znode/config.json
+        if ! chmod 600 "$updated_config" || ! mv -f "$updated_config" /etc/znode/config.json; then
+            rm -f "$updated_config"
+            echo -e "${red}Could not commit the AgentToken update safely.${plain}"
+            exit 1
+        fi
         echo -e "${green}Updated the token for existing agent ${existing_agent_id}.${plain}"
     fi
 
@@ -362,23 +621,23 @@ install_base() {
             echo "Đang cài kho EPEL..."
             yum install -y epel-release >/dev/null 2>&1
         fi
-        need_install_yum wget curl unzip tar cronie socat ca-certificates pv nano
+        need_install_yum wget curl unzip tar cronie socat ca-certificates openssl pv nano
         update-ca-trust force-enable >/dev/null 2>&1 || true
     elif [[ x"${release}" == x"alpine" ]]; then
-        need_install_apk wget curl unzip tar socat ca-certificates pv nano
+        need_install_apk wget curl unzip tar socat ca-certificates openssl pv nano
         update-ca-certificates >/dev/null 2>&1 || true
     elif [[ x"${release}" == x"debian" ]]; then
-        need_install_apt wget curl unzip tar cron socat ca-certificates pv nano
+        need_install_apt wget curl unzip tar cron socat ca-certificates openssl pv nano
         update-ca-certificates >/dev/null 2>&1 || true
     elif [[ x"${release}" == x"ubuntu" ]]; then
-        need_install_apt wget curl unzip tar cron socat ca-certificates pv nano
+        need_install_apt wget curl unzip tar cron socat ca-certificates openssl pv nano
         update-ca-certificates >/dev/null 2>&1 || true
     elif [[ x"${release}" == x"arch" ]]; then
         echo "Đang cập nhật cơ sở dữ liệu gói..."
         pacman -Sy --noconfirm >/dev/null 2>&1
         # --needed sẽ bỏ qua các gói đã cài
         echo "Đang cài các gói bắt buộc..."
-        pacman -S --noconfirm --needed wget curl unzip tar cronie socat ca-certificates pv nano >/dev/null 2>&1
+        pacman -S --noconfirm --needed wget curl unzip tar cronie socat ca-certificates openssl pv nano >/dev/null 2>&1
     fi
 }
 
@@ -404,116 +663,37 @@ check_status() {
     fi
 }
 
-generate_znode_config() {
-        local api_host="$1"
-        local node_id="$2"
-        local api_key="$3"
-
-        mkdir -p /etc/znode >/dev/null 2>&1
-        cat > /etc/znode/config.json <<EOF
-{
-    "Log": {
-        "Level": "warning",
-        "Output": "",
-        "Access": "none"
-    },
-    "ConnectionConfig": {
-        "Handshake": 4,
-        "ConnIdle": 120,
-        "UplinkOnly": 2,
-        "DownlinkOnly": 4,
-        "BufferSize": 128,
-        "DisableUDPContentSniffing": false
-    },
-    "Nodes": [
-        {
-            "ApiHost": "${api_host}",
-            "NodeID": ${node_id},
-            "ApiKey": "${api_key}",
-            "Timeout": 15,
-            "GlobalDeviceLimitConfig": {
-                "Enable": true,
-                "SyncEnabled": true,
-                "SyncChannel": "v2board:device-sync",
-                "RedisNetwork": "tcp",
-                "RedisAddr": "127.0.0.1:6379",
-                "RedisDB": 0,
-                "Timeout": 2,
-                "Expiry": 120,
-                "RefreshInterval": 40,
-                "MaxIPsPerUser": 256,
-                "KeyPrefix": "znode:device",
-                "FailClosed": false
-            }
-        }
-    ]
-}
-EOF
-        chmod 600 /etc/znode/config.json
-        echo -e "${green}Đã tạo xong tệp cấu hình znode, đang khởi động lại dịch vụ.${plain}"
-        if [[ x"${release}" == x"alpine" ]]; then
-            service znode restart
-        else
-            systemctl restart znode
-        fi
-        sleep 2
-        check_status
-        echo -e ""
-        if [[ $? == 0 ]]; then
-            echo -e "${green}Khởi động lại znode thành công${plain}"
-        else
-            echo -e "${red}Có thể znode khởi động thất bại. Hãy dùng znode log để xem nhật ký.${plain}"
-        fi
-}
-
-migrate_legacy_v2node() {
-    if [[ ! -f /etc/v2node/config.json || -f /etc/znode/config.json ]]; then
-        return 0
-    fi
-
-    echo -e "${yellow}Phát hiện cấu hình v2node cũ, đang chuyển sang ZNode...${plain}"
-    mkdir -p /etc/znode
-    cp -p /etc/v2node/config.json /etc/znode/config.json
-    chmod 600 /etc/znode/config.json
-    [[ -f /etc/v2node/release-repo ]] && cp -p /etc/v2node/release-repo /etc/znode/release-repo
-    [[ -f /etc/v2node/release-branch ]] && cp -p /etc/v2node/release-branch /etc/znode/release-branch
-
-    if [[ x"${release}" == x"alpine" ]]; then
-        service v2node stop >/dev/null 2>&1 || true
-        rc-update del v2node >/dev/null 2>&1 || true
-    else
-        systemctl stop v2node >/dev/null 2>&1 || true
-        systemctl disable v2node >/dev/null 2>&1 || true
-    fi
-    echo -e "${green}Đã giữ nguyên cấu hình và danh tính agent trong /etc/znode/config.json.${plain}"
-}
-
 generate_znode_agent_config() {
         local api_host="$1"
         local agent_id="$2"
         local agent_token="$3"
 	local poll_interval="$4"
-	local agent_instance_id
+	local agent_instance_id config_file temporary_config
 	agent_instance_id=$(cat /proc/sys/kernel/random/uuid 2>/dev/null || true)
 	if [[ -z "$agent_instance_id" ]]; then
 		agent_instance_id="$(hostname)-$(date +%s)"
 	fi
 
-        mkdir -p /etc/znode >/dev/null 2>&1
-        cat > /etc/znode/config.json <<EOF
+        config_file="/etc/znode/config.json"
+        mkdir -p /etc/znode >/dev/null 2>&1 || return 1
+        temporary_config=$(mktemp /etc/znode/config.json.XXXXXX) || return 1
+        if ! cat > "$temporary_config" <<EOF
 {
+    "type": "zboard",
     "Log": {
         "Level": "warning",
         "Output": "",
         "Access": "none"
     },
     "ConnectionConfig": {
-        "Handshake": 4,
+        "Handshake": 15,
         "ConnIdle": 120,
         "UplinkOnly": 2,
         "DownlinkOnly": 4,
         "BufferSize": 128,
-        "DisableUDPContentSniffing": false
+        "DisableUDPContentSniffing": true,
+        "MaxConnectionsPerUser": 128,
+        "MaxConnections": 32768
     },
     "Agent": {
         "Enable": true,
@@ -540,7 +720,14 @@ generate_znode_agent_config() {
     "Nodes": []
 }
 EOF
-        chmod 600 /etc/znode/config.json
+        then
+            rm -f "$temporary_config"
+            return 1
+        fi
+        if ! chmod 600 "$temporary_config" || ! mv -f "$temporary_config" "$config_file"; then
+            rm -f "$temporary_config"
+            return 1
+        fi
         echo -e "${green}Znode agent config generated; assigned nodes will be synchronized automatically.${plain}"
         if [[ x"${release}" == x"alpine" ]]; then
             service znode restart
@@ -551,54 +738,341 @@ EOF
         check_status
         if [[ $? == 0 ]]; then
             echo -e "${green}znode agent started successfully.${plain}"
+            return 0
         else
             echo -e "${red}znode agent may have failed to start; run: znode log${plain}"
+            return 1
         fi
+}
+
+sha256_file() {
+    openssl dgst -sha256 "$1" 2>/dev/null | awk '{print tolower($NF)}'
+}
+
+write_runtime_checksum() {
+    local directory="$1"
+    local digest
+    [[ -x "$directory/znode" ]] || return 1
+    digest=$(sha256_file "$directory/znode")
+    [[ "$digest" =~ ^[a-f0-9]{64}$ ]] || return 1
+    printf '%s  znode\n' "$digest" > "$directory/.znode.sha256"
+    chmod 600 "$directory/.znode.sha256"
+}
+
+verify_runtime_checksum() {
+    local directory="$1"
+    local expected actual
+    [[ -x "$directory/znode" && -r "$directory/.znode.sha256" ]] || return 1
+    expected=$(awk 'NR==1 {print tolower($1)}' "$directory/.znode.sha256")
+    actual=$(sha256_file "$directory/znode")
+    [[ "$expected" =~ ^[a-f0-9]{64}$ ]] \
+        && [[ "$actual" =~ ^[a-f0-9]{64}$ ]] \
+        && [[ "$expected" == "$actual" ]]
+}
+
+restore_previous_runtime() {
+    local current_directory="/usr/local/znode"
+    local previous_directory="/usr/local/znode.previous"
+    local failed_directory="/usr/local/znode.failed.$(date +%s)"
+    if ! verify_runtime_checksum "$previous_directory"; then
+        echo -e "${red}Checksum runtime dự phòng không hợp lệ; từ chối tự động rollback.${plain}"
+        return 1
+    fi
+    [[ -d "$current_directory" ]] || return 1
+
+    if [[ x"${release}" == x"alpine" ]]; then
+        service znode stop >/dev/null 2>&1 || true
+    else
+        systemctl stop znode >/dev/null 2>&1 || true
+    fi
+    mv "$current_directory" "$failed_directory" || return 1
+    if ! mv "$previous_directory" "$current_directory"; then
+        mv "$failed_directory" "$current_directory" || true
+        return 1
+    fi
+    mv "$failed_directory" "$previous_directory" || true
+    if ! install_geodata "$current_directory"; then
+        echo -e "${red}Runtime trước đã được khôi phục nhưng không thể khôi phục GeoIP/GeoSite; giữ dịch vụ dừng để kiểm tra thủ công.${plain}"
+        return 1
+    fi
+
+    if [[ x"${release}" == x"alpine" ]]; then
+        service znode start >/dev/null 2>&1 || true
+    else
+        systemctl start znode >/dev/null 2>&1 || true
+    fi
+    sleep 2
+    check_status
+}
+
+rollback_activated_runtime() {
+    local had_previous="$1"
+    local current_directory="/usr/local/znode"
+
+    if [[ "$had_previous" == true ]]; then
+        restore_previous_runtime
+        return $?
+    fi
+
+    if [[ x"${release}" == x"alpine" ]]; then
+        service znode stop >/dev/null 2>&1 || true
+    else
+        systemctl stop znode >/dev/null 2>&1 || true
+    fi
+    rm -rf "$current_directory"
+    echo -e "${yellow}Đã gỡ runtime mới vì đây là lần cài đầu và không có bản trước để khôi phục.${plain}"
+}
+
+validate_release_version() {
+    [[ "$1" =~ ^v?[0-9]+\.[0-9]+(\.[0-9]+)?([-+_][A-Za-z0-9.-]+)?$ ]]
+}
+
+semver_key() {
+    local value="${1#v}"
+    local major minor patch
+    value="${value%%[-+_]*}"
+    IFS=. read -r major minor patch <<< "$value"
+    printf '%09d%09d%09d' "$major" "$minor" "${patch:-0}"
+}
+
+latest_release_version() {
+    local repository="$1"
+    local metadata version
+    metadata=$(curl --fail --location --silent --show-error --retry 3 --connect-timeout 15 \
+        --proto '=https' --tlsv1.2 \
+        "https://api.github.com/repos/${repository}/releases/latest") || return 1
+    version=$(printf '%s\n' "$metadata" | awk -F'"' '/"tag_name":/ {print $4; exit}')
+    validate_release_version "$version" || return 1
+    printf '%s\n' "$version"
+}
+
+download_verified_script_asset() {
+    local repository="$1"
+    local version="$2"
+    local asset_name="$3"
+    local destination="$4"
+    local metadata expected actual asset_url asset_size
+
+    validate_release_version "$version" || return 1
+    case "$asset_name" in
+        install.sh|znode.sh) ;;
+        *) return 1 ;;
+    esac
+
+    metadata=$(curl --fail --location --silent --show-error --retry 3 --connect-timeout 15 \
+        --proto '=https' --tlsv1.2 \
+        "https://api.github.com/repos/${repository}/releases/tags/${version}") || return 1
+    expected=$(printf '%s\n' "$metadata" | awk -v asset="$asset_name" '
+        /"name":/ { selected = index($0, "\"" asset "\"") > 0 }
+        selected && /"digest": "sha256:/ {
+            value=$0
+            sub(/^.*"digest": "sha256:/, "", value)
+            sub(/".*$/, "", value)
+            print tolower(value)
+            exit
+        }
+    ')
+    if [[ ! "$expected" =~ ^[a-f0-9]{64}$ ]]; then
+        echo -e "${red}Release ${version} không công bố SHA-256 cho ${asset_name}; từ chối chạy script đặc quyền.${plain}"
+        return 1
+    fi
+
+    asset_url="https://github.com/${repository}/releases/download/${version}/${asset_name}"
+    if ! curl --fail --location --silent --show-error --retry 3 --connect-timeout 15 \
+        --proto '=https' --tlsv1.2 "$asset_url" -o "$destination"; then
+        rm -f "$destination"
+        return 1
+    fi
+    asset_size=$(wc -c < "$destination" | tr -d '[:space:]')
+    actual=$(sha256_file "$destination")
+    if [[ ! "$asset_size" =~ ^[0-9]+$ ]] || (( asset_size < 1024 || asset_size > 1048576 )) \
+        || [[ ! "$actual" =~ ^[a-f0-9]{64}$ ]] || [[ "$actual" != "$expected" ]] \
+        || ! bash -n "$destination"; then
+        rm -f "$destination"
+        echo -e "${red}Script ${asset_name} không vượt qua xác minh SHA-256/cú pháp; từ chối thực thi.${plain}"
+        return 1
+    fi
+}
+
+download_verified_release() {
+    local version="$1"
+    local archive="$2"
+    local asset_name asset_url checksum_url expected actual metadata
+    local archive_size digest_size entry_count uncompressed_size
+    asset_name="znode-linux-${arch}.zip"
+    asset_url="https://github.com/${RELEASE_REPO_ARG}/releases/download/${version}/${asset_name}"
+    checksum_url="${asset_url}.dgst"
+
+    if ! curl --fail --location --silent --show-error --retry 3 --connect-timeout 15 \
+        --proto '=https' --tlsv1.2 "$asset_url" | pv -s 30M -W -N "Tiến trình tải" > "$archive"; then
+        echo -e "${red}Tải gói phát hành ZNode thất bại.${plain}"
+        return 1
+    fi
+    archive_size=$(wc -c < "$archive")
+    if [[ ! "$archive_size" =~ ^[0-9]+$ ]] || (( archive_size < 1048576 || archive_size > 268435456 )); then
+        echo -e "${red}Kích thước gói phát hành không hợp lệ.${plain}"
+        return 1
+    fi
+    expected=""
+    if curl --fail --location --silent --show-error --retry 3 --connect-timeout 15 \
+        --proto '=https' --tlsv1.2 "$checksum_url" -o "${archive}.dgst" 2>/dev/null; then
+        digest_size=$(wc -c < "${archive}.dgst")
+        if [[ ! "$digest_size" =~ ^[0-9]+$ ]] || (( digest_size < 64 || digest_size > 65536 )); then
+            echo -e "${red}Tệp checksum của release có kích thước bất thường.${plain}"
+            return 1
+        fi
+        expected=$(awk 'toupper($1) ~ /^SHA(2-)?256=$/ {print tolower($2); exit}' "${archive}.dgst")
+    else
+        rm -f "${archive}.dgst"
+        metadata=$(curl --fail --location --silent --show-error --retry 3 --connect-timeout 15 \
+            --proto '=https' --tlsv1.2 \
+            "https://api.github.com/repos/${RELEASE_REPO_ARG}/releases/tags/${version}") || metadata=""
+        expected=$(printf '%s\n' "$metadata" | awk -v asset="$asset_name" '
+            /"name":/ { selected = index($0, "\"" asset "\"") > 0 }
+            selected && /"digest": "sha256:/ {
+                value=$0
+                sub(/^.*"digest": "sha256:/, "", value)
+                sub(/".*$/, "", value)
+                print tolower(value)
+                exit
+            }
+        ')
+    fi
+
+    actual=$(sha256_file "$archive")
+    if [[ ! "$expected" =~ ^[a-f0-9]{64}$ ]] || [[ ! "$actual" =~ ^[a-f0-9]{64}$ ]] || [[ "$expected" != "$actual" ]]; then
+        echo -e "${red}Không có SHA-256 tin cậy hoặc checksum gói phát hành không khớp; không thực thi binary đã tải.${plain}"
+        return 1
+    fi
+
+    if unzip -Z1 "$archive" | grep -Eq '(^/|(^|/)\.\.(/|$)|\\)'; then
+        echo -e "${red}Gói phát hành chứa đường dẫn không an toàn.${plain}"
+        return 1
+    fi
+    entry_count=$(unzip -Z1 "$archive" | wc -l | tr -d '[:space:]')
+    uncompressed_size=$(unzip -l "$archive" | awk 'END {print $1}')
+    if [[ ! "$entry_count" =~ ^[0-9]+$ || ! "$uncompressed_size" =~ ^[0-9]+$ ]] \
+        || (( entry_count < 1 || entry_count > 64 || uncompressed_size > 536870912 )); then
+        echo -e "${red}Gói phát hành vượt giới hạn giải nén an toàn.${plain}"
+        return 1
+    fi
+}
+
+install_manager_script() {
+    local temporary manager_ref
+    temporary=$(mktemp /usr/bin/.znode.XXXXXX) || return 1
+    manager_ref=$(latest_release_version "$RELEASE_REPO_ARG")
+    if [[ -z "$manager_ref" ]] \
+        || ! download_verified_script_asset "$RELEASE_REPO_ARG" "$manager_ref" znode.sh "$temporary"; then
+        rm -f "$temporary"
+        echo -e "${red}Không tải được manager đã xác minh từ release bảo mật mới nhất.${plain}"
+        return 1
+    fi
+    if ! chmod 0755 "$temporary" || ! mv -f "$temporary" /usr/bin/znode; then
+        rm -f "$temporary"
+        echo -e "${red}Không thể cài manager script theo giao dịch atomic; manager hiện tại được giữ nguyên.${plain}"
+        return 1
+    fi
 }
 
 install_znode() {
     local version_param="$1"
-    if [[ -e /usr/local/znode/ ]]; then
-        # Keep one known-good binary for an instant rollback after an update.
-        # Configuration lives in /etc/znode and is intentionally not copied.
-        rm -rf /usr/local/znode.previous/
-        mkdir -p /usr/local/znode.previous/
-        cp -a /usr/local/znode/. /usr/local/znode.previous/
-        rm -rf /usr/local/znode/
-    fi
+    local current_directory="/usr/local/znode"
+    local previous_directory="/usr/local/znode.previous"
+    local staging_directory archive current_version extracted_version
+    local had_previous=false
 
-    mkdir /usr/local/znode/ -p
-    cd /usr/local/znode/
+    mkdir -p /usr/local
+    staging_directory=$(mktemp -d /usr/local/znode.new.XXXXXX) || exit 1
+    archive="$staging_directory/znode-linux.zip"
 
     if  [[ -z "$version_param" ]] ; then
-        last_version=$(curl -Ls "https://api.github.com/repos/${RELEASE_REPO_ARG}/releases/latest" | grep '"tag_name":' | sed -E 's/.*"([^"]+)".*/\1/')
+        last_version=$(curl --fail --location --silent --show-error --retry 3 --connect-timeout 15 \
+            --proto '=https' --tlsv1.2 "https://api.github.com/repos/${RELEASE_REPO_ARG}/releases/latest" \
+            | grep '"tag_name":' | sed -E 's/.*"([^"]+)".*/\1/')
         if [[ ! -n "$last_version" ]]; then
             echo -e "${red}Không xác định được phiên bản znode, có thể đã vượt giới hạn GitHub API. Hãy thử lại sau hoặc chỉ định phiên bản để cài thủ công.${plain}"
+            rm -rf "$staging_directory"
             exit 1
         fi
         echo -e "${green}Đã tìm thấy phiên bản mới nhất: ${last_version}. Bắt đầu cài đặt...${plain}"
-        url="https://github.com/${RELEASE_REPO_ARG}/releases/download/${last_version}/znode-linux-${arch}.zip"
-        curl -sL "$url" | pv -s 30M -W -N "Tiến trình tải" > /usr/local/znode/znode-linux.zip
-        if [[ $? -ne 0 ]]; then
-            echo -e "${red}Tải znode thất bại. Hãy đảm bảo máy chủ có thể tải tệp từ GitHub.${plain}"
-            exit 1
-        fi
     else
-    last_version=$version_param
-        url="https://github.com/${RELEASE_REPO_ARG}/releases/download/${last_version}/znode-linux-${arch}.zip"
-        curl -sL "$url" | pv -s 30M -W -N "Tiến trình tải" > /usr/local/znode/znode-linux.zip
-        if [[ $? -ne 0 ]]; then
-            echo -e "${red}Tải znode $1 thất bại. Hãy kiểm tra phiên bản này có tồn tại.${plain}"
+        last_version=$version_param
+    fi
+    if ! validate_release_version "$last_version"; then
+        echo -e "${red}Phiên bản phát hành không hợp lệ: ${last_version}.${plain}"
+        rm -rf "$staging_directory"
+        exit 1
+    fi
+    if [[ -x "$current_directory/znode" ]]; then
+        current_version=$("$current_directory/znode" version 2>/dev/null | awk 'NR==1 {print $2}')
+        if validate_release_version "$current_version" \
+            && [[ "$(semver_key "$last_version")" < "$(semver_key "$current_version")" ]]; then
+            echo -e "${red}Release ${last_version} cũ hơn runtime hiện tại ${current_version}; dùng rollback đã xác minh thay vì hạ cấp tùy ý.${plain}"
+            rm -rf "$staging_directory"
             exit 1
         fi
     fi
 
-    unzip znode-linux.zip
-    rm znode-linux.zip -f
-    chmod +x znode
+    if ! download_verified_release "$last_version" "$archive"; then
+        rm -rf "$staging_directory"
+        exit 1
+    fi
+    if ! unzip -q "$archive" -d "$staging_directory"; then
+        echo -e "${red}Không giải nén được gói phát hành đã xác minh.${plain}"
+        rm -rf "$staging_directory"
+        exit 1
+    fi
+    rm -f "$archive" "${archive}.dgst"
+    if [[ ! -f "$staging_directory/znode" || -L "$staging_directory/znode" ]] \
+        || find "$staging_directory" -type l -print -quit | grep -q .; then
+        echo -e "${red}Gói phát hành không chứa binary znode thường ở vị trí mong đợi hoặc có symlink.${plain}"
+        rm -rf "$staging_directory"
+        exit 1
+    fi
+    chmod 755 "$staging_directory/znode"
+    extracted_version=$("$staging_directory/znode" version 2>/dev/null | awk 'NR==1 {print $2}')
+    if [[ "${extracted_version#v}" != "${last_version#v}" ]]; then
+        echo -e "${red}Binary báo phiên bản ${extracted_version:-không xác định}, không khớp release ${last_version}.${plain}"
+        rm -rf "$staging_directory"
+        exit 1
+    fi
+    if ! write_runtime_checksum "$staging_directory"; then
+        echo -e "${red}Không thể ghi checksum cho runtime mới.${plain}"
+        rm -rf "$staging_directory"
+        exit 1
+    fi
+    if ! validate_geodata "$staging_directory"; then
+        echo -e "${red}Xác minh dữ liệu GeoIP/GeoSite thất bại; runtime hiện hành chưa bị thay đổi.${plain}"
+        rm -rf "$staging_directory"
+        exit 1
+    fi
     mkdir /etc/znode/ -p
-    if ! install_geodata; then
-        echo -e "${red}Cài dữ liệu GeoIP/GeoSite thất bại; dừng để tránh chạy rule định tuyến sai.${plain}"
+
+    # Only replace the live tree after the archive, checksum, paths, binary and
+    # geodata have all passed validation. The former tree becomes the sole
+    # rollback candidate and carries its own binary checksum.
+    if [[ -d "$current_directory" ]]; then
+        had_previous=true
+        write_runtime_checksum "$current_directory" || {
+            echo -e "${red}Không thể chốt checksum runtime hiện tại; hủy update để giữ bản đang chạy.${plain}"
+            rm -rf "$staging_directory"
+            exit 1
+        }
+        rm -rf "$previous_directory"
+        mv "$current_directory" "$previous_directory" || exit 1
+    fi
+    if ! mv "$staging_directory" "$current_directory"; then
+        [[ -d "$previous_directory" && ! -d "$current_directory" ]] && mv "$previous_directory" "$current_directory"
+        echo -e "${red}Không thể kích hoạt runtime mới; đã khôi phục bản hiện tại.${plain}"
+        exit 1
+    fi
+    cd "$current_directory" || exit 1
+    if ! install_geodata "$current_directory"; then
+        echo -e "${red}Không thể kích hoạt GeoIP/GeoSite mới; đang rollback runtime.${plain}"
+        if ! rollback_activated_runtime "$had_previous"; then
+            echo -e "${red}Rollback sau lỗi GeoIP/GeoSite thất bại; hãy kiểm tra dịch vụ thủ công.${plain}"
+        fi
         exit 1
     fi
     if [[ x"${release}" == x"alpine" ]]; then
@@ -637,10 +1111,10 @@ User=root
 Group=root
 Type=simple
 Environment=XRAY_LOCATION_ASSET=/etc/znode
-LimitAS=infinity
-LimitRSS=infinity
-LimitCORE=infinity
-LimitNOFILE=999999
+LimitNOFILE=262144
+TasksMax=8192
+MemoryHigh=80%
+MemoryMax=90%
 WorkingDirectory=/usr/local/znode/
 ExecStart=/usr/local/znode/znode server
 Restart=always
@@ -650,50 +1124,67 @@ RestartSec=10
 WantedBy=multi-user.target
 EOF
         systemctl daemon-reload
-        systemctl stop znode
         systemctl enable znode
+        # Keep the old runtime serving while the new tree, service unit and
+        # configuration are staged. Activation below performs one short
+        # restart instead of leaving every inbound offline during the update.
         echo -e "${green}Đã cài znode ${last_version}${plain} và bật tự khởi động cùng hệ thống."
     fi
 
     if [[ ! -f /etc/znode/config.json ]]; then
-        # Nếu CLI đã truyền đủ tham số thì tạo cấu hình trực tiếp và bỏ qua bước hỏi
-        if [[ -n "$API_HOST_ARG" && -n "$AGENT_ID_ARG" && -n "$AGENT_TOKEN_ARG" ]]; then
-            generate_znode_agent_config "$API_HOST_ARG" "$AGENT_ID_ARG" "$AGENT_TOKEN_ARG" "$POLL_INTERVAL_ARG"
-            echo -e "${green}Agent config written to /etc/znode/config.json${plain}"
-            first_install=false
-        elif [[ -n "$API_HOST_ARG" && -n "$NODE_ID_ARG" && -n "$API_KEY_ARG" ]]; then
-            generate_znode_config "$API_HOST_ARG" "$NODE_ID_ARG" "$API_KEY_ARG"
-            echo -e "${green}Đã tạo /etc/znode/config.json từ các tham số được cung cấp.${plain}"
-            first_install=false
-        else
-            cp config.json /etc/znode/
-            migrate_tiktok_compat_profile
-            first_install=true
+        if ! generate_znode_agent_config "$API_HOST_ARG" "$AGENT_ID_ARG" "$AGENT_TOKEN_ARG" "$POLL_INTERVAL_ARG"; then
+            if ! rollback_activated_runtime "$had_previous"; then
+                echo -e "${red}Không thể rollback sau lỗi tạo cấu hình Agent; hãy kiểm tra dịch vụ thủ công.${plain}"
+            fi
+            exit 1
         fi
+        echo -e "${green}Agent config written to /etc/znode/config.json${plain}"
     else
+        if ! ensure_zboard_config_type; then
+            echo -e "${red}Xác minh type=zboard thất bại sau activation; đang rollback runtime.${plain}"
+            if ! rollback_activated_runtime "$had_previous"; then
+                echo -e "${red}Không thể rollback sau lỗi cấu hình; hãy kiểm tra dịch vụ thủ công.${plain}"
+            fi
+            exit 1
+        fi
         migrate_tiktok_compat_profile
         if [[ x"${release}" == x"alpine" ]]; then
-            service znode start
+            service znode restart
         else
-            systemctl start znode
+            systemctl restart znode
         fi
         sleep 2
         check_status
+        local runtime_status=$?
         echo -e ""
-        if [[ $? == 0 ]]; then
+        if [[ $runtime_status == 0 ]]; then
             echo -e "${green}Khởi động lại znode thành công${plain}"
         else
-            echo -e "${red}Có thể znode khởi động thất bại. Hãy dùng znode log để xem nhật ký.${plain}"
+            echo -e "${red}Runtime mới không khởi động; đang khôi phục bản trước.${plain}"
+            if rollback_activated_runtime "$had_previous"; then
+                if [[ "$had_previous" == true ]]; then
+                    echo -e "${yellow}Đã khôi phục runtime trước; update được đánh dấu thất bại.${plain}"
+                else
+                    echo -e "${yellow}Đã gỡ runtime lỗi của lần cài đầu; cài đặt được đánh dấu thất bại.${plain}"
+                fi
+            else
+                echo -e "${red}Không thể tự khôi phục runtime trước. Hãy kiểm tra dịch vụ thủ công.${plain}"
+            fi
+            exit 1
         fi
-        first_install=false
     fi
 
 
+    if ! install_manager_script; then
+        echo -e "${red}Cài manager script thất bại; đang rollback runtime mới.${plain}"
+        if ! rollback_activated_runtime "$had_previous"; then
+            echo -e "${red}Không thể rollback sau lỗi manager script; hãy kiểm tra dịch vụ thủ công.${plain}"
+        fi
+        exit 1
+    fi
     printf '%s\n' "$RELEASE_REPO_ARG" > /etc/znode/release-repo
     printf '%s\n' "$RELEASE_BRANCH_ARG" > /etc/znode/release-branch
     chmod 644 /etc/znode/release-repo /etc/znode/release-branch
-    curl -o /usr/bin/znode -Ls "https://raw.githubusercontent.com/${RELEASE_REPO_ARG}/${RELEASE_BRANCH_ARG}/script/znode.sh"
-    chmod +x /usr/bin/znode
     install_log_cleanup
 
     cd $cur_dir
@@ -709,7 +1200,7 @@ EOF
     echo "znode enable       - Bật tự khởi động cùng hệ thống"
     echo "znode disable      - Tắt tự khởi động cùng hệ thống"
     echo "znode log          - Xem nhật ký znode"
-    echo "znode generate     - Tạo tệp cấu hình znode"
+    echo "znode generate     - Hướng dẫn enrollment Agent qua ZBoard"
     echo "znode update       - Cập nhật znode"
     echo "znode update x.x.x - Cập nhật znode lên phiên bản chỉ định"
     echo "znode rollback     - Quay lại bản znode trước đó"
@@ -717,30 +1208,19 @@ EOF
     echo "znode uninstall    - Gỡ cài đặt znode"
     echo "znode version      - Xem phiên bản znode"
     echo "------------------------------------------"
-    if [[ $first_install == true ]]; then
-        read -rp "Đây là lần đầu cài znode. Bạn có muốn tự động tạo /etc/znode/config.json không? (y/n): " if_generate
-        if [[ "$if_generate" =~ ^[Yy]$ ]]; then
-            # Thu thập tham số tương tác và cung cấp giá trị mặc định mẫu
-            read -rp "Địa chỉ API panel [định dạng: https://example.com/]: " api_host
-            api_host=${api_host:-https://example.com/}
-            read -rp "ID node: " node_id
-            node_id=${node_id:-1}
-            read -rp "Khóa kết nối node: " api_key
-
-            # Tạo tệp cấu hình và ghi đè mẫu có thể đã được sao chép từ gói cài đặt
-            generate_znode_config "$api_host" "$node_id" "$api_key"
-        else
-            echo "${green}Đã bỏ qua bước tự tạo cấu hình. Có thể chạy znode generate để tạo sau.${plain}"
-        fi
-    fi
 }
 
 parse_args "$@"
+load_agent_token
 validate_release_source
+acquire_znode_operation_lock || exit 1
+trap release_znode_operation_lock EXIT
+trap 'exit 129' HUP
+trap 'exit 130' INT
+trap 'exit 143' TERM
 validate_agent_args
-if declare -F migrate_legacy_v2node >/dev/null 2>&1; then
-    migrate_legacy_v2node
-fi
+allow_legacy_v2node_config || exit 1
+ensure_zboard_config_type || exit 1
 validate_existing_agent_binding
 echo -e "${green}Bắt đầu cài đặt${plain}"
 install_base
