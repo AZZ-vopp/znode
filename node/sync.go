@@ -2,7 +2,9 @@ package node
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/json"
+	"fmt"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -24,16 +26,21 @@ type deviceSyncEvent struct {
 // coalescing notification channel. This prevents Redis clients and reconnect
 // goroutines from growing linearly with the logical-node count.
 type deviceSyncHubKey struct {
-	network  string
-	addr     string
-	username string
-	password string
-	db       int
-	timeout  int
-	channel  string
-	tls      bool
-	tlsName  string
-	tlsCA    string
+	network          string
+	addr             string
+	username         string
+	password         string
+	db               int
+	timeout          int
+	channel          string
+	tls              bool
+	tlsName          string
+	tlsCA            string
+	tlsCACertHash    string
+	sentinelMaster   string
+	sentinelAddrs    string
+	sentinelUsername string
+	sentinelPassword string
 }
 
 type deviceSyncHubEntry struct {
@@ -108,16 +115,21 @@ func applyDeviceSyncDefaults(config *conf.GlobalDeviceLimitConfig) {
 
 func deviceSyncKey(config *conf.GlobalDeviceLimitConfig) deviceSyncHubKey {
 	return deviceSyncHubKey{
-		network:  config.RedisNetwork,
-		addr:     config.RedisAddr,
-		username: config.RedisUsername,
-		password: config.RedisPassword,
-		db:       config.RedisDB,
-		timeout:  config.Timeout,
-		channel:  config.SyncChannel,
-		tls:      config.RedisTLS,
-		tlsName:  config.RedisTLSServerName,
-		tlsCA:    config.RedisTLSCAFile,
+		network:          config.RedisNetwork,
+		addr:             config.RedisAddr,
+		username:         config.RedisUsername,
+		password:         config.RedisPassword,
+		db:               config.RedisDB,
+		timeout:          config.Timeout,
+		channel:          config.SyncChannel,
+		tls:              config.RedisTLS,
+		tlsName:          config.RedisTLSServerName,
+		tlsCA:            config.RedisTLSCAFile,
+		tlsCACertHash:    fmt.Sprintf("%x", sha256.Sum256([]byte(config.RedisTLSCACert))),
+		sentinelMaster:   config.RedisSentinelMaster,
+		sentinelAddrs:    strings.Join(config.RedisSentinelAddrs, ","),
+		sentinelUsername: config.RedisSentinelUsername,
+		sentinelPassword: config.RedisSentinelPassword,
 	}
 }
 
@@ -126,8 +138,24 @@ func newDeviceSyncHub(config *conf.GlobalDeviceLimitConfig) (*deviceSyncHub, err
 	if err != nil {
 		return nil, err
 	}
-	return &deviceSyncHub{
-		client: redis.NewClient(&redis.Options{
+	var client *redis.Client
+	if strings.TrimSpace(config.RedisSentinelMaster) != "" && len(config.RedisSentinelAddrs) > 0 {
+		client = redis.NewFailoverClient(&redis.FailoverOptions{
+			MasterName:       config.RedisSentinelMaster,
+			SentinelAddrs:    append([]string(nil), config.RedisSentinelAddrs...),
+			SentinelUsername: config.RedisSentinelUsername,
+			SentinelPassword: config.RedisSentinelPassword,
+			Username:         config.RedisUsername,
+			Password:         config.RedisPassword,
+			DB:               config.RedisDB,
+			PoolSize:         1,
+			DialTimeout:      time.Duration(config.Timeout) * time.Second,
+			ReadTimeout:      time.Duration(config.Timeout) * time.Second,
+			WriteTimeout:     time.Duration(config.Timeout) * time.Second,
+			TLSConfig:        tlsConfig,
+		})
+	} else {
+		client = redis.NewClient(&redis.Options{
 			Network:      config.RedisNetwork,
 			Addr:         config.RedisAddr,
 			Username:     config.RedisUsername,
@@ -138,7 +166,10 @@ func newDeviceSyncHub(config *conf.GlobalDeviceLimitConfig) (*deviceSyncHub, err
 			ReadTimeout:  time.Duration(config.Timeout) * time.Second,
 			WriteTimeout: time.Duration(config.Timeout) * time.Second,
 			TLSConfig:    tlsConfig,
-		}),
+		})
+	}
+	return &deviceSyncHub{
+		client:      client,
 		channel:     config.SyncChannel,
 		subscribers: make(map[uint64]*deviceSyncSubscriber),
 		stop:        make(chan struct{}),

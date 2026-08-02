@@ -52,15 +52,20 @@ type redisDeviceStore struct {
 }
 
 type redisClientKey struct {
-	network  string
-	addr     string
-	username string
-	password string
-	db       int
-	timeout  int
-	tls      bool
-	tlsName  string
-	tlsCA    string
+	network          string
+	addr             string
+	username         string
+	password         string
+	db               int
+	timeout          int
+	tls              bool
+	tlsName          string
+	tlsCA            string
+	tlsCACertHash    string
+	sentinelMaster   string
+	sentinelAddrs    string
+	sentinelUsername string
+	sentinelPassword string
 }
 
 type sharedRedisClient struct {
@@ -79,15 +84,20 @@ func acquireRedisClient(c *conf.GlobalDeviceLimitConfig) (*redis.Client, redisCl
 		return nil, redisClientKey{}, err
 	}
 	key := redisClientKey{
-		network:  c.RedisNetwork,
-		addr:     c.RedisAddr,
-		username: c.RedisUsername,
-		password: c.RedisPassword,
-		db:       c.RedisDB,
-		timeout:  c.Timeout,
-		tls:      c.RedisTLS,
-		tlsName:  c.RedisTLSServerName,
-		tlsCA:    c.RedisTLSCAFile,
+		network:          c.RedisNetwork,
+		addr:             c.RedisAddr,
+		username:         c.RedisUsername,
+		password:         c.RedisPassword,
+		db:               c.RedisDB,
+		timeout:          c.Timeout,
+		tls:              c.RedisTLS,
+		tlsName:          c.RedisTLSServerName,
+		tlsCA:            c.RedisTLSCAFile,
+		tlsCACertHash:    fmt.Sprintf("%x", sha256.Sum256([]byte(c.RedisTLSCACert))),
+		sentinelMaster:   c.RedisSentinelMaster,
+		sentinelAddrs:    strings.Join(c.RedisSentinelAddrs, ","),
+		sentinelUsername: c.RedisSentinelUsername,
+		sentinelPassword: c.RedisSentinelPassword,
 	}
 	redisClientRegistry.Lock()
 	defer redisClientRegistry.Unlock()
@@ -95,19 +105,38 @@ func acquireRedisClient(c *conf.GlobalDeviceLimitConfig) (*redis.Client, redisCl
 		shared.refs++
 		return shared.client, key, nil
 	}
-	client := redis.NewClient(&redis.Options{
-		Network:      c.RedisNetwork,
-		Addr:         c.RedisAddr,
-		Username:     c.RedisUsername,
-		Password:     c.RedisPassword,
-		DB:           c.RedisDB,
-		PoolSize:     4,
-		MinIdleConns: 0,
-		DialTimeout:  time.Duration(c.Timeout) * time.Second,
-		ReadTimeout:  time.Duration(c.Timeout) * time.Second,
-		WriteTimeout: time.Duration(c.Timeout) * time.Second,
-		TLSConfig:    tlsConfig,
-	})
+	var client *redis.Client
+	if strings.TrimSpace(c.RedisSentinelMaster) != "" && len(c.RedisSentinelAddrs) > 0 {
+		client = redis.NewFailoverClient(&redis.FailoverOptions{
+			MasterName:       c.RedisSentinelMaster,
+			SentinelAddrs:    append([]string(nil), c.RedisSentinelAddrs...),
+			SentinelUsername: c.RedisSentinelUsername,
+			SentinelPassword: c.RedisSentinelPassword,
+			Username:         c.RedisUsername,
+			Password:         c.RedisPassword,
+			DB:               c.RedisDB,
+			PoolSize:         4,
+			MinIdleConns:     0,
+			DialTimeout:      time.Duration(c.Timeout) * time.Second,
+			ReadTimeout:      time.Duration(c.Timeout) * time.Second,
+			WriteTimeout:     time.Duration(c.Timeout) * time.Second,
+			TLSConfig:        tlsConfig,
+		})
+	} else {
+		client = redis.NewClient(&redis.Options{
+			Network:      c.RedisNetwork,
+			Addr:         c.RedisAddr,
+			Username:     c.RedisUsername,
+			Password:     c.RedisPassword,
+			DB:           c.RedisDB,
+			PoolSize:     4,
+			MinIdleConns: 0,
+			DialTimeout:  time.Duration(c.Timeout) * time.Second,
+			ReadTimeout:  time.Duration(c.Timeout) * time.Second,
+			WriteTimeout: time.Duration(c.Timeout) * time.Second,
+			TLSConfig:    tlsConfig,
+		})
+	}
 	redisClientRegistry.clients[key] = &sharedRedisClient{client: client, refs: 1}
 	return client, key, nil
 }

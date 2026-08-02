@@ -71,21 +71,26 @@ type ConnectionConfig struct {
 // If Redis is unavailable, FailClosed=false keeps traffic available and falls
 // back to the bounded local tracker.
 type GlobalDeviceLimitConfig struct {
-	Enable             bool   `mapstructure:"Enable"`
-	RedisNetwork       string `mapstructure:"RedisNetwork"`
-	RedisAddr          string `mapstructure:"RedisAddr"`
-	RedisUsername      string `mapstructure:"RedisUsername"`
-	RedisPassword      string `mapstructure:"RedisPassword"`
-	RedisDB            int    `mapstructure:"RedisDB"`
-	RedisTLS           bool   `mapstructure:"RedisTLS"`
-	RedisTLSServerName string `mapstructure:"RedisTLSServerName"`
-	RedisTLSCAFile     string `mapstructure:"RedisTLSCAFile"`
-	Timeout            int    `mapstructure:"Timeout"`
-	Expiry             int    `mapstructure:"Expiry"`
-	RefreshInterval    int    `mapstructure:"RefreshInterval"`
-	MaxIPsPerUser      int    `mapstructure:"MaxIPsPerUser"`
-	KeyPrefix          string `mapstructure:"KeyPrefix"`
-	FailClosed         bool   `mapstructure:"FailClosed"`
+	Enable                bool     `mapstructure:"Enable"`
+	RedisNetwork          string   `mapstructure:"RedisNetwork"`
+	RedisAddr             string   `mapstructure:"RedisAddr"`
+	RedisUsername         string   `mapstructure:"RedisUsername"`
+	RedisPassword         string   `mapstructure:"RedisPassword"`
+	RedisDB               int      `mapstructure:"RedisDB"`
+	RedisTLS              bool     `mapstructure:"RedisTLS"`
+	RedisTLSServerName    string   `mapstructure:"RedisTLSServerName"`
+	RedisTLSCAFile        string   `mapstructure:"RedisTLSCAFile"`
+	RedisTLSCACert        string   `mapstructure:"RedisTLSCACert"`
+	RedisSentinelMaster   string   `mapstructure:"RedisSentinelMaster"`
+	RedisSentinelAddrs    []string `mapstructure:"RedisSentinelAddrs"`
+	RedisSentinelUsername string   `mapstructure:"RedisSentinelUsername"`
+	RedisSentinelPassword string   `mapstructure:"RedisSentinelPassword"`
+	Timeout               int      `mapstructure:"Timeout"`
+	Expiry                int      `mapstructure:"Expiry"`
+	RefreshInterval       int      `mapstructure:"RefreshInterval"`
+	MaxIPsPerUser         int      `mapstructure:"MaxIPsPerUser"`
+	KeyPrefix             string   `mapstructure:"KeyPrefix"`
+	FailClosed            bool     `mapstructure:"FailClosed"`
 	// Pointer allows omitted SyncEnabled to default to true while still
 	// honoring an explicit false in a node config.
 	SyncEnabled *bool  `mapstructure:"SyncEnabled"`
@@ -100,7 +105,7 @@ func New() *Conf {
 			Access: "none",
 		},
 		ConnectionConfig: ConnectionConfig{
-			Handshake:    4,
+			Handshake:    15,
 			ConnIdle:     120,
 			UplinkOnly:   2,
 			DownlinkOnly: 4,
@@ -231,7 +236,7 @@ func NormalizePanelAPIHost(raw string) (string, error) {
 
 func (c *ConnectionConfig) applyDefaults() {
 	if c.Handshake == 0 {
-		c.Handshake = 4
+		c.Handshake = 15
 	}
 	if c.ConnIdle == 0 {
 		c.ConnIdle = 120
@@ -268,6 +273,23 @@ func (c *GlobalDeviceLimitConfig) applyDefaults() {
 	}
 	if c.RedisAddr == "" {
 		c.RedisAddr = "127.0.0.1:6379"
+	}
+	c.RedisSentinelMaster = strings.TrimSpace(c.RedisSentinelMaster)
+	if len(c.RedisSentinelAddrs) > 0 {
+		seen := make(map[string]struct{}, len(c.RedisSentinelAddrs))
+		addresses := make([]string, 0, len(c.RedisSentinelAddrs))
+		for _, address := range c.RedisSentinelAddrs {
+			address = strings.TrimSpace(address)
+			if address == "" {
+				continue
+			}
+			if _, exists := seen[address]; exists {
+				continue
+			}
+			seen[address] = struct{}{}
+			addresses = append(addresses, address)
+		}
+		c.RedisSentinelAddrs = addresses
 	}
 	if c.Timeout <= 0 {
 		c.Timeout = 1
