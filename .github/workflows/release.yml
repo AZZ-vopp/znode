@@ -213,13 +213,14 @@ jobs:
           pattern: znode-*
           merge-multiple: true
       - name: Publish release and checksums
-        uses: softprops/action-gh-release@3d0d9888cb7fd7b750713d6e236d1fcb99157228 # v3
-        with:
-          name: ZNode ${{ github.ref_name }}
-          generate_release_notes: true
-          fail_on_unmatched_files: true
-          files: |
-            script/install.sh
-            script/znode.sh
-            release-assets/*.zip
-            release-assets/*.zip.dgst
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" \
+            script/install.sh \
+            script/znode.sh \
+            release-assets/*.zip \
+            release-assets/*.zip.dgst \
+            --title "ZNode $GITHUB_REF_NAME" \
+            --generate-notes \
+            --verify-tag
