@@ -26,6 +26,8 @@ type Controller struct {
 	userReportPeriodic      *task.Task
 	renewCertPeriodic       *task.Task
 	deviceSyncWatcher       *deviceSyncWatcher
+	userRevisionWatcher     *userRevisionWatcher
+	userRevision            string
 	metrics                 *nodeMetricsCollector
 	userSyncMu              sync.Mutex
 	trafficReportMu         sync.Mutex
@@ -64,6 +66,14 @@ func (c *Controller) Prepare(ctx context.Context) error {
 		}
 	}
 	c.tag = c.info.Tag
+	// Read the revision before the user snapshot. If a device changes between
+	// these calls, the watcher observes the newer revision and immediately
+	// performs one more credential-only reconciliation after startup.
+	if revision, revisionErr := c.apiClient.GetUserRevision(ctx); revisionErr == nil {
+		c.userRevision = revision
+	} else {
+		log.WithFields(log.Fields{"tag": c.tag, "err": revisionErr}).Debug("User revision endpoint unavailable; periodic pull remains active")
+	}
 	c.userList, err = c.apiClient.GetUserList(ctx)
 	if err != nil {
 		return fmt.Errorf("get user list error: %s", err)
@@ -186,6 +196,10 @@ func (c *Controller) Close() error {
 }
 
 func (c *Controller) stopBackgroundServices() {
+	if c.userRevisionWatcher != nil {
+		c.userRevisionWatcher.Close()
+		c.userRevisionWatcher = nil
+	}
 	if c.deviceSyncWatcher != nil {
 		c.deviceSyncWatcher.Close()
 		c.deviceSyncWatcher = nil
@@ -209,6 +223,8 @@ func (c *Controller) startBackgroundServices() {
 		return
 	}
 	c.startTasks(c.info)
+	c.userRevisionWatcher = newUserRevisionWatcher(c.apiClient, c.userRevision, c.syncUserCredentials)
+	c.userRevisionWatcher.Start()
 	// Publish the freshly generated/self-signed certificate fingerprint right
 	// after a successful start instead of waiting for the traffic interval.
 	c.reportNodeStatusImmediately()

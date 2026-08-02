@@ -2,6 +2,7 @@ package panel
 
 import (
 	"context"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
@@ -39,9 +40,47 @@ type AliveMap struct {
 	Alive map[int]int `json:"alive"`
 }
 
+type UserRevisionBody struct {
+	Revision string `json:"revision"`
+}
+
 const maxPanelUsers = 200000
 const maxPanelUserResponseBytes int64 = 64 << 20
 const trafficCapabilityPath = "/api/v1/server/UniProxy/capability"
+const userRevisionPath = "/api/v1/server/UniProxy/revision"
+
+// GetUserRevision fetches a tiny desired-state marker. The node can poll this
+// frequently and only rebuild the complete user list when the marker changes.
+func (c *Client) GetUserRevision(ctx context.Context) (string, error) {
+	r, err := c.client.R().
+		SetContext(ctx).
+		ForceContentType("application/json").
+		Get(userRevisionPath)
+	if err != nil {
+		return "", fmt.Errorf("get user revision: %w", err)
+	}
+	if r == nil || r.RawResponse == nil {
+		return "", fmt.Errorf("get user revision: panel returned no response")
+	}
+	if r.StatusCode() < http.StatusOK || r.StatusCode() >= http.StatusMultipleChoices {
+		return "", fmt.Errorf("get user revision: panel returned HTTP %d", r.StatusCode())
+	}
+	var body UserRevisionBody
+	if err := json.Unmarshal(r.Body(), &body); err != nil {
+		return "", fmt.Errorf("decode user revision: %w", err)
+	}
+	revision := strings.TrimSpace(body.Revision)
+	if revision == "0" {
+		return revision, nil
+	}
+	if len(revision) != 32 {
+		return "", fmt.Errorf("decode user revision: invalid revision")
+	}
+	if _, err := hex.DecodeString(revision); err != nil {
+		return "", fmt.Errorf("decode user revision: invalid revision")
+	}
+	return revision, nil
+}
 
 // GetUserList will pull user from v2board
 func (c *Client) GetUserList(ctx context.Context) ([]UserInfo, error) {

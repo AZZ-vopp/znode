@@ -43,6 +43,49 @@ func TestUserListValidationRejectsDuplicateCredentialsAndInvalidLimits(t *testin
 	}
 }
 
+func TestUserRevisionAcceptsOnlyTheAuthenticatedHexMarker(t *testing.T) {
+	const revision = "0123456789abcdef0123456789abcdef"
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+		if request.URL.Path != userRevisionPath {
+			t.Errorf("unexpected revision path %q", request.URL.Path)
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"revision":"` + revision + `"}`))
+	}))
+	defer server.Close()
+
+	client, err := New(&conf.NodeConfig{
+		APIHost: server.URL, NodeID: 2, Key: "agent-token", AgentID: "agent-a",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := client.GetUserRevision(context.Background())
+	if err != nil || got != revision {
+		t.Fatalf("revision=%q err=%v, want %q", got, err, revision)
+	}
+}
+
+func TestUserRevisionRejectsMalformedSuccessfulResponse(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"revision":"not-a-revision"}`))
+	}))
+	defer server.Close()
+
+	client, err := New(&conf.NodeConfig{
+		APIHost: server.URL, NodeID: 2, Key: "agent-token", AgentID: "agent-a",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := client.GetUserRevision(context.Background()); err == nil {
+		t.Fatal("malformed revision response was accepted")
+	}
+}
+
 func TestUserListNotModifiedReplaysLastCompleteDesiredState(t *testing.T) {
 	requests := 0
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {

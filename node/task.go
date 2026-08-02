@@ -3,6 +3,7 @@ package node
 import (
 	"context"
 	"errors"
+	"fmt"
 	"reflect"
 	"time"
 
@@ -128,12 +129,23 @@ func (c *Controller) applyReportingThresholds(next *panel.NodeInfo) {
 func (c *Controller) refreshUsersImmediately() {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
-	if err := c.syncUsers(ctx); err != nil && !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
+	if err := c.syncUserCredentials(ctx); err != nil && !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
 		log.WithFields(log.Fields{"tag": c.tag, "err": err}).Warn("Fast device sync failed")
 	}
 }
 
 func (c *Controller) syncUsers(ctx context.Context) (err error) {
+	return c.syncUsersState(ctx, true)
+}
+
+// syncUserCredentials applies additions/removals without waiting for the
+// heavier online-device snapshot. The periodic task refreshes that fallback
+// map independently, so a slow statistics endpoint cannot delay a new UUID.
+func (c *Controller) syncUserCredentials(ctx context.Context) (err error) {
+	return c.syncUsersState(ctx, false)
+}
+
+func (c *Controller) syncUsersState(ctx context.Context, includeAlive bool) (err error) {
 	c.userSyncMu.Lock()
 	defer c.userSyncMu.Unlock()
 	if c.closing {
@@ -149,24 +161,28 @@ func (c *Controller) syncUsers(ctx context.Context) (err error) {
 			"tag": c.tag,
 			"err": err,
 		}).Error("Get user list failed")
-		return nil
-	}
-	// get user alive
-	newA, err := c.apiClient.GetUserAlive(ctx)
-	if err != nil {
-		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
-			return err
+		if !includeAlive {
+			return fmt.Errorf("get user list: %w", err)
 		}
-		log.WithFields(log.Fields{
-			"tag": c.tag,
-			"err": err,
-		}).Error("Get alive list failed")
 		return nil
 	}
-
-	// update alive list
-	if newA != nil {
-		c.limiter.UpdateAliveList(newA)
+	if includeAlive {
+		// Online state is useful for conservative device limiting, but it must
+		// not sit in the credential activation critical path.
+		newA, aliveErr := c.apiClient.GetUserAlive(ctx)
+		if aliveErr != nil {
+			if errors.Is(aliveErr, context.Canceled) || errors.Is(aliveErr, context.DeadlineExceeded) {
+				return aliveErr
+			}
+			log.WithFields(log.Fields{
+				"tag": c.tag,
+				"err": aliveErr,
+			}).Error("Get alive list failed")
+			return nil
+		}
+		if newA != nil {
+			c.limiter.UpdateAliveList(newA)
+		}
 	}
 	// A prior deletion may already have removed runtime credentials but failed
 	// to fsync its final counters. Finish that transaction before comparing the
@@ -181,6 +197,9 @@ func (c *Controller) syncUsers(ctx context.Context) (err error) {
 				"tag": c.tag,
 				"err": quiesceErr,
 			}).Error("Complete prior user quiesce failed")
+			if !includeAlive {
+				return fmt.Errorf("complete prior user quiesce: %w", quiesceErr)
+			}
 			return nil
 		}
 		if finalizeErr := c.finalizeQuiescedUsersLocked(); finalizeErr != nil {
@@ -188,6 +207,9 @@ func (c *Controller) syncUsers(ctx context.Context) (err error) {
 				"tag": c.tag,
 				"err": finalizeErr,
 			}).Error("Persist final traffic for quiesced users failed")
+			if !includeAlive {
+				return fmt.Errorf("persist final traffic for quiesced users: %w", finalizeErr)
+			}
 			return nil
 		}
 	}
@@ -208,6 +230,9 @@ func (c *Controller) syncUsers(ctx context.Context) (err error) {
 				"tag": c.tag,
 				"err": quiesceErr,
 			}).Error("Quiesce users failed")
+			if !includeAlive {
+				return fmt.Errorf("quiesce deleted users: %w", quiesceErr)
+			}
 			return nil
 		}
 		c.quiescedUsers = mergeUsersByCredential(c.quiescedUsers, deleted)
@@ -216,6 +241,9 @@ func (c *Controller) syncUsers(ctx context.Context) (err error) {
 				"tag": c.tag,
 				"err": finalizeErr,
 			}).Error("Persist final traffic for deleted users failed")
+			if !includeAlive {
+				return fmt.Errorf("persist final traffic for deleted users: %w", finalizeErr)
+			}
 			return nil
 		}
 	}
@@ -231,6 +259,9 @@ func (c *Controller) syncUsers(ctx context.Context) (err error) {
 				"tag": c.tag,
 				"err": err,
 			}).Error("Add users failed")
+			if !includeAlive {
+				return fmt.Errorf("add users: %w", err)
+			}
 			return nil
 		}
 	}
