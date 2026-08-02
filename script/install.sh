@@ -197,12 +197,13 @@ migrate_tiktok_compat_profile() {
     local config_file="/etc/znode/config.json"
     local temporary
     [[ -f "$config_file" ]] || return 0
-    if ! grep -Eq '"ConnIdle"[[:space:]]*:[[:space:]]*30([[:space:]]*,)|"BufferSize"[[:space:]]*:[[:space:]]*16([[:space:]]*,)|"DisableUDPContentSniffing"[[:space:]]*:[[:space:]]*false' "$config_file"; then
+    if ! grep -Eq '"Handshake"[[:space:]]*:[[:space:]]*4([[:space:]]*,)|"ConnIdle"[[:space:]]*:[[:space:]]*30([[:space:]]*,)|"BufferSize"[[:space:]]*:[[:space:]]*16([[:space:]]*,)|"DisableUDPContentSniffing"[[:space:]]*:[[:space:]]*false' "$config_file"; then
         return 0
     fi
     temporary=$(mktemp "${config_file}.XXXXXX") || return 1
 
     sed -E \
+        -e 's/"Handshake"[[:space:]]*:[[:space:]]*4[[:space:]]*,/"Handshake": 15,/' \
         -e 's/"ConnIdle"[[:space:]]*:[[:space:]]*30[[:space:]]*,/"ConnIdle": 120,/' \
         -e 's/"BufferSize"[[:space:]]*:[[:space:]]*16[[:space:]]*,/"BufferSize": 128,/' \
         -e 's/"DisableUDPContentSniffing"[[:space:]]*:[[:space:]]*false/"DisableUDPContentSniffing": true/' \
@@ -682,7 +683,7 @@ generate_znode_agent_config() {
         "Access": "none"
     },
     "ConnectionConfig": {
-        "Handshake": 4,
+        "Handshake": 15,
         "ConnIdle": 120,
         "UplinkOnly": 2,
         "DownlinkOnly": 4,

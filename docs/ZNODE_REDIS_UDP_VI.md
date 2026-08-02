@@ -9,7 +9,7 @@ Redis; key được băm SHA-256):
 ```json
 {
   "ConnectionConfig": {
-    "Handshake": 4,
+    "Handshake": 15,
     "ConnIdle": 120,
     "UplinkOnly": 2,
     "DownlinkOnly": 4,

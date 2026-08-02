@@ -48,6 +48,15 @@ func RedisTLSConfig(config *GlobalDeviceLimitConfig) (*tls.Config, error) {
 		}
 		return nil, nil
 	}
+	if len(config.RedisSentinelAddrs) > 64 {
+		return nil, fmt.Errorf("RedisSentinelAddrs contains too many addresses")
+	}
+	for _, address := range config.RedisSentinelAddrs {
+		sentinelHost, _, splitErr := net.SplitHostPort(strings.TrimSpace(address))
+		if splitErr != nil || strings.Trim(strings.TrimSpace(sentinelHost), "[]") == "" {
+			return nil, fmt.Errorf("Redis sentinel address %q must be host:port", address)
+		}
+	}
 
 	serverName := strings.TrimSpace(config.RedisTLSServerName)
 	if serverName == "" {
@@ -59,28 +68,37 @@ func RedisTLSConfig(config *GlobalDeviceLimitConfig) (*tls.Config, error) {
 	tlsConfig := &tls.Config{MinVersion: tls.VersionTLS12, ServerName: serverName}
 
 	caFile := strings.TrimSpace(config.RedisTLSCAFile)
-	if caFile == "" {
+	inlineCA := strings.TrimSpace(config.RedisTLSCACert)
+	if caFile == "" && inlineCA == "" {
 		return tlsConfig, nil
 	}
-	file, err := os.Open(caFile)
-	if err != nil {
-		return nil, fmt.Errorf("open Redis TLS CA file: %w", err)
-	}
-	defer file.Close()
-	info, err := file.Stat()
-	if err != nil || !info.Mode().IsRegular() || info.Size() < 1 || info.Size() > maxRedisCAFileBytes {
-		return nil, fmt.Errorf("Redis TLS CA file must be a regular file no larger than %d bytes", maxRedisCAFileBytes)
-	}
-	pem, err := io.ReadAll(io.LimitReader(file, maxRedisCAFileBytes+1))
-	if err != nil || len(pem) > maxRedisCAFileBytes {
-		return nil, fmt.Errorf("read Redis TLS CA file")
+	var pem []byte
+	if inlineCA != "" {
+		pem = []byte(inlineCA)
+		if len(pem) > maxRedisCAFileBytes {
+			return nil, fmt.Errorf("inline Redis TLS CA is larger than %d bytes", maxRedisCAFileBytes)
+		}
+	} else {
+		file, err := os.Open(caFile)
+		if err != nil {
+			return nil, fmt.Errorf("open Redis TLS CA file: %w", err)
+		}
+		defer file.Close()
+		info, err := file.Stat()
+		if err != nil || !info.Mode().IsRegular() || info.Size() < 1 || info.Size() > maxRedisCAFileBytes {
+			return nil, fmt.Errorf("Redis TLS CA file must be a regular file no larger than %d bytes", maxRedisCAFileBytes)
+		}
+		pem, err = io.ReadAll(io.LimitReader(file, maxRedisCAFileBytes+1))
+		if err != nil || len(pem) > maxRedisCAFileBytes {
+			return nil, fmt.Errorf("read Redis TLS CA file")
+		}
 	}
 	pool, err := x509.SystemCertPool()
 	if err != nil || pool == nil {
 		pool = x509.NewCertPool()
 	}
 	if !pool.AppendCertsFromPEM(pem) {
-		return nil, fmt.Errorf("Redis TLS CA file contains no valid certificate")
+		return nil, fmt.Errorf("Redis TLS CA contains no valid certificate")
 	}
 	tlsConfig.RootCAs = pool
 	return tlsConfig, nil

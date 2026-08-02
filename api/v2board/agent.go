@@ -40,13 +40,14 @@ type AgentCertificateRequest struct {
 // Revision should change whenever Nodes changes. If an older panel omits it,
 // EffectiveRevision derives a stable value from the sorted node IDs.
 type AgentManifest struct {
-	PanelType            string                   `json:"panel_type"`
-	Revision             string                   `json:"revision"`
-	Nodes                []int                    `json:"nodes"`
-	PollInterval         int                      `json:"poll_interval"`
-	Maintenance          *AgentMaintenance        `json:"maintenance,omitempty"`
-	CertificateRequest   *AgentCertificateRequest `json:"certificate_request,omitempty"`
-	AuthorizationRevoked bool                     `json:"-"`
+	PanelType               string                        `json:"panel_type"`
+	Revision                string                        `json:"revision"`
+	Nodes                   []int                         `json:"nodes"`
+	PollInterval            int                           `json:"poll_interval"`
+	Maintenance             *AgentMaintenance             `json:"maintenance,omitempty"`
+	CertificateRequest      *AgentCertificateRequest      `json:"certificate_request,omitempty"`
+	GlobalDeviceLimitConfig *conf.GlobalDeviceLimitConfig `json:"global_device_limit_config,omitempty"`
+	AuthorizationRevoked    bool                          `json:"-"`
 }
 
 // AgentClient is deliberately separate from Client: it authenticates a VPS
@@ -208,6 +209,14 @@ func (m *AgentManifest) Validate() error {
 	if len(m.Revision) > 256 {
 		return fmt.Errorf("invalid agent manifest: revision is too long")
 	}
+	if m.GlobalDeviceLimitConfig != nil {
+		if len(m.GlobalDeviceLimitConfig.RedisSentinelAddrs) > 64 {
+			return fmt.Errorf("invalid agent manifest: too many Redis sentinels")
+		}
+		if _, err := conf.RedisTLSConfig(m.GlobalDeviceLimitConfig); err != nil {
+			return fmt.Errorf("invalid agent manifest Redis config: %w", err)
+		}
+	}
 	seen := make(map[int]struct{}, len(m.Nodes))
 	for _, nodeID := range m.Nodes {
 		if nodeID <= 0 {
@@ -278,6 +287,10 @@ func (m *AgentManifest) EffectivePollInterval(fallback int) time.Duration {
 // NodeConfigs turns the authoritative manifest into the per-node clients used
 // by the existing runtime. Manual Nodes are untouched when agent mode is off.
 func (m *AgentManifest) NodeConfigs(agent conf.AgentConfig) []conf.NodeConfig {
+	deviceConfig := agent.GlobalDeviceLimitConfig
+	if m.GlobalDeviceLimitConfig != nil {
+		deviceConfig = m.GlobalDeviceLimitConfig
+	}
 	nodes := make([]conf.NodeConfig, 0, len(m.Nodes))
 	for _, nodeID := range m.Nodes {
 		nodes = append(nodes, conf.NodeConfig{
@@ -287,7 +300,7 @@ func (m *AgentManifest) NodeConfigs(agent conf.AgentConfig) []conf.NodeConfig {
 			AgentID:                 agent.AgentID,
 			AgentInstanceID:         agent.AgentInstanceID,
 			Timeout:                 conf.DefaultNodeTimeout,
-			GlobalDeviceLimitConfig: cloneGlobalDeviceLimitConfig(agent.GlobalDeviceLimitConfig),
+			GlobalDeviceLimitConfig: cloneGlobalDeviceLimitConfig(deviceConfig),
 		})
 	}
 	return nodes
@@ -298,6 +311,7 @@ func cloneGlobalDeviceLimitConfig(source *conf.GlobalDeviceLimitConfig) *conf.Gl
 		return nil
 	}
 	cloned := *source
+	cloned.RedisSentinelAddrs = append([]string(nil), source.RedisSentinelAddrs...)
 	if source.SyncEnabled != nil {
 		syncEnabled := *source.SyncEnabled
 		cloned.SyncEnabled = &syncEnabled
