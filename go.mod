@@ -3,7 +3,7 @@ module github.com/AZZ-vopp/znode
 go 1.26.5
 
 require (
-	github.com/fsnotify/fsnotify v1.9.0
+	github.com/fsnotify/fsnotify v1.10.1
 	github.com/go-acme/lego/v4 v4.34.0
 	github.com/go-resty/resty/v2 v2.17.2
 	github.com/juju/ratelimit v1.0.2
