@@ -23,9 +23,10 @@ type Node struct {
 // Xray without reaching the panel. It intentionally excludes Agent tokens;
 // callers rebuild per-node clients from the live root-owned config file.
 type RuntimeSnapshot struct {
-	NodeInfos []*panel.NodeInfo  `json:"node_infos"`
-	Users     [][]panel.UserInfo `json:"users"`
-	Alive     []map[int]int      `json:"alive"`
+	NodeInfos     []*panel.NodeInfo               `json:"node_infos"`
+	Users         [][]panel.UserInfo              `json:"users"`
+	Alive         []map[int]int                   `json:"alive"`
+	DeviceConfigs []*conf.GlobalDeviceLimitConfig `json:"device_configs,omitempty"`
 }
 
 type controllerCloseResult struct {
@@ -71,11 +72,17 @@ func NewFromRuntimeSnapshot(nodes []conf.NodeConfig, snapshot RuntimeSnapshot) (
 	if len(nodes) != len(snapshot.NodeInfos) || len(nodes) != len(snapshot.Users) || len(nodes) != len(snapshot.Alive) {
 		return nil, fmt.Errorf("runtime snapshot shape does not match assigned nodes")
 	}
+	if len(snapshot.DeviceConfigs) > 0 && len(snapshot.DeviceConfigs) != len(nodes) {
+		return nil, fmt.Errorf("runtime snapshot Redis fallback shape does not match assigned nodes")
+	}
 	n := &Node{
 		controllers: make([]*Controller, len(nodes)),
 		NodeInfos:   make([]*panel.NodeInfo, len(nodes)),
 	}
 	for i := range nodes {
+		if len(snapshot.DeviceConfigs) > 0 {
+			nodes[i].GlobalDeviceLimitConfig = cloneDeviceConfig(snapshot.DeviceConfigs[i])
+		}
 		info := snapshot.NodeInfos[i]
 		if info == nil || info.Common == nil {
 			return nil, fmt.Errorf("runtime snapshot node %d is empty", i)
@@ -110,9 +117,10 @@ func NewFromRuntimeSnapshot(nodes []conf.NodeConfig, snapshot RuntimeSnapshot) (
 // RuntimeSnapshot returns an isolated copy suitable for atomic persistence.
 func (n *Node) RuntimeSnapshot() (RuntimeSnapshot, error) {
 	snapshot := RuntimeSnapshot{
-		NodeInfos: make([]*panel.NodeInfo, len(n.controllers)),
-		Users:     make([][]panel.UserInfo, len(n.controllers)),
-		Alive:     make([]map[int]int, len(n.controllers)),
+		NodeInfos:     make([]*panel.NodeInfo, len(n.controllers)),
+		Users:         make([][]panel.UserInfo, len(n.controllers)),
+		Alive:         make([]map[int]int, len(n.controllers)),
+		DeviceConfigs: make([]*conf.GlobalDeviceLimitConfig, len(n.controllers)),
 	}
 	for i, controller := range n.controllers {
 		if controller == nil {
@@ -127,9 +135,23 @@ func (n *Node) RuntimeSnapshot() (RuntimeSnapshot, error) {
 		snapshot.NodeInfos[i] = info
 		snapshot.Users[i] = append([]panel.UserInfo(nil), controller.userList...)
 		snapshot.Alive[i] = cloneAliveMap(controller.aliveMap)
+		snapshot.DeviceConfigs[i] = cloneDeviceConfig(controller.conf.GlobalDeviceLimitConfig)
 		controller.userSyncMu.Unlock()
 	}
 	return snapshot, nil
+}
+
+func cloneDeviceConfig(source *conf.GlobalDeviceLimitConfig) *conf.GlobalDeviceLimitConfig {
+	if source == nil {
+		return nil
+	}
+	cloned := *source
+	cloned.RedisSentinelAddrs = append([]string(nil), source.RedisSentinelAddrs...)
+	if source.SyncEnabled != nil {
+		enabled := *source.SyncEnabled
+		cloned.SyncEnabled = &enabled
+	}
+	return &cloned
 }
 
 func cloneNodeInfo(source *panel.NodeInfo) (*panel.NodeInfo, error) {

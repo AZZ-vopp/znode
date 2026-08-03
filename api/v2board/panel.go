@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/sirupsen/logrus"
@@ -26,6 +27,8 @@ type Client struct {
 	responseBodyHash string
 	UserList         *UserListBody
 	AliveMap         *AliveMap
+	fallbackConfig   *conf.GlobalDeviceLimitConfig
+	fallbackMu       sync.Mutex
 }
 
 // Ordinary panel responses are small JSON documents. Keep a hard ceiling so
@@ -87,11 +90,12 @@ func New(c *conf.NodeConfig) (*Client, error) {
 	setAddressHeaders(client)
 	client.SetQueryParams(query)
 	return &Client{
-		client:   client,
-		Token:    c.Key,
-		APIHost:  apiHost,
-		NodeId:   c.NodeID,
-		UserList: &UserListBody{},
-		AliveMap: &AliveMap{},
+		client:         client,
+		Token:          c.Key,
+		APIHost:        apiHost,
+		NodeId:         c.NodeID,
+		UserList:       &UserListBody{},
+		AliveMap:       &AliveMap{},
+		fallbackConfig: cloneGlobalDeviceLimitConfig(c.GlobalDeviceLimitConfig),
 	}, nil
 }

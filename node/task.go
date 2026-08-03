@@ -61,6 +61,13 @@ func (c *Controller) nodeInfoMonitor(ctx context.Context) (err error) {
 			"tag": c.tag,
 			"err": err,
 		}).Error("Get node info failed")
+		// Keep the last-known-good inbound configuration, but still reconcile
+		// credentials. GetUserList tries ZBoard first and switches to the signed
+		// Redis snapshot only when that live request also fails.
+		if fallbackErr := c.syncUserCredentials(ctx); fallbackErr != nil &&
+			!errors.Is(fallbackErr, context.Canceled) && !errors.Is(fallbackErr, context.DeadlineExceeded) {
+			log.WithFields(log.Fields{"tag": c.tag, "err": fallbackErr}).Warn("Offline user snapshot reconciliation failed")
+		}
 		return nil
 	}
 	if newN != nil {

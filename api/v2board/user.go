@@ -82,8 +82,29 @@ func (c *Client) GetUserRevision(ctx context.Context) (string, error) {
 	return revision, nil
 }
 
-// GetUserList will pull user from v2board
+// GetUserList keeps ZBoard authoritative. Redis is consulted only after the
+// live panel request fails, and every fallback snapshot must pass the Agent
+// token HMAC before it can change runtime credentials.
 func (c *Client) GetUserList(ctx context.Context) ([]UserInfo, error) {
+	users, err := c.getUserListFromPanel(ctx)
+	if err == nil {
+		return users, nil
+	}
+	var statusError *userListHTTPError
+	if errors.As(err, &statusError) && (statusError.Status == http.StatusUnauthorized ||
+		statusError.Status == http.StatusForbidden || statusError.Status == http.StatusGone) {
+		return nil, err
+	}
+	fallback, fallbackErr := c.getFallbackUserList(ctx)
+	if fallbackErr != nil {
+		return nil, fmt.Errorf("%w; signed Redis fallback unavailable: %v", err, fallbackErr)
+	}
+	c.userEtag = ""
+	c.UserList = &UserListBody{Users: cloneUserList(fallback)}
+	return cloneUserList(fallback), nil
+}
+
+func (c *Client) getUserListFromPanel(ctx context.Context) ([]UserInfo, error) {
 	const path = "/api/v1/server/UniProxy/user"
 	r, err := c.client.R().
 		SetContext(ctx).
@@ -110,7 +131,7 @@ func (c *Client) GetUserList(ctx context.Context) ([]UserInfo, error) {
 		return cloneUserList(c.UserList.Users), nil
 	}
 	if r.StatusCode() < http.StatusOK || r.StatusCode() >= http.StatusMultipleChoices {
-		return nil, fmt.Errorf("get user list: panel returned HTTP %d", r.StatusCode())
+		return nil, &userListHTTPError{Status: r.StatusCode()}
 	}
 	if r.RawResponse.ContentLength > maxPanelUserResponseBytes {
 		return nil, fmt.Errorf("decode user list error: response is too large")
@@ -152,6 +173,14 @@ func (c *Client) GetUserList(ctx context.Context) ([]UserInfo, error) {
 	c.userEtag = etag
 	c.UserList = &UserListBody{Users: cloneUserList(userlist.Users)}
 	return cloneUserList(userlist.Users), nil
+}
+
+type userListHTTPError struct {
+	Status int
+}
+
+func (e *userListHTTPError) Error() string {
+	return fmt.Sprintf("get user list: panel returned HTTP %d", e.Status)
 }
 
 func cloneUserList(users []UserInfo) []UserInfo {

@@ -95,6 +95,11 @@ type GlobalDeviceLimitConfig struct {
 	// honoring an explicit false in a node config.
 	SyncEnabled *bool  `mapstructure:"SyncEnabled"`
 	SyncChannel string `mapstructure:"SyncChannel"`
+	// Signed user snapshots are a control-plane fallback. ZNode always asks
+	// ZBoard first and reads Redis only when that request fails.
+	UserFallbackEnabled bool   `mapstructure:"UserFallbackEnabled"`
+	UserSnapshotPrefix  string `mapstructure:"UserSnapshotPrefix"`
+	UserSnapshotMaxAge  int    `mapstructure:"UserSnapshotMaxAge"`
 }
 
 func New() *Conf {
@@ -323,6 +328,15 @@ func (c *GlobalDeviceLimitConfig) applyDefaults() {
 	if c.SyncEnabled == nil {
 		enabled := true
 		c.SyncEnabled = &enabled
+	}
+	if c.UserSnapshotPrefix == "" {
+		c.UserSnapshotPrefix = "zboard:user-snapshot"
+	}
+	if c.UserSnapshotMaxAge <= 0 {
+		c.UserSnapshotMaxAge = 7 * 24 * 60 * 60
+	}
+	if c.UserSnapshotMaxAge > 30*24*60*60 {
+		c.UserSnapshotMaxAge = 30 * 24 * 60 * 60
 	}
 }
 

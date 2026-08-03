@@ -53,6 +53,11 @@ func TestOfflineRuntimeSnapshotStartsWithoutPanel(t *testing.T) {
 		}},
 		Users: [][]panel.UserInfo{{{Id: 11, UserId: 11, Uuid: "11111111-1111-4111-8111-111111111111", DeviceLimit: 2}}},
 		Alive: []map[int]int{{11: 1}},
+		DeviceConfigs: []*conf.GlobalDeviceLimitConfig{{
+			Enable: false, RedisNetwork: "tcp", RedisAddr: "127.0.0.1:6379",
+			UserFallbackEnabled: true, UserSnapshotPrefix: "zboard:user-snapshot",
+			UserSnapshotMaxAge: 604800,
+		}},
 	}
 	nodes, err := node.NewFromRuntimeSnapshot(configuration.NodeConfigs, runtimeState)
 	if err != nil {
@@ -83,6 +88,9 @@ func TestOfflineRuntimeSnapshotStartsWithoutPanel(t *testing.T) {
 	}
 	if restored.assignment.Revision != "revision-online" || len(restored.config.NodeConfigs) != 1 || restored.config.NodeConfigs[0].NodeID != 7 {
 		t.Fatalf("unexpected restored runtime: assignment=%+v nodes=%+v", restored.assignment, restored.config.NodeConfigs)
+	}
+	if fallback := restored.config.NodeConfigs[0].GlobalDeviceLimitConfig; fallback == nil || !fallback.UserFallbackEnabled || fallback.UserSnapshotMaxAge != 604800 {
+		t.Fatalf("Redis fallback config was not restored: %+v", fallback)
 	}
 	limiter.Init()
 	running, err := startPreparedRuntime(restored, make(chan struct{}, 1))
