@@ -111,6 +111,7 @@ func (c *AgentClient) GetManifest(ctx context.Context) (*AgentManifest, error) {
 		if !strings.EqualFold(strings.TrimSpace(response.Header().Get(agentAuthorizationHeader)), "revoked") {
 			return nil, fmt.Errorf("get agent manifest: unconfirmed authorization response HTTP %d", response.StatusCode())
 		}
+		markZBoardControlPlaneHealthy(c.config.APIHost, c.config.AgentID)
 		return &AgentManifest{
 			Revision:             fmt.Sprintf("authorization-revoked:%d", response.StatusCode()),
 			Nodes:                make([]int, 0),
@@ -151,6 +152,7 @@ func (c *AgentClient) GetManifest(ctx context.Context) (*AgentManifest, error) {
 	if err := manifest.Validate(); err != nil {
 		return nil, err
 	}
+	markZBoardControlPlaneHealthy(c.config.APIHost, c.config.AgentID)
 	return manifest, nil
 }
 

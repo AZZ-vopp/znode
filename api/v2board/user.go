@@ -88,12 +88,16 @@ func (c *Client) GetUserRevision(ctx context.Context) (string, error) {
 func (c *Client) GetUserList(ctx context.Context) ([]UserInfo, error) {
 	users, err := c.getUserListFromPanel(ctx)
 	if err == nil {
+		markZBoardControlPlaneHealthy(c.APIHost, c.AgentID)
 		return users, nil
 	}
 	var statusError *userListHTTPError
 	if errors.As(err, &statusError) && (statusError.Status == http.StatusUnauthorized ||
 		statusError.Status == http.StatusForbidden || statusError.Status == http.StatusGone) {
 		return nil, err
+	}
+	if zboardControlPlaneRecentlyHealthy(c.APIHost, c.AgentID) {
+		return nil, fmt.Errorf("%w; live ZBoard control plane is healthy, Redis fallback suppressed", err)
 	}
 	fallback, fallbackErr := c.getFallbackUserList(ctx)
 	if fallbackErr != nil {

@@ -20,6 +20,7 @@ import (
 type Client struct {
 	client           *resty.Client
 	APIHost          string
+	AgentID          string
 	Token            string
 	NodeId           int
 	nodeEtag         string
@@ -101,6 +102,7 @@ func New(c *conf.NodeConfig) (*Client, error) {
 		client:         client,
 		Token:          c.Key,
 		APIHost:        apiHost,
+		AgentID:        c.AgentID,
 		NodeId:         c.NodeID,
 		UserList:       &UserListBody{},
 		AliveMap:       &AliveMap{},
