@@ -52,6 +52,14 @@ func NewController(api *panel.Client, conf *conf.NodeConfig, info *panel.NodeInf
 	return controller
 }
 
+func (c *Controller) UpdateFallbackConfig(config *conf.GlobalDeviceLimitConfig) {
+	c.userSyncMu.Lock()
+	cloned := cloneDeviceConfig(config)
+	c.conf.GlobalDeviceLimitConfig = cloned
+	c.apiClient.UpdateFallbackConfig(cloned)
+	c.userSyncMu.Unlock()
+}
+
 // Prepare fetches all panel-side state and certificates without binding an
 // inbound. Reload uses this while the previous runtime is still healthy.
 func (c *Controller) Prepare(ctx context.Context) error {

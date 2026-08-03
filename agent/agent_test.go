@@ -61,6 +61,57 @@ func TestMonitorSignalsUntilRevisionIsApplied(t *testing.T) {
 	}
 }
 
+func TestMonitorAppliesRedisFallbackWithoutReloadingNodes(t *testing.T) {
+	reloadCh := make(chan struct{}, 1)
+	fallbackCh := make(chan FallbackUpdate, 1)
+	fetcher := &fakeManifestFetcher{manifest: &panel.AgentManifest{
+		Revision:         "all-2",
+		NodeRevision:     "nodes-1",
+		FallbackRevision: "fallback-2",
+		Nodes:            []int{1},
+		GlobalDeviceLimitConfig: &conf.GlobalDeviceLimitConfig{
+			RedisAddr: "redis.example:6379", UserFallbackEnabled: true,
+		},
+	}}
+	monitor := newMonitorWithFallback(reloadCh, fallbackCh, func(conf.AgentConfig) (manifestFetcher, error) {
+		return fetcher, nil
+	})
+	defer monitor.Close()
+
+	config := conf.AgentConfig{Enable: true, APIHost: "https://panel.example", AgentID: "agent", AgentToken: "token"}
+	if err := monitor.MarkApplied(config, Assignment{
+		Revision: "all-1", NodeRevision: "nodes-1", FallbackRevision: "fallback-1",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := monitor.pollOnce(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case update := <-fallbackCh:
+		if update.Config == nil || update.Config.RedisAddr != "redis.example:6379" || !update.Config.UserFallbackEnabled ||
+			update.Revision != "fallback-2" || update.AggregateRevision != "all-2" {
+			t.Fatalf("unexpected fallback update: %+v", update)
+		}
+	default:
+		t.Fatal("expected a hot Redis fallback update")
+	}
+	select {
+	case <-reloadCh:
+		t.Fatal("Redis-only update reloaded VPN nodes")
+	default:
+	}
+
+	if err := monitor.pollOnce(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-fallbackCh:
+		t.Fatal("already applied fallback was sent twice")
+	default:
+	}
+}
+
 func TestMonitorKeepsCurrentNodesUntilAuthorizationDenialIsPersistent(t *testing.T) {
 	reloadCh := make(chan struct{}, 1)
 	fetcher := &fakeManifestFetcher{manifest: &panel.AgentManifest{

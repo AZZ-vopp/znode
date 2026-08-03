@@ -31,6 +31,14 @@ type Client struct {
 	fallbackMu       sync.Mutex
 }
 
+// UpdateFallbackConfig changes only the signed Redis user-snapshot source.
+// It does not touch Xray inbounds, users, or the device limiter.
+func (c *Client) UpdateFallbackConfig(config *conf.GlobalDeviceLimitConfig) {
+	c.fallbackMu.Lock()
+	c.fallbackConfig = cloneGlobalDeviceLimitConfig(config)
+	c.fallbackMu.Unlock()
+}
+
 // Ordinary panel responses are small JSON documents. Keep a hard ceiling so
 // a compromised/misconfigured endpoint cannot make the root Agent buffer an
 // unbounded body. The user list is streamed separately in user.go.

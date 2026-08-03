@@ -15,8 +15,16 @@ import (
 // to this VPS agent.
 type Assignment struct {
 	Revision             string
+	NodeRevision         string
+	FallbackRevision     string
 	PollInterval         time.Duration
 	AuthorizationRevoked bool
+}
+
+type FallbackUpdate struct {
+	Config            *conf.GlobalDeviceLimitConfig
+	Revision          string
+	AggregateRevision string
 }
 
 // Resolve replaces Nodes with the authoritative agent manifest when agent mode
@@ -42,6 +50,8 @@ func Resolve(ctx context.Context, config *conf.Conf) (Assignment, error) {
 	config.NodeConfigs = manifest.NodeConfigs(config.AgentConfig)
 	return Assignment{
 		Revision:             manifest.EffectiveRevision(),
+		NodeRevision:         manifest.EffectiveNodeRevision(),
+		FallbackRevision:     manifest.EffectiveFallbackRevision(),
 		PollInterval:         manifest.EffectivePollInterval(config.AgentConfig.PollInterval),
 		AuthorizationRevoked: manifest.AuthorizationRevoked,
 	}, nil
@@ -68,33 +78,45 @@ func defaultFetcherFactory(config conf.AgentConfig) (manifestFetcher, error) {
 // applied revision. MarkApplied is intentionally separate so a failed reload
 // is retried while the healthy old runtime keeps serving traffic.
 type Monitor struct {
-	mu                   sync.RWMutex
-	config               conf.AgentConfig
-	fetcher              manifestFetcher
-	factory              fetcherFactory
-	appliedRevision      string
-	authorizationDenials int
-	pollInterval         time.Duration
-	generation           uint64
-	reloadCh             chan<- struct{}
-	wake                 chan struct{}
-	stop                 chan struct{}
-	done                 chan struct{}
-	startOnce            sync.Once
-	closeOnce            sync.Once
+	mu                      sync.RWMutex
+	config                  conf.AgentConfig
+	fetcher                 manifestFetcher
+	factory                 fetcherFactory
+	appliedRevision         string
+	appliedNodeRevision     string
+	appliedFallbackRevision string
+	authorizationDenials    int
+	pollInterval            time.Duration
+	generation              uint64
+	reloadCh                chan<- struct{}
+	fallbackCh              chan<- FallbackUpdate
+	wake                    chan struct{}
+	stop                    chan struct{}
+	done                    chan struct{}
+	startOnce               sync.Once
+	closeOnce               sync.Once
 }
 
-func NewMonitor(reloadCh chan<- struct{}) *Monitor {
-	return newMonitor(reloadCh, defaultFetcherFactory)
+func NewMonitor(reloadCh chan<- struct{}, fallbackChannels ...chan<- FallbackUpdate) *Monitor {
+	var fallbackCh chan<- FallbackUpdate
+	if len(fallbackChannels) > 0 {
+		fallbackCh = fallbackChannels[0]
+	}
+	return newMonitorWithFallback(reloadCh, fallbackCh, defaultFetcherFactory)
 }
 
 func newMonitor(reloadCh chan<- struct{}, factory fetcherFactory) *Monitor {
+	return newMonitorWithFallback(reloadCh, nil, factory)
+}
+
+func newMonitorWithFallback(reloadCh chan<- struct{}, fallbackCh chan<- FallbackUpdate, factory fetcherFactory) *Monitor {
 	return &Monitor{
-		factory:  factory,
-		reloadCh: reloadCh,
-		wake:     make(chan struct{}, 1),
-		stop:     make(chan struct{}),
-		done:     make(chan struct{}),
+		factory:    factory,
+		reloadCh:   reloadCh,
+		fallbackCh: fallbackCh,
+		wake:       make(chan struct{}, 1),
+		stop:       make(chan struct{}),
+		done:       make(chan struct{}),
 	}
 }
 
@@ -121,6 +143,11 @@ func (m *Monitor) MarkApplied(config conf.AgentConfig, assignment Assignment) er
 	m.config = config
 	m.fetcher = fetcher
 	m.appliedRevision = assignment.Revision
+	m.appliedNodeRevision = assignment.NodeRevision
+	if m.appliedNodeRevision == "" {
+		m.appliedNodeRevision = assignment.Revision
+	}
+	m.appliedFallbackRevision = assignment.FallbackRevision
 	m.authorizationDenials = 0
 	m.pollInterval = pollInterval
 	m.generation++
@@ -207,6 +234,8 @@ func (m *Monitor) pollOnce(ctx context.Context) error {
 		}
 	}
 	revision := manifest.EffectiveRevision()
+	nodeRevision := manifest.EffectiveNodeRevision()
+	fallbackRevision := manifest.EffectiveFallbackRevision()
 	interval := manifest.EffectivePollInterval(fallback)
 
 	m.mu.Lock()
@@ -229,16 +258,73 @@ func (m *Monitor) pollOnce(ctx context.Context) error {
 	} else {
 		m.authorizationDenials = 0
 	}
-	changed := revision != m.appliedRevision
+	componentAware := manifest.NodeRevision != "" && manifest.FallbackRevision != ""
+	legacyChanged := revision != m.appliedRevision
+	nodeChanged := nodeRevision != m.appliedNodeRevision
+	fallbackChanged := fallbackRevision != m.appliedFallbackRevision
+	fallbackCh := m.fallbackCh
 	m.mu.Unlock()
 
-	if changed && m.reloadCh != nil {
+	if !componentAware {
+		if legacyChanged && m.reloadCh != nil {
+			select {
+			case m.reloadCh <- struct{}{}:
+			default:
+			}
+		}
+		return nil
+	}
+	if nodeChanged && m.reloadCh != nil {
+		select {
+		case m.reloadCh <- struct{}{}:
+		default:
+		}
+		return nil
+	}
+	if fallbackChanged && fallbackCh != nil && hotSwappableFallback(manifest.GlobalDeviceLimitConfig) {
+		config := cloneFallbackConfig(manifest.GlobalDeviceLimitConfig)
+		select {
+		case fallbackCh <- FallbackUpdate{
+			Config:            config,
+			Revision:          fallbackRevision,
+			AggregateRevision: revision,
+		}:
+			m.mu.Lock()
+			if generation == m.generation && nodeRevision == m.appliedNodeRevision {
+				m.appliedRevision = revision
+				m.appliedFallbackRevision = fallbackRevision
+			}
+			m.mu.Unlock()
+		default:
+		}
+		return nil
+	}
+	// Device-limiter changes need a complete controller reconciliation. The hot
+	// path above is deliberately limited to Enable=false user-list fallback.
+	if fallbackChanged && m.reloadCh != nil {
 		select {
 		case m.reloadCh <- struct{}{}:
 		default:
 		}
 	}
 	return nil
+}
+
+func hotSwappableFallback(config *conf.GlobalDeviceLimitConfig) bool {
+	return config == nil || !config.Enable
+}
+
+func cloneFallbackConfig(source *conf.GlobalDeviceLimitConfig) *conf.GlobalDeviceLimitConfig {
+	if source == nil {
+		return nil
+	}
+	cloned := *source
+	cloned.RedisSentinelAddrs = append([]string(nil), source.RedisSentinelAddrs...)
+	if source.SyncEnabled != nil {
+		enabled := *source.SyncEnabled
+		cloned.SyncEnabled = &enabled
+	}
+	return &cloned
 }
 
 func (m *Monitor) Close() {

@@ -31,6 +31,8 @@ type runtimeSnapshotPayload struct {
 	AgentID              string               `json:"agent_id"`
 	AgentInstanceID      string               `json:"agent_instance_id,omitempty"`
 	Revision             string               `json:"revision"`
+	NodeRevision         string               `json:"node_revision,omitempty"`
+	FallbackRevision     string               `json:"fallback_revision,omitempty"`
 	PollIntervalSeconds  int64                `json:"poll_interval_seconds"`
 	AuthorizationRevoked bool                 `json:"authorization_revoked,omitempty"`
 	Runtime              node.RuntimeSnapshot `json:"runtime"`
@@ -88,6 +90,8 @@ func prepareRuntimeFromSnapshot(configPath string) (*preparedRuntime, error) {
 		nodes:  nodes,
 		assignment: agent.Assignment{
 			Revision:             payload.Revision,
+			NodeRevision:         payload.NodeRevision,
+			FallbackRevision:     payload.FallbackRevision,
 			PollInterval:         time.Duration(payload.PollIntervalSeconds) * time.Second,
 			AuthorizationRevoked: payload.AuthorizationRevoked,
 		},
@@ -117,6 +121,8 @@ func persistRuntimeSnapshot(prepared *preparedRuntime) error {
 		AgentID:              agentConfig.AgentID,
 		AgentInstanceID:      agentConfig.AgentInstanceID,
 		Revision:             prepared.assignment.Revision,
+		NodeRevision:         prepared.assignment.NodeRevision,
+		FallbackRevision:     prepared.assignment.FallbackRevision,
 		PollIntervalSeconds:  pollSeconds,
 		AuthorizationRevoked: prepared.assignment.AuthorizationRevoked,
 		Runtime:              runtimeState,

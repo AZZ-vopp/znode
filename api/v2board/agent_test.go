@@ -32,7 +32,7 @@ func TestAgentClientGetsManifestWithCredentials(t *testing.T) {
 			t.Fatalf("agent ID leaked into query string: %q", got)
 		}
 		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(`{"panel_type":"zboard","revision":"rev-9","nodes":[12,18],"poll_interval":7}`))
+		_, _ = w.Write([]byte(`{"panel_type":"zboard","revision":"rev-9","node_revision":"nodes-9","fallback_revision":"fallback-9","nodes":[12,18],"poll_interval":7}`))
 	}))
 	defer server.Close()
 
@@ -52,6 +52,9 @@ func TestAgentClientGetsManifestWithCredentials(t *testing.T) {
 	}
 	if manifest.EffectiveRevision() != "rev-9" || len(manifest.Nodes) != 2 {
 		t.Fatalf("unexpected manifest: %+v", manifest)
+	}
+	if manifest.EffectiveNodeRevision() != "nodes-9" || manifest.EffectiveFallbackRevision() != "fallback-9" {
+		t.Fatalf("unexpected component revisions: %+v", manifest)
 	}
 	if manifest.EffectivePollInterval(15) != 7*time.Second {
 		t.Fatalf("unexpected poll interval: %s", manifest.EffectivePollInterval(15))

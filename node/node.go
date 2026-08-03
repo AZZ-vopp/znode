@@ -35,6 +35,17 @@ type controllerCloseResult struct {
 	err        error
 }
 
+// UpdateFallbackConfig installs only the signed user-snapshot source. It is a
+// control-plane client setting and therefore must not close or rebuild Xray
+// listeners when Redis HA becomes ready or temporarily unavailable.
+func (n *Node) UpdateFallbackConfig(config *conf.GlobalDeviceLimitConfig) {
+	for _, controller := range n.controllers {
+		if controller != nil {
+			controller.UpdateFallbackConfig(config)
+		}
+	}
+}
+
 func New(nodes []conf.NodeConfig) (*Node, error) {
 	return NewContext(context.Background(), nodes)
 }

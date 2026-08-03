@@ -42,6 +42,8 @@ type AgentCertificateRequest struct {
 type AgentManifest struct {
 	PanelType               string                        `json:"panel_type"`
 	Revision                string                        `json:"revision"`
+	NodeRevision            string                        `json:"node_revision,omitempty"`
+	FallbackRevision        string                        `json:"fallback_revision,omitempty"`
 	Nodes                   []int                         `json:"nodes"`
 	PollInterval            int                           `json:"poll_interval"`
 	Maintenance             *AgentMaintenance             `json:"maintenance,omitempty"`
@@ -209,6 +211,9 @@ func (m *AgentManifest) Validate() error {
 	if len(m.Revision) > 256 {
 		return fmt.Errorf("invalid agent manifest: revision is too long")
 	}
+	if len(m.NodeRevision) > 256 || len(m.FallbackRevision) > 256 {
+		return fmt.Errorf("invalid agent manifest: component revision is too long")
+	}
 	if m.GlobalDeviceLimitConfig != nil {
 		if len(m.GlobalDeviceLimitConfig.RedisSentinelAddrs) > 64 {
 			return fmt.Errorf("invalid agent manifest: too many Redis sentinels")
@@ -262,6 +267,25 @@ func (m *AgentManifest) EffectiveRevision() string {
 	ids := append([]int(nil), m.Nodes...)
 	sort.Ints(ids)
 	payload, _ := json.Marshal(ids)
+	digest := sha256.Sum256(payload)
+	return hex.EncodeToString(digest[:])
+}
+
+// EffectiveNodeRevision lets ZNode distinguish an inbound/node change from a
+// Redis-only fallback update. Older ZBoard versions omit this field and retain
+// the conservative full-reload behavior through the aggregate revision.
+func (m *AgentManifest) EffectiveNodeRevision() string {
+	if revision := strings.TrimSpace(m.NodeRevision); revision != "" {
+		return revision
+	}
+	return m.EffectiveRevision()
+}
+
+func (m *AgentManifest) EffectiveFallbackRevision() string {
+	if revision := strings.TrimSpace(m.FallbackRevision); revision != "" {
+		return revision
+	}
+	payload, _ := json.Marshal(m.GlobalDeviceLimitConfig)
 	digest := sha256.Sum256(payload)
 	return hex.EncodeToString(digest[:])
 }

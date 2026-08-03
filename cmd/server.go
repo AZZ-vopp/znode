@@ -83,6 +83,7 @@ func serverHandle(_ *cobra.Command, _ []string) {
 	limiter.Init()
 	reloadCh := make(chan struct{}, 1)
 	snapshotCh := make(chan struct{}, 1)
+	fallbackCh := make(chan agent.FallbackUpdate, 1)
 	running, err := startPreparedRuntime(prepared, reloadCh, snapshotCh)
 	if err != nil {
 		log.WithField("err", err).Error("Start runtime failed")
@@ -95,7 +96,7 @@ func serverHandle(_ *cobra.Command, _ []string) {
 		log.WithField("err", err).Warn("Persist last-known-good runtime snapshot failed")
 	}
 
-	agentMonitor := agent.NewMonitor(reloadCh)
+	agentMonitor := agent.NewMonitor(reloadCh, fallbackCh)
 	if err := agentMonitor.MarkApplied(running.config.AgentConfig, running.assignment); err != nil {
 		log.WithField("err", err).Error("Start agent manifest monitor failed")
 		return
@@ -144,12 +145,48 @@ func serverHandle(_ *cobra.Command, _ []string) {
 				log.WithField("err", err).Warn("Update agent manifest monitor failed")
 			}
 			log.WithField("nodes", len(running.config.NodeConfigs)).Info("Reload successful")
+		case fallbackUpdate := <-fallbackCh:
+			applyRuntimeFallbackConfig(running, fallbackUpdate)
+			if err := persistRuntimeSnapshot(running.preparedRuntime); err != nil {
+				log.WithField("err", err).Warn("Persist Redis fallback update failed")
+			}
+			log.Info("Applied Redis user fallback without reloading VPN inbounds")
 		case <-snapshotCh:
 			if err := persistRuntimeSnapshot(running.preparedRuntime); err != nil {
 				log.WithField("err", err).Warn("Refresh last-known-good runtime snapshot failed")
 			}
 		}
 	}
+}
+
+func applyRuntimeFallbackConfig(running *runningRuntime, update agent.FallbackUpdate) {
+	if running == nil || running.preparedRuntime == nil {
+		return
+	}
+	if running.nodes != nil {
+		running.nodes.UpdateFallbackConfig(update.Config)
+	}
+	if running.config == nil {
+		return
+	}
+	for index := range running.config.NodeConfigs {
+		running.config.NodeConfigs[index].GlobalDeviceLimitConfig = cloneRuntimeFallbackConfig(update.Config)
+	}
+	running.assignment.FallbackRevision = update.Revision
+	running.assignment.Revision = update.AggregateRevision
+}
+
+func cloneRuntimeFallbackConfig(source *conf.GlobalDeviceLimitConfig) *conf.GlobalDeviceLimitConfig {
+	if source == nil {
+		return nil
+	}
+	cloned := *source
+	cloned.RedisSentinelAddrs = append([]string(nil), source.RedisSentinelAddrs...)
+	if source.SyncEnabled != nil {
+		enabled := *source.SyncEnabled
+		cloned.SyncEnabled = &enabled
+	}
+	return &cloned
 }
 
 func logRevokedAssignment(assignment agent.Assignment) {

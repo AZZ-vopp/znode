@@ -67,7 +67,8 @@ func TestOfflineRuntimeSnapshotStartsWithoutPanel(t *testing.T) {
 		config: configuration,
 		nodes:  nodes,
 		assignment: agent.Assignment{
-			Revision: "revision-online", PollInterval: 15 * time.Second,
+			Revision: "revision-online", NodeRevision: "nodes-online",
+			FallbackRevision: "fallback-online", PollInterval: 15 * time.Second,
 		},
 	}
 	if err := persistRuntimeSnapshot(prepared); err != nil {
@@ -88,6 +89,9 @@ func TestOfflineRuntimeSnapshotStartsWithoutPanel(t *testing.T) {
 	}
 	if restored.assignment.Revision != "revision-online" || len(restored.config.NodeConfigs) != 1 || restored.config.NodeConfigs[0].NodeID != 7 {
 		t.Fatalf("unexpected restored runtime: assignment=%+v nodes=%+v", restored.assignment, restored.config.NodeConfigs)
+	}
+	if restored.assignment.NodeRevision != "nodes-online" || restored.assignment.FallbackRevision != "fallback-online" {
+		t.Fatalf("component revisions were not restored: %+v", restored.assignment)
 	}
 	if fallback := restored.config.NodeConfigs[0].GlobalDeviceLimitConfig; fallback == nil || !fallback.UserFallbackEnabled || fallback.UserSnapshotMaxAge != 604800 {
 		t.Fatalf("Redis fallback config was not restored: %+v", fallback)
