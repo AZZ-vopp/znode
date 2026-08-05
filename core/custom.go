@@ -36,6 +36,9 @@ func resolveRouteOutbound(value *string, existing []*core.OutboundHandlerConfig)
 	if err := hardenFreedomOutbound(outbound); err != nil {
 		return "", nil, fmt.Errorf("secure route outbound: %w", err)
 	}
+	if err := applyXHTTPStreamDefaults(outbound.StreamSetting); err != nil {
+		return "", nil, fmt.Errorf("apply xhttp outbound defaults: %w", err)
+	}
 	if hasOutboundWithTag(existing, outbound.Tag) {
 		return outbound.Tag, nil, nil
 	}

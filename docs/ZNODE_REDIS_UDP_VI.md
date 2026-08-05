@@ -107,13 +107,13 @@ riêng.
 ## Kiểm thử
 
 ```bash
-GOEXPERIMENT=jsonv2 go test ./...
-GOEXPERIMENT=jsonv2 go test -bench BenchmarkDeviceTrackerSameIP -benchmem ./limiter
+GOEXPERIMENT=jsonv2 ./script/with-xray-core.sh go test ./...
+GOEXPERIMENT=jsonv2 ./script/with-xray-core.sh go test -bench BenchmarkDeviceTrackerSameIP -benchmem ./limiter
 ```
 
 Race detector cần CGO và một C compiler (`gcc`/MinGW). Sau khi cài toolchain,
 nên chạy thêm:
 
 ```bash
-CGO_ENABLED=1 GOEXPERIMENT=jsonv2 go test -race ./...
+CGO_ENABLED=1 GOEXPERIMENT=jsonv2 ./script/with-xray-core.sh go test -race ./...
 ```

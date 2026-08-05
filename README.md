@@ -56,11 +56,15 @@ hoặc tự thay URL tải bằng nguồn không tin cậy.
 Yêu cầu Go 1.26.5 và experiment JSON v2:
 
 ```bash
-GOEXPERIMENT=jsonv2 go test ./...
-GOEXPERIMENT=jsonv2 go build -v -o build_assets/znode \
+GOEXPERIMENT=jsonv2 ./script/with-xray-core.sh go test ./...
+GOEXPERIMENT=jsonv2 ./script/with-xray-core.sh go build -v -o build_assets/znode \
   -trimpath \
   -ldflags "-X 'github.com/AZZ-vopp/znode/cmd.version=dev' -s -w -buildid="
 ```
+
+Wrapper trên giữ nguyên fork Xray có AnyTLS/TUIC, sau đó áp các backport đã
+kiểm tra trong `patches/xray-core` vào bản sao tạm. Module cache gốc không bị
+sửa và build sẽ dừng ngay nếu patch không còn tương thích với fork được ghim.
 
 ## Phát hành
 

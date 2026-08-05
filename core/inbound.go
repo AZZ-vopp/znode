@@ -298,6 +298,9 @@ func buildVLess(nodeInfo *panel.NodeInfo, inbound *coreConf.InboundDetourConfig)
 		if err != nil {
 			return fmt.Errorf("unmarshal xhttp settings error: %s", err)
 		}
+		if err := applyXHTTPAntiTSPUDefaults(inbound.StreamSetting.SplitHTTPSettings); err != nil {
+			return fmt.Errorf("apply xhttp defaults error: %s", err)
+		}
 	default:
 		return errors.New("the network type is not vail")
 	}
@@ -344,6 +347,9 @@ func buildVMess(nodeInfo *panel.NodeInfo, inbound *coreConf.InboundDetourConfig)
 		err := unmarshalNetworkSettings(v.NetworkSettings, &inbound.StreamSetting.SplitHTTPSettings)
 		if err != nil {
 			return fmt.Errorf("unmarshal xhttp settings error: %s", err)
+		}
+		if err := applyXHTTPAntiTSPUDefaults(inbound.StreamSetting.SplitHTTPSettings); err != nil {
+			return fmt.Errorf("apply xhttp defaults error: %s", err)
 		}
 	default:
 		return errors.New("the network type is not vail")
@@ -570,6 +576,9 @@ func buildAnyTLS(nodeInfo *panel.NodeInfo, inbound *coreConf.InboundDetourConfig
 			err := unmarshalNetworkSettings(v.NetworkSettings, &inbound.StreamSetting.SplitHTTPSettings)
 			if err != nil {
 				return fmt.Errorf("unmarshal xhttp settings error: %s", err)
+			}
+			if err := applyXHTTPAntiTSPUDefaults(inbound.StreamSetting.SplitHTTPSettings); err != nil {
+				return fmt.Errorf("apply xhttp defaults error: %s", err)
 			}
 		default:
 			return errors.New("the network type is not vail")

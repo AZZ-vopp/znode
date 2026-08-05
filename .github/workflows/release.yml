@@ -43,11 +43,11 @@ jobs:
         run: GOEXPERIMENT=jsonv2 go mod download
       - name: Run tests and static analysis
         run: |
-          GOEXPERIMENT=jsonv2 go test ./...
-          GOEXPERIMENT=jsonv2 go vet ./...
-          GOEXPERIMENT=jsonv2 go test -race ./common/format ./api/v2board ./agent ./core/app/dispatcher ./core ./node ./limiter
+          GOEXPERIMENT=jsonv2 ./script/with-xray-core.sh go test ./...
+          GOEXPERIMENT=jsonv2 ./script/with-xray-core.sh go vet ./...
+          GOEXPERIMENT=jsonv2 ./script/with-xray-core.sh go test -race ./common/format ./api/v2board ./agent ./core/app/dispatcher ./core ./node ./limiter
       - name: Scan reachable Go vulnerabilities
-        run: GOEXPERIMENT=jsonv2 go run golang.org/x/vuln/cmd/govulncheck@v1.6.0 ./...
+        run: GOEXPERIMENT=jsonv2 ./script/with-xray-core.sh go run golang.org/x/vuln/cmd/govulncheck@v1.6.0 ./...
 
   build:
     needs: test
@@ -149,13 +149,13 @@ jobs:
         run: |
           echo "version: $version"
           mkdir -p build_assets
-          GOEXPERIMENT=jsonv2 go build -v -o build_assets/znode -trimpath -ldflags "-X 'github.com/AZZ-vopp/znode/cmd.version=$version' -s -w -buildid="
+          GOEXPERIMENT=jsonv2 ./script/with-xray-core.sh go build -v -o build_assets/znode -trimpath -ldflags "-X 'github.com/AZZ-vopp/znode/cmd.version=$version' -s -w -buildid="
 
       - name: Build Mips softfloat znode
         if: matrix.goarch == 'mips' || matrix.goarch == 'mipsle'
         run: |
           echo "version: $version"
-          GOEXPERIMENT=jsonv2 GOMIPS=softfloat go build -v -o build_assets/znode_softfloat -trimpath -ldflags "-X 'github.com/AZZ-vopp/znode/cmd.version=$version' -s -w -buildid="
+          GOEXPERIMENT=jsonv2 GOMIPS=softfloat ./script/with-xray-core.sh go build -v -o build_assets/znode_softfloat -trimpath -ldflags "-X 'github.com/AZZ-vopp/znode/cmd.version=$version' -s -w -buildid="
       - name: Rename Windows znode
         if: matrix.goos == 'windows'
         run: |
