@@ -6,6 +6,7 @@ import (
 	"crypto/tls"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"sort"
@@ -19,6 +20,8 @@ import (
 const agentManifestPath = "/api/v2/server/agent/config"
 const agentMaintenanceReportPath = "/api/v2/server/agent/maintenance/report"
 const agentCertificateReportPath = "/api/v2/server/agent/certificate/report"
+const agentTerminalClaimPath = "/api/v2/server/agent/terminal/claim"
+const agentTerminalExchangePath = "/api/v2/server/agent/terminal/exchange"
 const agentAuthorizationHeader = "X-ZBoard-Agent-Authorization"
 
 const maxAgentNodes = 10000
@@ -55,8 +58,133 @@ type AgentManifest struct {
 // AgentClient is deliberately separate from Client: it authenticates a VPS
 // agent, while Client authenticates requests for one assigned logical node.
 type AgentClient struct {
-	client *resty.Client
-	config conf.AgentConfig
+	client         *resty.Client
+	terminalClient *resty.Client
+	config         conf.AgentConfig
+	instanceSecret string
+}
+
+// AgentTerminalSession is the small, byte-free metadata record returned by
+// the terminal relay. Values are strings because the relay stores them in
+// Redis hashes.
+type AgentTerminalSession struct {
+	ID     string
+	Status map[string]string
+}
+
+type AgentTerminalInput struct {
+	Seq  uint64 `json:"seq"`
+	Data string `json:"data"`
+}
+
+type AgentTerminalExchange struct {
+	Input  []AgentTerminalInput
+	Status map[string]string
+}
+
+// AgentTerminalHTTPError preserves the panel status so the terminal worker
+// can distinguish a closed/revoked session from a transient network failure.
+type AgentTerminalHTTPError struct {
+	StatusCode int
+}
+
+func (e *AgentTerminalHTTPError) Error() string {
+	return fmt.Sprintf("terminal request: panel returned HTTP %d", e.StatusCode)
+}
+
+// IsTerminalSessionClosed reports responses that must immediately tear down
+// the root PTY. Retrying these responses would keep a disabled session alive.
+func IsTerminalSessionClosed(err error) bool {
+	var responseError *AgentTerminalHTTPError
+	if !errors.As(err, &responseError) {
+		return false
+	}
+	return responseError.StatusCode == http.StatusUnauthorized ||
+		responseError.StatusCode == http.StatusForbidden ||
+		responseError.StatusCode == http.StatusNotFound
+}
+
+// ClaimTerminal asks the panel for one pending terminal session. No request
+// body is sent: this makes the endpoint safe to poll through strict proxies.
+func (c *AgentClient) ClaimTerminal(ctx context.Context) (*AgentTerminalSession, error) {
+	var payload struct {
+		Data *struct {
+			ID     string            `json:"id"`
+			Status map[string]string `json:"status"`
+		} `json:"data"`
+	}
+	if err := c.terminalPost(ctx, agentTerminalClaimPath, nil, &payload); err != nil {
+		return nil, err
+	}
+	if payload.Data == nil {
+		return nil, nil
+	}
+	if strings.TrimSpace(payload.Data.ID) == "" {
+		return nil, fmt.Errorf("claim terminal: response missing session ID")
+	}
+	return &AgentTerminalSession{ID: payload.Data.ID, Status: payload.Data.Status}, nil
+}
+
+// ExchangeTerminal optionally uploads one PTY output chunk and returns all
+// pending terminal input and current size metadata for the claimed session.
+func (c *AgentClient) ExchangeTerminal(ctx context.Context, id string, seq uint64, data string, inputAck uint64) (*AgentTerminalExchange, error) {
+	if strings.TrimSpace(id) == "" {
+		return nil, fmt.Errorf("exchange terminal: session ID is required")
+	}
+	body := map[string]any{"id": id}
+	if inputAck != 0 {
+		body["input_ack"] = inputAck
+	}
+	if seq != 0 || data != "" {
+		if seq == 0 || data == "" {
+			return nil, fmt.Errorf("exchange terminal: sequence and data must be supplied together")
+		}
+		body["seq"] = seq
+		body["data"] = data
+	}
+	var payload struct {
+		Data struct {
+			Input  []AgentTerminalInput `json:"input"`
+			Status map[string]string    `json:"status"`
+		} `json:"data"`
+	}
+	if err := c.terminalPost(ctx, agentTerminalExchangePath, body, &payload); err != nil {
+		return nil, err
+	}
+	return &AgentTerminalExchange{Input: payload.Data.Input, Status: payload.Data.Status}, nil
+}
+
+// CloseTerminal releases relay state when the shell exits or the local idle
+// deadline is reached, preventing a claimed-but-orphaned browser session.
+func (c *AgentClient) CloseTerminal(ctx context.Context, id string) error {
+	if strings.TrimSpace(id) == "" {
+		return fmt.Errorf("close terminal: session ID is required")
+	}
+	var payload struct {
+		Data map[string]any `json:"data"`
+	}
+	return c.terminalPost(ctx, agentTerminalExchangePath, map[string]any{"id": id, "close": true}, &payload)
+}
+
+func (c *AgentClient) terminalPost(ctx context.Context, path string, body any, result any) error {
+	if c.instanceSecret == "" {
+		return fmt.Errorf("terminal request: instance secret is unavailable")
+	}
+	request := c.terminalClient.R().SetContext(ctx).SetResult(result).ForceContentType("application/json")
+	if body != nil {
+		request.SetBody(body)
+	}
+	response, err := request.Post(path)
+	if err != nil {
+		return fmt.Errorf("terminal request: %w", err)
+	}
+	if response == nil {
+		return fmt.Errorf("terminal request: received nil response")
+	}
+	if response.StatusCode() < http.StatusOK || response.StatusCode() >= http.StatusMultipleChoices {
+		return &AgentTerminalHTTPError{StatusCode: response.StatusCode()}
+	}
+	return nil
 }
 
 func NewAgentClient(c conf.AgentConfig) (*AgentClient, error) {
@@ -72,12 +200,23 @@ func NewAgentClient(c conf.AgentConfig) (*AgentClient, error) {
 	}
 	c.APIHost = apiHost
 
+	client := newAgentHTTPClient(c, conf.DefaultNodeRetryCount)
+	terminalClient := newAgentHTTPClient(c, 0)
+	instanceSecret := setInstanceSecretHeader(client)
+	if instanceSecret != "" {
+		terminalClient.SetHeader("X-ZNode-Instance-Secret", instanceSecret)
+	}
+
+	return &AgentClient{client: client, terminalClient: terminalClient, config: c, instanceSecret: instanceSecret}, nil
+}
+
+func newAgentHTTPClient(c conf.AgentConfig, retryCount int) *resty.Client {
 	timeout := conf.DefaultNodeTimeout
 	client := resty.New().
 		SetBaseURL(c.APIHost).
 		SetTimeout(time.Duration(timeout)*time.Second).
 		SetResponseBodyLimit(maxBufferedPanelResponseBytes).
-		SetRetryCount(conf.DefaultNodeRetryCount).
+		SetRetryCount(retryCount).
 		SetRedirectPolicy(resty.NoRedirectPolicy()).
 		SetTLSClientConfig(&tls.Config{MinVersion: tls.VersionTLS12}).
 		SetHeader("User-Agent", fmt.Sprintf("znode-agent go-resty/%s (https://github.com/go-resty/resty)", resty.Version)).
@@ -88,8 +227,7 @@ func NewAgentClient(c conf.AgentConfig) (*AgentClient, error) {
 		SetHeader("X-ZNode-Version", ClientVersion()).
 		SetAuthToken(c.AgentToken)
 	setAddressHeaders(client)
-
-	return &AgentClient{client: client, config: c}, nil
+	return client
 }
 
 func (c *AgentClient) GetManifest(ctx context.Context) (*AgentManifest, error) {
@@ -319,6 +457,10 @@ func (m *AgentManifest) NodeConfigs(agent conf.AgentConfig) []conf.NodeConfig {
 	}
 	nodes := make([]conf.NodeConfig, 0, len(m.Nodes))
 	for _, nodeID := range m.Nodes {
+		config := cloneGlobalDeviceLimitConfig(deviceConfig)
+		if config != nil && config.UserSourceMode != "redis_primary" {
+			config.UserSourceMode = "web_primary"
+		}
 		nodes = append(nodes, conf.NodeConfig{
 			APIHost:                 agent.APIHost,
 			NodeID:                  nodeID,
@@ -326,7 +468,7 @@ func (m *AgentManifest) NodeConfigs(agent conf.AgentConfig) []conf.NodeConfig {
 			AgentID:                 agent.AgentID,
 			AgentInstanceID:         agent.AgentInstanceID,
 			Timeout:                 conf.DefaultNodeTimeout,
-			GlobalDeviceLimitConfig: cloneGlobalDeviceLimitConfig(deviceConfig),
+			GlobalDeviceLimitConfig: config,
 		})
 	}
 	return nodes

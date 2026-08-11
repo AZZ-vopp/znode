@@ -5,11 +5,14 @@ import (
 	"encoding/hex"
 	"net"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 
 	"github.com/go-resty/resty/v2"
 )
+
+const defaultInstanceSecretPath = "/etc/znode/instance-secret"
 
 var (
 	identityOnce sync.Once
@@ -44,6 +47,38 @@ func setAddressHeaders(client *resty.Client) {
 	if hostIPv6 != "" {
 		client.SetHeader("X-ZNode-IPv6", hostIPv6)
 	}
+}
+
+func setInstanceSecretHeader(client *resty.Client) string {
+	secret := loadInstanceSecret()
+	if secret != "" {
+		client.SetHeader("X-ZNode-Instance-Secret", secret)
+	}
+	return secret
+}
+
+func loadInstanceSecret() string {
+	path := strings.TrimSpace(os.Getenv("ZNODE_INSTANCE_SECRET_FILE"))
+	if path == "" {
+		path = defaultInstanceSecretPath
+	}
+	if !filepath.IsAbs(path) {
+		return ""
+	}
+	info, err := os.Lstat(path)
+	if err != nil || !info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0 || info.Mode().Perm()&0o077 != 0 {
+		return ""
+	}
+	value, err := os.ReadFile(path)
+	if err != nil {
+		return ""
+	}
+	secret := strings.TrimSpace(string(value))
+	decoded, err := hex.DecodeString(secret)
+	if err != nil || len(decoded) != 32 || secret != strings.ToLower(secret) {
+		return ""
+	}
+	return secret
 }
 
 func discoverHostAddresses() {

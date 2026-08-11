@@ -94,6 +94,7 @@ func New(c *conf.NodeConfig) (*Client, error) {
 	}
 	client.SetHeader("X-ZNode-Agent-ID", c.AgentID)
 	client.SetHeader("X-ZNode-Instance-ID", effectiveInstanceID(c.AgentInstanceID))
+	setInstanceSecretHeader(client)
 	client.SetHeader("X-ZNode-Agent-Token", c.Key)
 	client.SetAuthToken(c.Key)
 	setAddressHeaders(client)

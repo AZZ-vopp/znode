@@ -4,12 +4,39 @@ import (
 	"context"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/AZZ-vopp/znode/conf"
 )
+
+func configureInstanceSecret(t *testing.T) string {
+	t.Helper()
+	secret := strings.Repeat("a", 64)
+	path := filepath.Join(t.TempDir(), "instance-secret")
+	if err := os.WriteFile(path, []byte(secret+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("ZNODE_INSTANCE_SECRET_FILE", path)
+	return secret
+}
+
+func TestInstanceSecretRequiresPrivateRegularFile(t *testing.T) {
+	secret := configureInstanceSecret(t)
+	if got := loadInstanceSecret(); got != secret {
+		t.Fatalf("instance secret = %q", got)
+	}
+	path := os.Getenv("ZNODE_INSTANCE_SECRET_FILE")
+	if err := os.Chmod(path, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if got := loadInstanceSecret(); got != "" {
+		t.Fatal("world-readable instance secret was accepted")
+	}
+}
 
 func TestNodeConfigRequiresZBoardPanelIdentity(t *testing.T) {
 	for name, panelType := range map[string]string{

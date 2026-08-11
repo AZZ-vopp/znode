@@ -54,6 +54,11 @@ AGENT_ID_ARG=""
 AGENT_TOKEN_ARG=""
 AGENT_TOKEN_STDIN=false
 POLL_INTERVAL_ARG="15"
+DISABLE_EXECUTE_WAS_SET=false
+if [[ -n "${DISABLE_EXECUTE+x}" ]]; then
+    DISABLE_EXECUTE_WAS_SET=true
+fi
+DISABLE_EXECUTE="${DISABLE_EXECUTE:-}"
 RELEASE_REPO_ARG="${ZNODE_RELEASE_REPO:-AZZ-vopp/znode}"
 RELEASE_BRANCH_ARG="${ZNODE_RELEASE_BRANCH:-main}"
 ZNODE_OPERATION_LOCK_FILE="/run/znode-operation.lock"
@@ -224,6 +229,38 @@ secure_znode_config_permissions() {
     chown root:root "$config_file" && chmod 600 "$config_file"
 }
 
+ensure_instance_secret() {
+    local secret_file="/etc/znode/instance-secret"
+    local temporary secret
+    mkdir -p /etc/znode || return 1
+    if [[ -e "$secret_file" ]]; then
+        if [[ -L "$secret_file" || ! -f "$secret_file" ]]; then
+            echo -e "${red}Từ chối instance secret không phải regular file.${plain}"
+            return 1
+        fi
+        secret=$(tr -d '\r\n' < "$secret_file")
+        if [[ ! "$secret" =~ ^[a-f0-9]{64}$ ]]; then
+            echo -e "${red}Instance secret hiện tại không hợp lệ; không tự ghi đè khóa định danh VPS.${plain}"
+            return 1
+        fi
+        chown root:root "$secret_file" && chmod 600 "$secret_file"
+        return $?
+    fi
+    temporary=$(mktemp /etc/znode/.instance-secret.XXXXXX) || return 1
+    secret=$(openssl rand -hex 32 2>/dev/null) || {
+        rm -f "$temporary"
+        return 1
+    }
+    if [[ ! "$secret" =~ ^[a-f0-9]{64}$ ]] \
+        || ! printf '%s\n' "$secret" > "$temporary" \
+        || ! chown root:root "$temporary" \
+        || ! chmod 600 "$temporary" \
+        || ! mv -f "$temporary" "$secret_file"; then
+        rm -f "$temporary"
+        return 1
+    fi
+}
+
 # Bind every installed runtime to ZBoard. Existing ZNode configs are upgraded
 # in place, while an explicit incompatible type is never overwritten.
 ensure_zboard_config_type() {
@@ -315,6 +352,21 @@ parse_args() {
                 fi ;;
         esac
     done
+}
+
+validate_terminal_service_setting() {
+    local saved=""
+    if [[ "$DISABLE_EXECUTE_WAS_SET" != true && -f /etc/znode/terminal.env && ! -L /etc/znode/terminal.env ]]; then
+        saved=$(sed -n 's/^DISABLE_EXECUTE=\([01]\)$/\1/p' /etc/znode/terminal.env | head -n 1)
+        if [[ "$saved" == "0" || "$saved" == "1" ]]; then
+            DISABLE_EXECUTE="$saved"
+        fi
+    fi
+    DISABLE_EXECUTE="${DISABLE_EXECUTE:-0}"
+    if [[ "$DISABLE_EXECUTE" != "0" && "$DISABLE_EXECUTE" != "1" ]]; then
+        echo -e "${red}DISABLE_EXECUTE must be 0 or 1.${plain}"
+        exit 1
+    fi
 }
 
 load_agent_token() {
@@ -767,6 +819,63 @@ verify_runtime_checksum() {
         && [[ "$expected" == "$actual" ]]
 }
 
+runtime_supports_terminal() {
+    local directory="$1"
+    [[ -x "$directory/znode" ]] && "$directory/znode" terminal --help >/dev/null 2>&1
+}
+
+remove_terminal_service() {
+    if [[ x"${release}" == x"alpine" ]]; then
+        rc-update del znode-terminal default >/dev/null 2>&1 || true
+        service znode-terminal stop >/dev/null 2>&1 || true
+        rm -f /etc/init.d/znode-terminal
+    else
+        systemctl disable --now znode-terminal >/dev/null 2>&1 || true
+        rm -f /etc/systemd/system/znode-terminal.service
+        systemctl daemon-reload >/dev/null 2>&1 || true
+        systemctl reset-failed znode-terminal >/dev/null 2>&1 || true
+    fi
+}
+
+start_terminal_service() {
+    if [[ "$DISABLE_EXECUTE" == "1" ]]; then
+        return 0
+    fi
+    if [[ x"${release}" == x"alpine" ]]; then
+        service znode-terminal restart >/dev/null 2>&1 || return 1
+        sleep 1
+        service znode-terminal status >/dev/null 2>&1
+    else
+        systemctl restart znode-terminal >/dev/null 2>&1 || return 1
+        sleep 1
+        systemctl is-active --quiet znode-terminal
+    fi
+}
+
+restore_terminal_service_for_runtime() {
+    local directory="$1"
+    if ! runtime_supports_terminal "$directory"; then
+        remove_terminal_service
+        return 0
+    fi
+    if [[ "$DISABLE_EXECUTE" == "1" ]]; then
+        if [[ x"${release}" == x"alpine" ]]; then
+            rc-update del znode-terminal default >/dev/null 2>&1 || true
+            service znode-terminal stop >/dev/null 2>&1 || true
+        else
+            systemctl disable --now znode-terminal >/dev/null 2>&1 || true
+        fi
+        return 0
+    fi
+    if [[ x"${release}" == x"alpine" ]]; then
+        rc-update add znode-terminal default >/dev/null 2>&1 || return 1
+    else
+        systemctl daemon-reload >/dev/null 2>&1 || return 1
+        systemctl enable znode-terminal >/dev/null 2>&1 || return 1
+    fi
+    start_terminal_service
+}
+
 restore_previous_runtime() {
     local current_directory="/usr/local/znode"
     local previous_directory="/usr/local/znode.previous"
@@ -778,8 +887,10 @@ restore_previous_runtime() {
     [[ -d "$current_directory" ]] || return 1
 
     if [[ x"${release}" == x"alpine" ]]; then
+        service znode-terminal stop >/dev/null 2>&1 || true
         service znode stop >/dev/null 2>&1 || true
     else
+        systemctl stop znode-terminal >/dev/null 2>&1 || true
         systemctl stop znode >/dev/null 2>&1 || true
     fi
     mv "$current_directory" "$failed_directory" || return 1
@@ -798,6 +909,7 @@ restore_previous_runtime() {
     else
         systemctl start znode >/dev/null 2>&1 || true
     fi
+    restore_terminal_service_for_runtime "$current_directory" || return 1
     sleep 2
     check_status
 }
@@ -812,11 +924,14 @@ rollback_activated_runtime() {
     fi
 
     if [[ x"${release}" == x"alpine" ]]; then
+        service znode-terminal stop >/dev/null 2>&1 || true
         service znode stop >/dev/null 2>&1 || true
     else
+        systemctl stop znode-terminal >/dev/null 2>&1 || true
         systemctl stop znode >/dev/null 2>&1 || true
     fi
     rm -rf "$current_directory"
+    remove_terminal_service
     echo -e "${yellow}Đã gỡ runtime mới vì đây là lần cài đầu và không có bản trước để khôi phục.${plain}"
 }
 
@@ -1045,6 +1160,13 @@ install_znode() {
         exit 1
     fi
     mkdir /etc/znode/ -p
+    if ! ensure_instance_secret; then
+        echo -e "${red}Không thể tạo khóa định danh riêng cho VPS; hủy cài đặt terminal.${plain}"
+        rm -rf "$staging_directory"
+        exit 1
+    fi
+    printf 'DISABLE_EXECUTE=%s\n' "$DISABLE_EXECUTE" > /etc/znode/terminal.env
+    chmod 600 /etc/znode/terminal.env
 
     # Only replace the live tree after the archive, checksum, paths, binary and
     # geodata have all passed validation. The former tree becomes the sole
@@ -1094,6 +1216,31 @@ depend() {
 EOF
         chmod +x /etc/init.d/znode
         rc-update add znode default
+        cat <<EOF > /etc/init.d/znode-terminal
+#!/sbin/openrc-run
+
+name="znode-terminal"
+description="znode outbound terminal relay"
+command="/usr/local/znode/znode"
+command_args="terminal"
+command_user="root"
+pidfile="/run/znode-terminal.pid"
+command_background="yes"
+start_pre() {
+    if [ -f /etc/znode/terminal.env ]; then
+        . /etc/znode/terminal.env
+        export DISABLE_EXECUTE
+    fi
+}
+depend() { need net; }
+EOF
+        chmod +x /etc/init.d/znode-terminal
+        if [[ "$DISABLE_EXECUTE" == "1" ]]; then
+            rc-update del znode-terminal default >/dev/null 2>&1 || true
+            service znode-terminal stop >/dev/null 2>&1 || true
+        else
+            rc-update add znode-terminal default
+        fi
         echo -e "${green}Đã cài znode ${last_version}${plain} và bật tự khởi động cùng hệ thống."
     else
         rm /etc/systemd/system/znode.service -f
@@ -1114,7 +1261,28 @@ MemoryHigh=80%
 MemoryMax=90%
 WorkingDirectory=/usr/local/znode/
 ExecStart=/usr/local/znode/znode server
+TimeoutStopSec=45s
 Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
+EOF
+        cat <<EOF > /etc/systemd/system/znode-terminal.service
+[Unit]
+Description=znode outbound terminal relay
+After=network.target nss-lookup.target
+Wants=network.target
+
+[Service]
+User=root
+Group=root
+Type=simple
+WorkingDirectory=/usr/local/znode/
+EnvironmentFile=-/etc/znode/terminal.env
+ExecStart=/usr/local/znode/znode terminal
+TimeoutStopSec=45s
+Restart=on-failure
 RestartSec=10
 
 [Install]
@@ -1122,6 +1290,11 @@ WantedBy=multi-user.target
 EOF
         systemctl daemon-reload
         systemctl enable znode
+        if [[ "$DISABLE_EXECUTE" == "1" ]]; then
+            systemctl disable --now znode-terminal >/dev/null 2>&1 || true
+        else
+            systemctl enable znode-terminal
+        fi
         # Keep the old runtime serving while the new tree, service unit and
         # configuration are staged. Activation below performs one short
         # restart instead of leaving every inbound offline during the update.
@@ -1171,6 +1344,17 @@ EOF
         fi
     fi
 
+    # enable --now does not replace an already-running process after an
+    # in-place runtime swap. Restart the relay here so it always executes the
+    # current binary, including the first-config path above.
+    if ! start_terminal_service; then
+        echo -e "${red}Dịch vụ terminal riêng không khởi động được; đang rollback runtime.${plain}"
+        if ! rollback_activated_runtime "$had_previous"; then
+            echo -e "${red}Không thể rollback sau lỗi terminal; hãy kiểm tra dịch vụ thủ công.${plain}"
+        fi
+        exit 1
+    fi
+
 
     if ! install_manager_script; then
         echo -e "${red}Cài manager script thất bại; đang rollback runtime mới.${plain}"
@@ -1208,6 +1392,7 @@ EOF
 }
 
 parse_args "$@"
+validate_terminal_service_setting
 load_agent_token
 validate_release_source
 acquire_znode_operation_lock || exit 1

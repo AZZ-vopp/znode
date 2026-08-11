@@ -392,17 +392,128 @@ swap_runtime_trees() {
 
 start_znode_service() {
     if [[ x"${release}" == x"alpine" ]]; then
-        service znode start >/dev/null 2>&1
+        service znode start >/dev/null 2>&1 || return 1
     else
-        systemctl start znode >/dev/null 2>&1
+        systemctl start znode >/dev/null 2>&1 || return 1
     fi
+    start_terminal_service
 }
 
 stop_znode_service() {
     if [[ x"${release}" == x"alpine" ]]; then
+        service znode-terminal stop >/dev/null 2>&1 || true
         service znode stop >/dev/null 2>&1 || true
     else
+        systemctl stop znode-terminal >/dev/null 2>&1 || true
         systemctl stop znode >/dev/null 2>&1 || true
+    fi
+}
+
+terminal_execution_disabled() {
+    local value="${DISABLE_EXECUTE:-}"
+    if [[ "$value" != "0" && "$value" != "1" && -f /etc/znode/terminal.env && ! -L /etc/znode/terminal.env ]]; then
+        value=$(sed -n 's/^DISABLE_EXECUTE=\([01]\)$/\1/p' /etc/znode/terminal.env | head -n 1)
+    fi
+    [[ "$value" == "1" ]]
+}
+
+runtime_supports_terminal() {
+    [[ -x /usr/local/znode/znode ]] && /usr/local/znode/znode terminal --help >/dev/null 2>&1
+}
+
+remove_terminal_service() {
+    if [[ x"${release}" == x"alpine" ]]; then
+        service znode-terminal stop >/dev/null 2>&1 || true
+        rc-update del znode-terminal default >/dev/null 2>&1 || true
+        rm -f /etc/init.d/znode-terminal
+    else
+        systemctl disable --now znode-terminal >/dev/null 2>&1 || true
+        rm -f /etc/systemd/system/znode-terminal.service
+        systemctl daemon-reload >/dev/null 2>&1 || true
+        systemctl reset-failed znode-terminal >/dev/null 2>&1 || true
+    fi
+}
+
+install_terminal_service_unit() {
+    if [[ x"${release}" == x"alpine" ]]; then
+        cat <<'EOF' > /etc/init.d/znode-terminal
+#!/sbin/openrc-run
+name="znode-terminal"
+description="znode outbound terminal relay"
+command="/usr/local/znode/znode"
+command_args="terminal"
+command_user="root"
+pidfile="/run/znode-terminal.pid"
+command_background="yes"
+start_pre() {
+    if [ -f /etc/znode/terminal.env ]; then
+        . /etc/znode/terminal.env
+        export DISABLE_EXECUTE
+    fi
+}
+depend() { need net; }
+EOF
+        chmod 0755 /etc/init.d/znode-terminal
+        return $?
+    fi
+    cat <<'EOF' > /etc/systemd/system/znode-terminal.service
+[Unit]
+Description=znode outbound terminal relay
+After=network.target nss-lookup.target
+Wants=network.target
+
+[Service]
+User=root
+Group=root
+Type=simple
+WorkingDirectory=/usr/local/znode/
+EnvironmentFile=-/etc/znode/terminal.env
+ExecStart=/usr/local/znode/znode terminal
+TimeoutStopSec=45s
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
+EOF
+    systemctl daemon-reload >/dev/null 2>&1
+}
+
+enable_terminal_service() {
+    if terminal_execution_disabled || ! runtime_supports_terminal; then
+        return 0
+    fi
+    install_terminal_service_unit || return 1
+    if [[ x"${release}" == x"alpine" ]]; then
+        rc-update add znode-terminal default >/dev/null 2>&1
+    else
+        systemctl enable znode-terminal >/dev/null 2>&1
+    fi
+}
+
+start_terminal_service() {
+    if terminal_execution_disabled; then
+        if [[ x"${release}" == x"alpine" ]]; then
+            service znode-terminal stop >/dev/null 2>&1 || true
+            rc-update del znode-terminal default >/dev/null 2>&1 || true
+        else
+            systemctl disable --now znode-terminal >/dev/null 2>&1 || true
+        fi
+        return 0
+    fi
+    if ! runtime_supports_terminal; then
+        remove_terminal_service
+        return 0
+    fi
+    enable_terminal_service || return 1
+    if [[ x"${release}" == x"alpine" ]]; then
+        service znode-terminal restart >/dev/null 2>&1 || return 1
+        sleep 1
+        service znode-terminal status >/dev/null 2>&1
+    else
+        systemctl restart znode-terminal >/dev/null 2>&1 || return 1
+        sleep 1
+        systemctl is-active --quiet znode-terminal
     fi
 }
 
@@ -415,7 +526,7 @@ restore_runtime_after_failed_rollback() {
         echo -e "${red}Runtime ban đầu đã trở lại nhưng GeoIP/GeoSite không thể khôi phục; giữ dịch vụ dừng.${plain}"
         return 1
     fi
-    start_znode_service || true
+    start_znode_service || return 1
     sleep 2
     check_status
 }
@@ -427,7 +538,7 @@ rollback() (
         echo -e "${red}Chưa có bản trước để quay lại. Hãy cập nhật thành công ít nhất một lần trước.${plain}"
         return 1
     fi
-    local previous_version expected_checksum actual_checksum
+    local previous_version expected_checksum actual_checksum service_status=0
     if [[ ! -r /usr/local/znode.previous/.znode.sha256 ]]; then
         echo -e "${red}Bản dự phòng không có checksum tin cậy; từ chối thực thi.${plain}"
         return 1
@@ -460,9 +571,9 @@ rollback() (
         restore_runtime_after_failed_rollback || true
         return 1
     fi
-    start_znode_service || true
+    start_znode_service || service_status=$?
     sleep 2
-    if check_status; then
+    if [[ $service_status == 0 ]] && check_status; then
         echo -e "${green}Đã quay lại bản trước. Dùng znode version và znode log để kiểm tra.${plain}"
         return 0
     fi
@@ -510,12 +621,12 @@ uninstall() {
     fi
     acquire_znode_operation_lock || return 1
     trap release_znode_operation_lock EXIT
+    stop_znode_service
+    remove_terminal_service
     if [[ x"${release}" == x"alpine" ]]; then
-        service znode stop
         rc-update del znode
         rm /etc/init.d/znode -f
     else
-        systemctl stop znode
         systemctl disable znode
         rm /etc/systemd/system/znode.service -f
         systemctl daemon-reload
@@ -538,17 +649,17 @@ uninstall() {
 start() {
     check_status
     if [[ $? == 0 ]]; then
-        echo ""
-        echo -e "${green}znode đang chạy, không cần khởi động lại. Hãy chọn Khởi động lại nếu cần.${plain}"
-    else
-        if [[ x"${release}" == x"alpine" ]]; then
-            service znode start
+        if start_terminal_service; then
+            echo ""
+            echo -e "${green}znode và dịch vụ terminal riêng đang ở trạng thái mong muốn.${plain}"
         else
-            systemctl start znode
+            echo -e "${red}znode đang chạy nhưng dịch vụ terminal riêng không khởi động được.${plain}"
         fi
+    else
+        start_znode_service
+        local start_status=$?
         sleep 2
-        check_status
-        if [[ $? == 0 ]]; then
+        if [[ $start_status == 0 ]] && check_status; then
             echo -e "${green}Khởi động znode thành công. Dùng znode log để xem nhật ký.${plain}"
         else
             echo -e "${red}Có thể znode khởi động thất bại. Vui lòng dùng znode log để kiểm tra nhật ký.${plain}"
@@ -561,11 +672,7 @@ start() {
 }
 
 stop() {
-    if [[ x"${release}" == x"alpine" ]]; then
-        service znode stop
-    else
-        systemctl stop znode
-    fi
+    stop_znode_service
     sleep 2
     check_status
     if [[ $? == 1 ]]; then
@@ -580,14 +687,11 @@ stop() {
 }
 
 restart() {
-    if [[ x"${release}" == x"alpine" ]]; then
-        service znode restart
-    else
-        systemctl restart znode
-    fi
+    stop_znode_service
+    start_znode_service
+    local restart_status=$?
     sleep 2
-    check_status
-    if [[ $? == 0 ]]; then
+    if [[ $restart_status == 0 ]] && check_status; then
         echo -e "${green}Khởi động lại znode thành công. Dùng znode log để xem nhật ký.${plain}"
     else
         echo -e "${red}Có thể znode khởi động thất bại. Vui lòng dùng znode log để kiểm tra nhật ký.${plain}"
@@ -609,12 +713,14 @@ status() {
 }
 
 enable() {
+    local status=0
     if [[ x"${release}" == x"alpine" ]]; then
-        rc-update add znode
+        rc-update add znode || status=$?
     else
-        systemctl enable znode
+        systemctl enable znode || status=$?
     fi
-    if [[ $? == 0 ]]; then
+    enable_terminal_service || status=$?
+    if [[ $status == 0 ]]; then
         echo -e "${green}Đã bật tự khởi động znode cùng hệ thống${plain}"
     else
         echo -e "${red}Không thể bật tự khởi động znode cùng hệ thống${plain}"
@@ -626,12 +732,15 @@ enable() {
 }
 
 disable() {
+    local status=0
     if [[ x"${release}" == x"alpine" ]]; then
-        rc-update del znode
+        rc-update del znode || status=$?
+        rc-update del znode-terminal default >/dev/null 2>&1 || true
     else
-        systemctl disable znode
+        systemctl disable znode || status=$?
+        systemctl disable znode-terminal >/dev/null 2>&1 || true
     fi
-    if [[ $? == 0 ]]; then
+    if [[ $status == 0 ]]; then
         echo -e "${green}Đã tắt tự khởi động znode cùng hệ thống${plain}"
     else
         echo -e "${red}Không thể tắt tự khởi động znode cùng hệ thống${plain}"
