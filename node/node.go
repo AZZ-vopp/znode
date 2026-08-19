@@ -77,7 +77,7 @@ func NewContext(ctx context.Context, nodes []conf.NodeConfig) (*Node, error) {
 		n.NodeInfos[i] = info
 		return nil
 	})
-	for i, err := range errs {
+	for _, err := range errs {
 		if err != nil {
 			return nil, err
 		}
