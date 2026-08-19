@@ -60,13 +60,13 @@ func NewContext(ctx context.Context, nodes []conf.NodeConfig) (*Node, error) {
 		controllers: make([]*Controller, len(nodes)),
 		NodeInfos:   make([]*panel.NodeInfo, len(nodes)),
 	}
-	errs := parallelNodeWork(ctx, len(nodes), func(i int) error {
+	errs := parallelNodeWork(ctx, len(nodes), func(workCtx context.Context, i int) error {
 		node := nodes[i]
 		p, err := panel.New(&node)
 		if err != nil {
 			return err
 		}
-		info, err := p.GetNodeInfo(ctx)
+		info, err := p.GetNodeInfo(workCtx)
 		if err != nil {
 			return fmt.Errorf("get node info for node %d: %w", node.NodeID, err)
 		}
@@ -233,8 +233,8 @@ func ValidateUniqueServerPorts(infos []*panel.NodeInfo) error {
 }
 
 func (n *Node) Prepare(ctx context.Context, nodes []conf.NodeConfig) error {
-	errs := parallelNodeWork(ctx, len(nodes), func(i int) error {
-		return n.controllers[i].Prepare(ctx)
+	errs := parallelNodeWork(ctx, len(nodes), func(workCtx context.Context, i int) error {
+		return n.controllers[i].Prepare(workCtx)
 	})
 	for i, err := range errs {
 		if err != nil {
@@ -248,7 +248,7 @@ func (n *Node) Prepare(ctx context.Context, nodes []conf.NodeConfig) error {
 // parallelNodeWork runs independent per-node preparation with a small bounded
 // worker pool. Errors are retained by index so callers can report the same
 // first failing node they would have reported in the old sequential loop.
-func parallelNodeWork(ctx context.Context, count int, work func(int) error) []error {
+func parallelNodeWork(ctx context.Context, count int, work func(context.Context, int) error) []error {
 	errs := make([]error, count)
 	if count == 0 {
 		return errs
@@ -257,7 +257,12 @@ func parallelNodeWork(ctx context.Context, count int, work func(int) error) []er
 	if workers > maxConcurrentNodePreparation {
 		workers = maxConcurrentNodePreparation
 	}
+	workCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
 	jobs := make(chan int)
+	var firstFailureMu sync.Mutex
+	firstFailure := -1
+	completed := make([]bool, count)
 	var wg sync.WaitGroup
 	wg.Add(workers)
 	for worker := 0; worker < workers; worker++ {
@@ -265,24 +270,47 @@ func parallelNodeWork(ctx context.Context, count int, work func(int) error) []er
 			defer wg.Done()
 			for {
 				select {
-				case <-ctx.Done():
+				case <-workCtx.Done():
 					return
 				case i, ok := <-jobs:
 					if !ok {
 						return
 					}
-					errs[i] = work(i)
+					if workCtx.Err() != nil {
+						return
+					}
+					err := work(workCtx, i)
+					firstFailureMu.Lock()
+					completed[i] = true
+					if err == nil {
+						firstFailureMu.Unlock()
+						continue
+					}
+					if firstFailure < 0 {
+						firstFailure = i
+						errs[i] = err
+						cancel()
+					} else if ctx.Err() != nil || !errors.Is(err, context.Canceled) {
+						// A parent cancellation is a real result. Preserve other
+						// errors too; only cancellation caused by another worker is
+						// omitted so it cannot hide the original failure.
+						errs[i] = err
+					}
+					firstFailureMu.Unlock()
 				}
 			}
 		}()
 	}
+queueLoop:
 	for i := 0; i < count; i++ {
 		select {
-		case <-ctx.Done():
-			break
+		case <-workCtx.Done():
+			// Stop queuing work after either the parent is canceled or a
+			// worker has failed and canceled the derived context.
+			break queueLoop
 		case jobs <- i:
 		}
-		if ctx.Err() != nil {
+		if workCtx.Err() != nil {
 			break
 		}
 	}
@@ -290,7 +318,7 @@ func parallelNodeWork(ctx context.Context, count int, work func(int) error) []er
 	wg.Wait()
 	if err := ctx.Err(); err != nil {
 		for i := range errs {
-			if errs[i] == nil {
+			if !completed[i] && errs[i] == nil {
 				errs[i] = err
 			}
 		}
