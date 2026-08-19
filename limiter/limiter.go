@@ -73,6 +73,9 @@ func AddLimiter(nodetype string, tag string, users []panel.UserInfo, alive map[i
 			}
 		} else {
 			l.remote = remote
+			if !l.failClosed {
+				l.devices.startRemoteRefresh(2)
+			}
 		}
 	}
 	for i := range users {
@@ -109,6 +112,7 @@ func DeleteLimiter(tag string) {
 }
 
 func (l *Limiter) Close() {
+	l.devices.Close()
 	if l.remote != nil {
 		_ = l.remote.Close()
 	}
@@ -234,7 +238,8 @@ func (l *Limiter) CheckLimit(ctx context.Context, taguuid string, ip string) (*r
 
 // TouchDevice refreshes the bounded local entry and, when due, the Redis TTL.
 // It is safe to call from the data path because same-IP touches are allocation
-// free and Redis is only contacted at RefreshInterval cadence.
+// free. Fail-open Redis refreshes are queued in bounded background workers;
+// FailClosed keeps its synchronous enforcement semantics.
 func (l *Limiter) TouchDevice(taguuid, ip string) {
 	value, ok := l.UserLimitInfo.Load(taguuid)
 	if !ok {
@@ -286,6 +291,13 @@ func NormalizeIP(raw string) string {
 	return normalizeIP(raw)
 }
 
+// deviceGracePtr returns a fresh pointer. applyDeviceDefaults is handed a
+// shallow copy of the caller's config, so a default must replace the pointer
+// rather than write through it, or it would mutate the original.
+func deviceGracePtr(v int) *int {
+	return &v
+}
+
 func applyDeviceDefaults(c *conf.GlobalDeviceLimitConfig) {
 	if c.RedisNetwork == "" {
 		c.RedisNetwork = "tcp"
@@ -310,6 +322,32 @@ func applyDeviceDefaults(c *conf.GlobalDeviceLimitConfig) {
 	}
 	if c.RefreshInterval < 5 {
 		c.RefreshInterval = 5
+	}
+	// Kept byte-for-byte in step with conf.GlobalDeviceLimitConfig.applyDefaults:
+	// a file-loaded config and an agent hot-swapped one must admit identically.
+	if c.HandoverGrace == nil {
+		c.HandoverGrace = deviceGracePtr(15)
+	}
+	if *c.HandoverGrace < 0 {
+		c.HandoverGrace = deviceGracePtr(0)
+	}
+	if *c.HandoverGrace > c.Expiry {
+		c.HandoverGrace = deviceGracePtr(c.Expiry)
+	}
+	// An address that is still transmitting only refreshes its score once per
+	// RefreshInterval, so it must get at least two chances to do so inside the
+	// grace window. Otherwise a second client that is genuinely active looks
+	// silent and gets evicted, which is the sharing case we must still refuse.
+	if grace := *c.HandoverGrace; grace > 0 {
+		if c.RefreshInterval > grace/2 {
+			c.RefreshInterval = grace / 2
+			if c.RefreshInterval < 5 {
+				c.RefreshInterval = 5
+			}
+		}
+		if c.RefreshInterval*2 > grace {
+			c.HandoverGrace = deviceGracePtr(c.RefreshInterval * 2)
+		}
 	}
 	if c.MaxIPsPerUser <= 0 {
 		c.MaxIPsPerUser = 256

@@ -33,17 +33,25 @@ func TestLoadDefaultsAndRedisConfig(t *testing.T) {
 		t.Fatalf("unexpected connection defaults: %+v", c.ConnectionConfig)
 	}
 	device := c.NodeConfigs[0].GlobalDeviceLimitConfig
-	if device == nil || device.RedisNetwork != "tcp" || device.Timeout != 1 || device.RefreshInterval != 30 || device.MaxIPsPerUser != 256 || device.SyncEnabled == nil || !*device.SyncEnabled {
+	if device == nil || device.RedisNetwork != "tcp" || device.Timeout != 1 || device.RefreshInterval != 7 || device.MaxIPsPerUser != 256 || device.SyncEnabled == nil || !*device.SyncEnabled {
 		t.Fatalf("unexpected Redis defaults: %+v", device)
 	}
 	disabled := false
 	custom := &GlobalDeviceLimitConfig{SyncEnabled: &disabled}
 	custom.applyDefaults()
-	if custom.Expiry != 60 || custom.RefreshInterval != 20 || custom.Timeout != 1 {
+	if custom.Expiry != 60 || custom.RefreshInterval != 7 || custom.Timeout != 1 {
 		t.Fatalf("unexpected balanced Redis defaults: %+v", custom)
 	}
 	if custom.SyncEnabled == nil || *custom.SyncEnabled {
 		t.Fatalf("explicit SyncEnabled=false was not preserved")
+	}
+	if custom.UserSourceMode != "web_primary" {
+		t.Fatalf("unexpected user source default: %q", custom.UserSourceMode)
+	}
+	custom.UserSourceMode = "REDIS_PRIMARY"
+	custom.applyDefaults()
+	if custom.UserSourceMode != "redis_primary" {
+		t.Fatalf("redis primary source was not normalized: %q", custom.UserSourceMode)
 	}
 }
 
@@ -76,7 +84,7 @@ func TestLoadAgentConfigAndKeepManualModeCompatible(t *testing.T) {
 		t.Fatalf("unexpected agent config: %+v", c.AgentConfig)
 	}
 	agentDevice := c.AgentConfig.GlobalDeviceLimitConfig
-	if agentDevice == nil || agentDevice.RedisNetwork != "tcp" || agentDevice.RefreshInterval != 30 || agentDevice.SyncEnabled == nil || !*agentDevice.SyncEnabled {
+	if agentDevice == nil || agentDevice.RedisNetwork != "tcp" || agentDevice.RefreshInterval != 7 || agentDevice.SyncEnabled == nil || !*agentDevice.SyncEnabled {
 		t.Fatalf("unexpected agent Redis defaults: %+v", agentDevice)
 	}
 

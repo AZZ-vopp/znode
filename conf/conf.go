@@ -88,6 +88,14 @@ type GlobalDeviceLimitConfig struct {
 	Timeout               int      `mapstructure:"Timeout"`
 	Expiry                int      `mapstructure:"Expiry"`
 	RefreshInterval       int      `mapstructure:"RefreshInterval"`
+	// HandoverGrace lets a genuinely new address take the slot of one that has
+	// gone silent for at least this many seconds, instead of being refused
+	// until Expiry. A phone leaving WiFi for mobile data is the ordinary case.
+	// Pointer so an omitted key still gets a working default while an explicit
+	// 0 disables handover. Must stay at or above 2*RefreshInterval: an address
+	// that is still transmitting only refreshes its score at that cadence, so
+	// a shorter grace would evict a second client that is genuinely active.
+	HandoverGrace         *int     `mapstructure:"HandoverGrace"`
 	MaxIPsPerUser         int      `mapstructure:"MaxIPsPerUser"`
 	KeyPrefix             string   `mapstructure:"KeyPrefix"`
 	FailClosed            bool     `mapstructure:"FailClosed"`
@@ -100,6 +108,9 @@ type GlobalDeviceLimitConfig struct {
 	UserFallbackEnabled bool   `mapstructure:"UserFallbackEnabled"`
 	UserSnapshotPrefix  string `mapstructure:"UserSnapshotPrefix"`
 	UserSnapshotMaxAge  int    `mapstructure:"UserSnapshotMaxAge"`
+	// UserSourceMode controls only signed UUID snapshot precedence. It never
+	// changes Redis device limiter Enable/FailClosed behavior.
+	UserSourceMode string `mapstructure:"UserSourceMode"`
 }
 
 func New() *Conf {
@@ -273,6 +284,15 @@ func (c *ConnectionConfig) applyDefaults() {
 }
 
 func (c *GlobalDeviceLimitConfig) applyDefaults() {
+	c.UserSourceMode = strings.ToLower(strings.TrimSpace(c.UserSourceMode))
+	if c.UserSourceMode == "" {
+		c.UserSourceMode = "web_primary"
+	}
+	if c.UserSourceMode != "web_primary" && c.UserSourceMode != "redis_primary" {
+		// Invalid remote configuration must fail safe to the live panel rather
+		// than unexpectedly trusting a stale snapshot.
+		c.UserSourceMode = "web_primary"
+	}
 	if c.RedisNetwork == "" {
 		c.RedisNetwork = "tcp"
 	}
@@ -313,6 +333,30 @@ func (c *GlobalDeviceLimitConfig) applyDefaults() {
 	}
 	if c.RefreshInterval < 5 {
 		c.RefreshInterval = 5
+	}
+	if c.HandoverGrace == nil {
+		c.HandoverGrace = intPtr(15)
+	}
+	if *c.HandoverGrace < 0 {
+		c.HandoverGrace = intPtr(0)
+	}
+	if *c.HandoverGrace > c.Expiry {
+		c.HandoverGrace = intPtr(c.Expiry)
+	}
+	// An address that is still transmitting only refreshes its score once per
+	// RefreshInterval, so it must get at least two chances to do so inside the
+	// grace window. Otherwise a second client that is genuinely active looks
+	// silent and gets evicted, which is the sharing case we must still refuse.
+	if grace := *c.HandoverGrace; grace > 0 {
+		if c.RefreshInterval > grace/2 {
+			c.RefreshInterval = grace / 2
+			if c.RefreshInterval < 5 {
+				c.RefreshInterval = 5
+			}
+		}
+		if c.RefreshInterval*2 > grace {
+			c.HandoverGrace = intPtr(c.RefreshInterval * 2)
+		}
 	}
 	if c.MaxIPsPerUser <= 0 {
 		c.MaxIPsPerUser = 256
