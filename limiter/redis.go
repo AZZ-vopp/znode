@@ -23,21 +23,43 @@ local key = KEYS[1]
 local member = ARGV[1]
 local limit = tonumber(ARGV[2])
 local now = tonumber(ARGV[3])
-local cutoff = now - (tonumber(ARGV[4]) * 1000)
+local expiry = tonumber(ARGV[4])
+local grace = tonumber(ARGV[5])
+local cutoff = now - (expiry * 1000)
 redis.call('ZREMRANGEBYSCORE', key, '-inf', cutoff)
-local existing = redis.call('ZSCORE', key, member)
-if existing then
+if redis.call('ZSCORE', key, member) then
   redis.call('ZADD', key, now, member)
-  redis.call('EXPIRE', key, tonumber(ARGV[4]))
-  return {1, redis.call('ZCARD', key)}
+  redis.call('EXPIRE', key, expiry)
+  return {1, redis.call('ZCARD', key), 0}
 end
 local count = redis.call('ZCARD', key)
+local handover = 0
 if limit > 0 and count >= limit then
-  return {0, count}
+  if grace <= 0 then
+    return {0, count, 0}
+  end
+  -- Free exactly as many slots as this admission needs, least recently seen
+  -- first. ZRANGE is ascending by score, so these are the oldest touches and
+  -- no others are considered. An address still inside the grace window is
+  -- transmitting, so a set that is only partly idle refuses the newcomer.
+  local needed = count - limit + 1
+  local silent = now - (grace * 1000)
+  local candidates = redis.call('ZRANGE', key, 0, needed - 1, 'WITHSCORES')
+  local evict = {}
+  for i = 1, #candidates, 2 do
+    if tonumber(candidates[i + 1]) <= silent then
+      evict[#evict + 1] = candidates[i]
+    end
+  end
+  if #evict < needed then
+    return {0, count, 0}
+  end
+  redis.call('ZREM', key, unpack(evict))
+  handover = #evict
 end
 redis.call('ZADD', key, now, member)
-redis.call('EXPIRE', key, tonumber(ARGV[4]))
-return {1, count + 1}
+redis.call('EXPIRE', key, expiry)
+return {1, redis.call('ZCARD', key), handover}
 `
 
 type redisDeviceStore struct {
@@ -48,6 +70,7 @@ type redisDeviceStore struct {
 	namespace string
 	timeout   time.Duration
 	expiry    time.Duration
+	grace     time.Duration
 	closeOnce sync.Once
 }
 
@@ -178,6 +201,8 @@ func newRedisDeviceStore(c *conf.GlobalDeviceLimitConfig, namespace string) (*re
 		namespace: strings.TrimRight(namespace, "/"),
 		timeout:   time.Duration(c.Timeout) * time.Second,
 		expiry:    time.Duration(c.Expiry) * time.Second,
+		// applyDeviceDefaults ran above, so the pointer is set.
+		grace:     time.Duration(*c.HandoverGrace) * time.Second,
 	}, nil
 }
 
@@ -194,7 +219,7 @@ func (r *redisDeviceStore) Allow(ctx context.Context, userKey, ip string, limit 
 	requestCtx, cancel := context.WithTimeout(ctx, r.timeout)
 	defer cancel()
 	now := time.Now().UnixMilli()
-	result, err := r.script.Run(requestCtx, r.client, []string{r.key(userKey)}, ip, strconv.Itoa(limit), strconv.FormatInt(now, 10), strconv.FormatInt(int64(r.expiry/time.Second), 10)).Int64Slice()
+	result, err := r.script.Run(requestCtx, r.client, []string{r.key(userKey)}, ip, strconv.Itoa(limit), strconv.FormatInt(now, 10), strconv.FormatInt(int64(r.expiry/time.Second), 10), strconv.FormatInt(int64(r.grace/time.Second), 10)).Int64Slice()
 	if err != nil {
 		return false, err
 	}
