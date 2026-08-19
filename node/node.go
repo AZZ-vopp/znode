@@ -14,6 +14,11 @@ import (
 	log "github.com/sirupsen/logrus"
 )
 
+// maxConcurrentNodePreparation limits panel requests made while a runtime is
+// being prepared. Preparation is independent per node, but an unbounded fan
+// out can overload a panel (and a VPS with many assigned nodes).
+const maxConcurrentNodePreparation = 4
+
 type Node struct {
 	controllers []*Controller
 	NodeInfos   []*panel.NodeInfo
@@ -55,20 +60,27 @@ func NewContext(ctx context.Context, nodes []conf.NodeConfig) (*Node, error) {
 		controllers: make([]*Controller, len(nodes)),
 		NodeInfos:   make([]*panel.NodeInfo, len(nodes)),
 	}
-	for i, node := range nodes {
+	errs := parallelNodeWork(ctx, len(nodes), func(i int) error {
+		node := nodes[i]
 		p, err := panel.New(&node)
 		if err != nil {
-			return nil, err
+			return err
 		}
 		info, err := p.GetNodeInfo(ctx)
 		if err != nil {
-			return nil, fmt.Errorf("get node info for node %d: %w", node.NodeID, err)
+			return fmt.Errorf("get node info for node %d: %w", node.NodeID, err)
 		}
 		if info == nil || info.Common == nil {
-			return nil, fmt.Errorf("get node info for node %d: panel returned an empty node configuration", node.NodeID)
+			return fmt.Errorf("get node info for node %d: panel returned an empty node configuration", node.NodeID)
 		}
-		n.controllers[i] = NewController(p, &node, info)
+		n.controllers[i] = NewController(p, &nodes[i], info)
 		n.NodeInfos[i] = info
+		return nil
+	})
+	for i, err := range errs {
+		if err != nil {
+			return nil, err
+		}
 	}
 	if err := ValidateUniqueServerPorts(n.NodeInfos); err != nil {
 		return nil, err
@@ -221,12 +233,69 @@ func ValidateUniqueServerPorts(infos []*panel.NodeInfo) error {
 }
 
 func (n *Node) Prepare(ctx context.Context, nodes []conf.NodeConfig) error {
-	for i, nodeConfig := range nodes {
-		if err := n.controllers[i].Prepare(ctx); err != nil {
+	errs := parallelNodeWork(ctx, len(nodes), func(i int) error {
+		return n.controllers[i].Prepare(ctx)
+	})
+	for i, err := range errs {
+		if err != nil {
+			nodeConfig := nodes[i]
 			return fmt.Errorf("prepare node controller [%s-%d] error: %w", nodeConfig.APIHost, nodeConfig.NodeID, err)
 		}
 	}
 	return nil
+}
+
+// parallelNodeWork runs independent per-node preparation with a small bounded
+// worker pool. Errors are retained by index so callers can report the same
+// first failing node they would have reported in the old sequential loop.
+func parallelNodeWork(ctx context.Context, count int, work func(int) error) []error {
+	errs := make([]error, count)
+	if count == 0 {
+		return errs
+	}
+	workers := count
+	if workers > maxConcurrentNodePreparation {
+		workers = maxConcurrentNodePreparation
+	}
+	jobs := make(chan int)
+	var wg sync.WaitGroup
+	wg.Add(workers)
+	for worker := 0; worker < workers; worker++ {
+		go func() {
+			defer wg.Done()
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case i, ok := <-jobs:
+					if !ok {
+						return
+					}
+					errs[i] = work(i)
+				}
+			}
+		}()
+	}
+	for i := 0; i < count; i++ {
+		select {
+		case <-ctx.Done():
+			break
+		case jobs <- i:
+		}
+		if ctx.Err() != nil {
+			break
+		}
+	}
+	close(jobs)
+	wg.Wait()
+	if err := ctx.Err(); err != nil {
+		for i := range errs {
+			if errs[i] == nil {
+				errs[i] = err
+			}
+		}
+	}
+	return errs
 }
 
 func (n *Node) Start(nodes []conf.NodeConfig, core *core.V2Core) error {
@@ -284,6 +353,68 @@ func (n *Node) Close() error {
 		return fmt.Errorf("close node controllers: %w; restore previous controllers: %v", closeErr, restoreErr)
 	}
 	return fmt.Errorf("close node controllers: %w; previous controllers restored", closeErr)
+}
+
+// Shutdown is the non-transactional terminal counterpart to Close. It does
+// not restart controllers after a failed drain, because process termination
+// must remain fail-closed for new connections.
+func (n *Node) Shutdown(ctx context.Context) error {
+	var shutdownErr error
+	for _, controller := range n.controllers {
+		if controller == nil {
+			continue
+		}
+		if err := controller.Shutdown(ctx); err != nil {
+			shutdownErr = errors.Join(shutdownErr, err)
+		}
+	}
+	return shutdownErr
+}
+
+// TerminalShutdownFinished reports whether every controller that may touch
+// the current core completed its terminal transition. A caller must not tear
+// down that core while a pre-existing lifecycle operation still owns it.
+func (n *Node) TerminalShutdownFinished() bool {
+	if n == nil {
+		return true
+	}
+	for _, controller := range n.controllers {
+		if !controller.terminalShutdownFinished() {
+			return false
+		}
+	}
+	return true
+}
+
+// BeginTerminalCoreOperations closes admission for every controller before
+// terminal accounting starts. This must happen as one runtime-wide phase: a
+// slow drain for one node must not leave another node able to enter the core.
+func (n *Node) BeginTerminalCoreOperations() {
+	if n == nil {
+		return
+	}
+	for _, controller := range n.controllers {
+		if controller != nil {
+			controller.beginTerminalCoreOperations()
+		}
+	}
+}
+
+// CloseCoreOperations waits only for callbacks that were admitted before the
+// runtime-wide terminal admission phase. It intentionally does not reopen or
+// newly close admission here, because the caller's deadline may already have
+// elapsed after a preceding controller drain.
+func (n *Node) CloseCoreOperations(ctx context.Context) error {
+	if n == nil {
+		return nil
+	}
+	var waitErr error
+	for _, controller := range n.controllers {
+		if controller != nil {
+			waitErr = errors.Join(waitErr, controller.waitForCoreOperations(ctx))
+		}
+	}
+	return waitErr
 }
 
 func closeControllersConcurrently(controllers []*Controller, closeController func(*Controller) error) []controllerCloseResult {
