@@ -277,9 +277,12 @@ install_geodata_line=$(grep -nF 'if ! install_geodata "$current_directory"' "$in
 [[ "$validate_line" -lt "$activate_line" ]] || fail 'geodata must be validated before runtime activation'
 [[ "$install_geodata_line" -gt "$activate_line" ]] || fail 'geodata must not mutate /etc before runtime activation'
 
-migration_line=$(grep -nF '        migrate_tiktok_compat_profile' "$installer" | tail -n 1 | cut -d: -f1)
+migration_line=$(grep -nF '        if ! migrate_legacy_connection_profile; then' "$installer" | tail -n 1 | cut -d: -f1)
 openrc_restart_line=$(grep -nF '            service znode restart' "$installer" | tail -n 1 | cut -d: -f1)
 [[ "$openrc_restart_line" -gt "$migration_line" ]] || fail 'Alpine update must restart, not merely start, the service'
+
+contains "$installer" '"DisableUDPContentSniffing": false'
+not_contains "$installer" 's/"DisableUDPContentSniffing"[[:space:]]*:[[:space:]]*true/"DisableUDPContentSniffing": false/'
 
 rollback_geodata_line=$(grep -nF 'if ! install_runtime_geodata /usr/local/znode; then' "$manager" | head -n 1 | cut -d: -f1)
 rollback_start_line=$(grep -nF '    start_znode_service || true' "$manager" | head -n 1 | cut -d: -f1)
