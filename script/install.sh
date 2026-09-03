@@ -196,27 +196,32 @@ EOF
     chmod 755 "$schedule_dir/znode-log-cleanup"
 }
 
-# Upgrade legacy defaults that either starved video buffers or held the first
-# UDP/QUIC packets for content sniffing. TCP/TLS domain routing remains active.
-migrate_tiktok_compat_profile() {
+# Upgrade only the legacy connection limits. Do not rewrite
+# DisableUDPContentSniffing here: an existing true value may be an operator's
+# deliberate choice rather than an installer-generated default.
+migrate_legacy_connection_profile() {
     local config_file="/etc/znode/config.json"
     local temporary
     [[ -f "$config_file" ]] || return 0
-    if ! grep -Eq '"Handshake"[[:space:]]*:[[:space:]]*4([[:space:]]*,)|"ConnIdle"[[:space:]]*:[[:space:]]*30([[:space:]]*,)|"BufferSize"[[:space:]]*:[[:space:]]*16([[:space:]]*,)|"DisableUDPContentSniffing"[[:space:]]*:[[:space:]]*false' "$config_file"; then
+    if ! grep -Eq '"Handshake"[[:space:]]*:[[:space:]]*4([[:space:]]*,)|"ConnIdle"[[:space:]]*:[[:space:]]*30([[:space:]]*,)|"BufferSize"[[:space:]]*:[[:space:]]*16([[:space:]]*,)' "$config_file"; then
         return 0
     fi
     temporary=$(mktemp "${config_file}.XXXXXX") || return 1
 
-    sed -E \
+    if ! sed -E \
         -e 's/"Handshake"[[:space:]]*:[[:space:]]*4[[:space:]]*,/"Handshake": 15,/' \
         -e 's/"ConnIdle"[[:space:]]*:[[:space:]]*30[[:space:]]*,/"ConnIdle": 120,/' \
         -e 's/"BufferSize"[[:space:]]*:[[:space:]]*16[[:space:]]*,/"BufferSize": 128,/' \
-        -e 's/"DisableUDPContentSniffing"[[:space:]]*:[[:space:]]*false/"DisableUDPContentSniffing": true/' \
-        "$config_file" > "$temporary"
+        "$config_file" > "$temporary"; then
+        rm -f "$temporary"
+        return 1
+    fi
 
-    chmod 600 "$temporary"
-    mv -f "$temporary" "$config_file"
-    echo -e "${green}Đã nâng cấu hình UDP/QUIC để ổn định TikTok và video.${plain}"
+    if ! chmod 600 "$temporary" || ! mv -f "$temporary" "$config_file"; then
+        rm -f "$temporary"
+        return 1
+    fi
+    echo -e "${green}Đã nâng giới hạn kết nối cũ cho luồng video.${plain}"
 }
 
 secure_znode_config_permissions() {
@@ -740,7 +745,7 @@ generate_znode_agent_config() {
         "UplinkOnly": 2,
         "DownlinkOnly": 4,
         "BufferSize": 128,
-        "DisableUDPContentSniffing": true,
+        "DisableUDPContentSniffing": false,
         "MaxConnectionsPerUser": 128,
         "MaxConnections": 32768
     },
@@ -1317,7 +1322,13 @@ EOF
             fi
             exit 1
         fi
-        migrate_tiktok_compat_profile
+        if ! migrate_legacy_connection_profile; then
+            echo -e "${red}Không thể nâng cấu hình kết nối; đang rollback runtime.${plain}"
+            if ! rollback_activated_runtime "$had_previous"; then
+                echo -e "${red}Không thể rollback sau lỗi migration; hãy kiểm tra dịch vụ thủ công.${plain}"
+            fi
+            exit 1
+        fi
         if [[ x"${release}" == x"alpine" ]]; then
             service znode restart
         else

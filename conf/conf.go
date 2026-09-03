@@ -126,10 +126,9 @@ func New() *Conf {
 			UplinkOnly:   2,
 			DownlinkOnly: 4,
 			BufferSize:   128,
-			// Domain routing still sniffs TCP/TLS. Do not hold QUIC datagrams while
-			// attempting content inspection; mobile video apps are sensitive to the
-			// added first-packet delay on high-latency China-to-Vietnam links.
-			DisableUDPContentSniffing: true,
+			// Keep UDP/QUIC content sniffing on so domain rules can route TikTok
+			// QUIC traffic through the selected outbound (for example WireGuard).
+			DisableUDPContentSniffing: false,
 			MaxConnectionsPerUser:     128,
 			MaxConnections:            32768,
 		},

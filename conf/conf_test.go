@@ -29,7 +29,7 @@ func TestLoadDefaultsAndRedisConfig(t *testing.T) {
 	if err := c.LoadFromPath(path); err != nil {
 		t.Fatal(err)
 	}
-	if c.ConnectionConfig.Handshake != 15 || c.ConnectionConfig.ConnIdle != 120 || c.ConnectionConfig.BufferSize != 128 || !c.ConnectionConfig.DisableUDPContentSniffing {
+	if c.ConnectionConfig.Handshake != 15 || c.ConnectionConfig.ConnIdle != 120 || c.ConnectionConfig.BufferSize != 128 || c.ConnectionConfig.DisableUDPContentSniffing {
 		t.Fatalf("unexpected connection defaults: %+v", c.ConnectionConfig)
 	}
 	device := c.NodeConfigs[0].GlobalDeviceLimitConfig
@@ -52,6 +52,27 @@ func TestLoadDefaultsAndRedisConfig(t *testing.T) {
 	custom.applyDefaults()
 	if custom.UserSourceMode != "redis_primary" {
 		t.Fatalf("redis primary source was not normalized: %q", custom.UserSourceMode)
+	}
+}
+
+func TestLoadPreservesExplicitUDPContentSniffingChoice(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.json")
+	data := []byte(`{
+  "type": "zboard",
+  "ConnectionConfig": {
+    "DisableUDPContentSniffing": true
+  },
+  "Nodes": []
+}`)
+	if err := os.WriteFile(path, data, 0600); err != nil {
+		t.Fatal(err)
+	}
+	c := New()
+	if err := c.LoadFromPath(path); err != nil {
+		t.Fatal(err)
+	}
+	if !c.ConnectionConfig.DisableUDPContentSniffing {
+		t.Fatal("explicit DisableUDPContentSniffing=true was not preserved")
 	}
 }
 
