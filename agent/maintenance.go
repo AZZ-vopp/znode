@@ -51,7 +51,7 @@ func reconcileMaintenance(ctx context.Context, reporter maintenanceReporter, com
 	if !validMaintenanceID(command.ID) {
 		return fmt.Errorf("invalid maintenance command ID")
 	}
-	if command.Action != "update_latest" && command.Action != "rollback" {
+	if command.Action != "update_latest" && command.Action != "update_geodata" && command.Action != "rollback" {
 		return fmt.Errorf("invalid maintenance action")
 	}
 	maintenanceMu.Lock()
@@ -125,6 +125,8 @@ func scheduleMaintenanceCommand(command panel.AgentMaintenance) error {
 	switch command.Action {
 	case "update_latest":
 		action = "update"
+	case "update_geodata":
+		action = "update-geodata"
 	case "rollback":
 		action = "rollback"
 	default:

@@ -27,6 +27,9 @@ func TestAgentClientGetsManifestWithCredentials(t *testing.T) {
 		if got := r.Header.Get("X-ZNode-Type"); got != conf.RequiredPanelType {
 			t.Fatalf("unexpected ZBoard type header: %q", got)
 		}
+		if got := r.Header.Get("X-ZNode-Capabilities"); got != "update_geodata" {
+			t.Fatalf("unexpected capabilities header: %q", got)
+		}
 		if got := r.Header.Get("Authorization"); got != "Bearer top-secret" {
 			t.Fatalf("unexpected authorization header: %q", got)
 		}

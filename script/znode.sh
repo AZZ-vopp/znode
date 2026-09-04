@@ -18,6 +18,7 @@ plain='\033[0m'
 cur_dir=$(pwd)
 release_repo="AZZ-vopp/znode"
 release_branch="main"
+geodata_release_repo="Loyalsoldier/v2ray-rules-dat"
 [[ -s /etc/znode/release-repo ]] && release_repo=$(tr -d '\r\n' < /etc/znode/release-repo)
 [[ -s /etc/znode/release-branch ]] && release_branch=$(tr -d '\r\n' < /etc/znode/release-branch)
 ZNODE_OPERATION_LOCK_FILE="/run/znode-operation.lock"
@@ -360,6 +361,104 @@ install_runtime_geodata() (
             return 1
         fi
     done
+)
+
+download_verified_geodata_asset() {
+    local metadata="$1"
+    local asset_name="$2"
+    local destination="$3"
+    local expected actual asset_size asset_url
+
+    case "$asset_name" in
+        geoip.dat|geosite.dat) ;;
+        *) return 1 ;;
+    esac
+    expected=$(printf '%s\n' "$metadata" | awk -v asset="$asset_name" '
+        /"name":/ { selected = index($0, "\"" asset "\"") > 0 }
+        selected && /"digest": "sha256:/ {
+            value=$0
+            sub(/^.*"digest": "sha256:/, "", value)
+            sub(/".*$/, "", value)
+            print tolower(value)
+            exit
+        }
+    ')
+    if [[ ! "$expected" =~ ^[a-f0-9]{64}$ ]]; then
+        echo -e "${red}Release GeoIP/GeoSite không công bố SHA-256 cho ${asset_name}; từ chối cập nhật.${plain}"
+        return 1
+    fi
+
+    asset_url="https://github.com/${geodata_release_repo}/releases/latest/download/${asset_name}"
+    if ! curl --fail --location --silent --show-error --retry 3 --connect-timeout 15 \
+        --proto '=https' --tlsv1.2 "$asset_url" -o "$destination"; then
+        rm -f "$destination"
+        return 1
+    fi
+    asset_size=$(wc -c < "$destination" | tr -d '[:space:]')
+    actual=$(sha256_file "$destination")
+    if [[ ! "$asset_size" =~ ^[0-9]+$ ]] || (( asset_size < 1048576 || asset_size > 134217728 )) \
+        || [[ ! "$actual" =~ ^[a-f0-9]{64}$ ]] || [[ "$actual" != "$expected" ]]; then
+        rm -f "$destination"
+        echo -e "${red}${asset_name} không vượt qua xác minh kích thước/SHA-256; dữ liệu đang chạy được giữ nguyên.${plain}"
+        return 1
+    fi
+}
+
+update_geodata() (
+    local temporary_directory previous_directory metadata file start_status=0
+
+    acquire_znode_operation_lock || return 1
+    temporary_directory=$(mktemp -d /etc/znode/.geodata-update.XXXXXX) || {
+        release_znode_operation_lock
+        return 1
+    }
+    trap 'rm -rf "$temporary_directory"; release_znode_operation_lock' EXIT
+    previous_directory="$temporary_directory/previous"
+    mkdir -p "$previous_directory" || return 1
+
+    if ! validate_runtime_geodata /etc/znode; then
+        echo -e "${red}Không có đủ GeoIP/GeoSite hiện hành để rollback an toàn; từ chối cập nhật.${plain}"
+        return 1
+    fi
+    for file in geoip.dat geosite.dat; do
+        cp -p "/etc/znode/$file" "$previous_directory/$file" || return 1
+    done
+
+    metadata=$(curl --fail --location --silent --show-error --retry 3 --connect-timeout 15 \
+        --proto '=https' --tlsv1.2 \
+        "https://api.github.com/repos/${geodata_release_repo}/releases/latest") || {
+        echo -e "${red}Không tải được metadata GeoIP/GeoSite mới nhất; dữ liệu đang chạy được giữ nguyên.${plain}"
+        return 1
+    }
+    for file in geoip.dat geosite.dat; do
+        download_verified_geodata_asset "$metadata" "$file" "$temporary_directory/$file" || return 1
+    done
+    validate_runtime_geodata "$temporary_directory" || return 1
+    install_runtime_geodata "$temporary_directory" /etc/znode || {
+        echo -e "${red}Không thể kích hoạt GeoIP/GeoSite mới; dữ liệu đang chạy được giữ nguyên.${plain}"
+        return 1
+    }
+
+    echo -e "${yellow}Đã xác minh và thay GeoIP/GeoSite; đang khởi động lại ZNode để nạp rule mới...${plain}"
+    stop_znode_service
+    start_znode_service || start_status=$?
+    sleep 2
+    if [[ $start_status == 0 ]] && check_status; then
+        echo -e "${green}Đã cập nhật geoip.dat và geosite.dat, ZNode đang chạy với dữ liệu mới.${plain}"
+        return 0
+    fi
+
+    echo -e "${red}ZNode không khởi động với dữ liệu mới; đang khôi phục GeoIP/GeoSite trước đó.${plain}"
+    stop_znode_service
+    if install_runtime_geodata "$previous_directory" /etc/znode && start_znode_service; then
+        sleep 2
+        if check_status; then
+            echo -e "${red}Cập nhật thất bại; GeoIP/GeoSite cũ đã được khôi phục và ZNode đã chạy lại.${plain}"
+            return 1
+        fi
+    fi
+    echo -e "${red}Không thể khôi phục dịch vụ tự động; ZNode được giữ dừng để kiểm tra thủ công.${plain}"
+    return 1
 )
 
 swap_runtime_trees() {
@@ -915,6 +1014,7 @@ show_usage() {
     echo "znode generate     - Hướng dẫn enrollment Agent qua ZBoard"
     echo "znode update       - Cập nhật znode"
     echo "znode update x.x.x - Cài phiên bản znode chỉ định"
+    echo "znode update-geodata - Cập nhật geoip.dat và geosite.dat của Xray"
     echo "znode rollback     - Quay lại bản znode trước đó"
     echo "znode install      - Cài đặt znode"
     echo "znode uninstall    - Gỡ cài đặt znode"
@@ -944,11 +1044,12 @@ show_menu() {
   ${green}11.${plain} Xem phiên bản znode
   ${green}12.${plain} Nâng cấp script quản lý znode
   ${green}13.${plain} Hướng dẫn enrollment Agent qua ZBoard
-  ${green}14.${plain} Thoát script
+  ${green}14.${plain} Cập nhật GeoIP/GeoSite (.dat)
+  ${green}15.${plain} Thoát script
  "
  # Có thể bổ sung chức năng mới vào menu phía trên
     show_status
-    echo && read -rp "Vui lòng chọn [0-14]: " num
+    echo && read -rp "Vui lòng chọn [0-15]: " num
 
     case "${num}" in
         0) config ;;
@@ -965,7 +1066,8 @@ show_menu() {
         11) check_install && show_znode_version ;;
         12) update_shell ;;
         13) generate_config_file ;;
-        14) exit ;;
+        14) check_install && update_geodata ;;
+        15) exit ;;
         *) echo -e "${red}Vui lòng nhập đúng một số từ 0 đến 15.${plain}" ;;
     esac
 }
@@ -981,6 +1083,7 @@ if [[ $# > 0 ]]; then
         "disable") check_install 0 && disable 0 ;;
         "log") check_install 0 && show_log 0 ;;
         "update") check_install 0 && update 0 $2 ;;
+        "update-geodata") check_install 0 && update_geodata ;;
         "rollback") check_install 0 && rollback 0 ;;
         "config") config $* ;;
         "generate") generate_config_file ;;

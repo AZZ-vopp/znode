@@ -225,6 +225,7 @@ func newAgentHTTPClient(c conf.AgentConfig, retryCount int) *resty.Client {
 		SetHeader("X-ZNode-Agent-Token", c.AgentToken).
 		SetHeader("X-ZNode-Type", conf.RequiredPanelType).
 		SetHeader("X-ZNode-Version", ClientVersion()).
+		SetHeader("X-ZNode-Capabilities", "update_geodata").
 		SetAuthToken(c.AgentToken)
 	setAddressHeaders(client)
 	return client
@@ -379,7 +380,7 @@ func (m *AgentManifest) Validate() error {
 		if _, err := hex.DecodeString(m.Maintenance.ID); err != nil {
 			return fmt.Errorf("invalid agent maintenance command ID: %w", err)
 		}
-		if m.Maintenance.Action != "update_latest" && m.Maintenance.Action != "rollback" {
+		if m.Maintenance.Action != "update_latest" && m.Maintenance.Action != "update_geodata" && m.Maintenance.Action != "rollback" {
 			return fmt.Errorf("invalid agent maintenance action %q", m.Maintenance.Action)
 		}
 	}

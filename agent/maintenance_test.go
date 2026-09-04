@@ -82,3 +82,27 @@ func TestCorruptMaintenanceStatePreventsDuplicateScheduling(t *testing.T) {
 		t.Fatal("maintenance was scheduled again without trustworthy state")
 	}
 }
+
+func TestGeodataMaintenanceActionIsAccepted(t *testing.T) {
+	oldPath := statePath
+	oldSchedule := scheduleMaintenance
+	statePath = filepath.Join(t.TempDir(), "maintenance.json")
+	var scheduled panel.AgentMaintenance
+	scheduleMaintenance = func(command panel.AgentMaintenance) error {
+		scheduled = command
+		return nil
+	}
+	defer func() { statePath = oldPath; scheduleMaintenance = oldSchedule }()
+
+	reporter := &fakeMaintenanceReporter{}
+	command := &panel.AgentMaintenance{ID: "fedcba9876543210fedcba9876543210", Action: "update_geodata"}
+	if err := reconcileMaintenance(context.Background(), reporter, command); err != nil {
+		t.Fatal(err)
+	}
+	if scheduled.Action != "update_geodata" {
+		t.Fatalf("scheduled action = %q, want update_geodata", scheduled.Action)
+	}
+	if len(reporter.reports) != 1 || reporter.reports[0].status != "scheduled" {
+		t.Fatalf("unexpected reports: %+v", reporter.reports)
+	}
+}
