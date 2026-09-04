@@ -23,7 +23,7 @@ func (c *Controller) reportUserTrafficTask(ctx context.Context) (err error) {
 	var reportmin = 0
 	var devicemin = 0
 	c.userSyncMu.Lock()
-	if c.info.Common.BaseConfig != nil {
+	if c.info != nil && c.info.Common != nil && c.info.Common.BaseConfig != nil {
 		reportmin = c.info.Common.BaseConfig.NodeReportMinTraffic
 		devicemin = c.info.Common.BaseConfig.DeviceOnlineMinTraffic
 	}
@@ -33,11 +33,20 @@ func (c *Controller) reportUserTrafficTask(ctx context.Context) (err error) {
 	// acknowledges a 2xx response. Network errors therefore retry the same ID
 	// instead of silently losing accounting data or double charging a user.
 	c.userSyncMu.Lock()
-	if c.closing {
+	if c.closing || c.terminalFence.Load() {
 		c.userSyncMu.Unlock()
 		return nil
 	}
 	trafficByUID, reportedUsers, err := c.reportPendingTraffic(ctx, reportmin)
+	terminal := c.closing || c.terminalFence.Load()
+	var onlineDevice *[]panel.OnlineUser
+	var onlineDeviceErr error
+	// Shutdown deletes and clears the limiter under userSyncMu. Snapshot its
+	// online view while the same mutex still guards its lifetime, after the final
+	// terminal-state check, so SignalStop cannot race limiter teardown.
+	if !terminal && c.limiter != nil {
+		onlineDevice, onlineDeviceErr = c.limiter.GetOnlineDevice()
+	}
 	c.userSyncMu.Unlock()
 	if err != nil {
 		log.WithFields(log.Fields{
@@ -51,10 +60,13 @@ func (c *Controller) reportUserTrafficTask(ctx context.Context) (err error) {
 		log.WithField("tag", c.tag).Infof("Report %d users traffic", reportedUsers)
 	}
 
-	if onlineDevice, err := c.limiter.GetOnlineDevice(); err != nil {
+	if terminal || onlineDevice == nil {
+		return nil
+	}
+	if onlineDeviceErr != nil {
 		log.WithFields(log.Fields{
 			"tag": c.tag,
-			"err": err,
+			"err": onlineDeviceErr,
 		}).Info("Get online device failed")
 	} else {
 		result := onlineUsersMeetingTrafficThreshold(*onlineDevice, trafficByUID, devicemin)
@@ -86,7 +98,7 @@ func (c *Controller) reportPendingTraffic(ctx context.Context, minTraffic int) (
 	previousPending := append([]panel.UserTraffic(nil), c.pendingTraffic...)
 	previousPendingReportID := c.pendingTrafficReportID
 	previousQueued := append([]panel.UserTraffic(nil), c.queuedTraffic...)
-	capture, err := c.server.PrepareUserTrafficCapture(c.tag, minTraffic)
+	capture, err := c.coreExecutor().captureUserTraffic(ctx, false, c.tag, minTraffic)
 	if err != nil {
 		return nil, 0, err
 	}
@@ -224,15 +236,31 @@ func (c *Controller) spoolOutstandingTraffic() error {
 // UUID-to-reporting-ID map stable lets a failed disk commit restore every
 // atomic counter before a concurrent user deletion can remove it.
 func (c *Controller) spoolOutstandingTrafficWithUsersLocked() error {
-	c.trafficReportMu.Lock()
+	return c.spoolOutstandingTrafficWithUsersLockedContext(context.Background())
+}
+
+// spoolOutstandingTrafficWithUsersLockedContext is the terminal counterpart
+// to the normal durable capture. It never waits past ctx for the accounting
+// mutex and checks the deadline between each potentially slow phase.
+func (c *Controller) spoolOutstandingTrafficWithUsersLockedContext(ctx context.Context) error {
+	if !lockControllerForShutdown(ctx, &c.trafficReportMu) {
+		return ctx.Err()
+	}
 	defer c.trafficReportMu.Unlock()
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	if !c.trafficSpoolLoaded {
-		if err := c.restoreTrafficSpoolLocked(); err != nil {
-			return err
-		}
+		// restoreTrafficSpool can block in filesystem I/O. A started controller
+		// has loaded it already; do not make terminal shutdown unbounded merely
+		// to recover an uninitialized test/partial controller.
+		return fmt.Errorf("traffic spool was not initialized")
+	}
+	if err := ctx.Err(); err != nil {
+		return err
 	}
 	previousQueued := append([]panel.UserTraffic(nil), c.queuedTraffic...)
-	capture, err := c.server.PrepareUserTrafficCapture(c.tag, 0)
+	capture, err := c.coreExecutor().captureUserTraffic(ctx, c.terminalFence.Load(), c.tag, 0)
 	if err != nil {
 		return err
 	}
@@ -244,12 +272,39 @@ func (c *Controller) spoolOutstandingTrafficWithUsersLocked() error {
 		}
 		c.queuedTraffic = merged
 	}
-	if err := c.persistTrafficSpoolLocked(); err != nil {
+	if err := ctx.Err(); err != nil {
 		c.queuedTraffic = previousQueued
 		return err
 	}
-	capture.Commit()
-	return nil
+	state, err := c.trafficSpoolSnapshotLocked()
+	if err != nil {
+		c.queuedTraffic = previousQueued
+		return err
+	}
+	path := c.trafficSpoolPath()
+	c.trafficReportMu.Unlock()
+	writerDone := make(chan error, 1)
+	go func() { writerDone <- c.writeTrafficSpool(path, state) }()
+	select {
+	case err := <-writerDone:
+		c.trafficReportMu.Lock()
+		if err != nil {
+			c.queuedTraffic = previousQueued
+			return err
+		}
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		capture.Commit()
+		return nil
+	case <-ctx.Done():
+		// The writer owns only immutable data and may complete after process
+		// accounting times out. It cannot retain a controller/core lease or
+		// mutate controller state, so terminal core close remains safe.
+		c.trafficReportMu.Lock()
+		c.queuedTraffic = previousQueued
+		return ctx.Err()
+	}
 }
 
 func saturatingTrafficAdd(current, upload, download int64) int64 {

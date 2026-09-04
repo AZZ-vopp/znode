@@ -67,16 +67,34 @@ func (c *Controller) restoreTrafficSpoolLocked() error {
 }
 
 func (c *Controller) persistTrafficSpoolLocked() error {
-	state := trafficSpoolState{
+	state, err := c.trafficSpoolSnapshotLocked()
+	if err != nil {
+		return err
+	}
+	return c.writeTrafficSpool(c.trafficSpoolPath(), state)
+}
+
+// trafficSpoolSnapshotLocked copies all controller-owned traffic state before
+// terminal persistence. The writer receives only this immutable snapshot and
+// never owns a controller lock, core lease, or mutable controller state.
+func (c *Controller) trafficSpoolSnapshotLocked() (*trafficSpoolState, error) {
+	state := &trafficSpoolState{
 		Version:         trafficSpoolVersion,
 		PendingReportID: c.pendingTrafficReportID,
 		Pending:         trafficToSpoolEntries(c.pendingTraffic),
 		Queued:          trafficToSpoolEntries(c.queuedTraffic),
 	}
-	if err := validateTrafficSpoolState(&state); err != nil {
-		return fmt.Errorf("validate traffic spool: %w", err)
+	if err := validateTrafficSpoolState(state); err != nil {
+		return nil, fmt.Errorf("validate traffic spool: %w", err)
 	}
-	return writeTrafficSpool(c.trafficSpoolPath(), &state)
+	return state, nil
+}
+
+func (c *Controller) writeTrafficSpool(path string, state *trafficSpoolState) error {
+	if c.trafficSpoolWriter != nil {
+		return c.trafficSpoolWriter(path, state)
+	}
+	return writeTrafficSpool(path, state)
 }
 
 func (c *Controller) trafficSpoolPath() string {

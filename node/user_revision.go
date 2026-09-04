@@ -15,35 +15,57 @@ const (
 	userCredentialSyncTimeout = 30 * time.Second
 )
 
+// userRevisionPollDelay provides a small, deterministic stagger for healthy
+// polls. It keeps revision changes responsive while avoiding every logical
+// node hitting the panel on the same two-second boundary.
+func userRevisionPollDelay(entropy uint64) time.Duration {
+	return userRevisionPollInterval + time.Duration(entropy%1000)*time.Millisecond
+}
+
 type userRevisionClient interface {
 	GetUserRevision(context.Context) (string, error)
+}
+
+type userRevisionIntervalClient interface {
+	UserRevisionPollInterval() time.Duration
 }
 
 // userRevisionWatcher keeps the hot path independent from Redis topology.
 // It polls only a tiny authenticated marker; the complete list is downloaded
 // when that marker changes, and the running Xray core is not restarted.
 type userRevisionWatcher struct {
-	client    userRevisionClient
-	last      string
-	refresh   func(context.Context) error
-	ctx       context.Context
-	cancel    context.CancelFunc
-	stop      chan struct{}
-	done      chan struct{}
-	startOnce sync.Once
-	closeOnce sync.Once
+	client       userRevisionClient
+	last         string
+	refresh      func(context.Context) error
+	ctx          context.Context
+	cancel       context.CancelFunc
+	stop         chan struct{}
+	done         chan struct{}
+	startOnce    sync.Once
+	closeOnce    sync.Once
+	jitterSeed   uint64
+	pollInterval time.Duration
 }
 
 func newUserRevisionWatcher(client userRevisionClient, initial string, refresh func(context.Context) error) *userRevisionWatcher {
 	ctx, cancel := context.WithCancel(context.Background())
+	pollInterval := userRevisionPollInterval
+	if intervalClient, ok := client.(userRevisionIntervalClient); ok {
+		pollInterval = intervalClient.UserRevisionPollInterval()
+	}
+	if pollInterval < time.Second {
+		pollInterval = time.Second
+	}
 	return &userRevisionWatcher{
-		client:  client,
-		last:    initial,
-		refresh: refresh,
-		ctx:     ctx,
-		cancel:  cancel,
-		stop:    make(chan struct{}),
-		done:    make(chan struct{}),
+		client:       client,
+		last:         initial,
+		refresh:      refresh,
+		ctx:          ctx,
+		cancel:       cancel,
+		stop:         make(chan struct{}),
+		done:         make(chan struct{}),
+		jitterSeed:   uint64(time.Now().UnixNano()),
+		pollInterval: pollInterval,
 	}
 }
 
@@ -56,8 +78,8 @@ func (w *userRevisionWatcher) Start() {
 
 func (w *userRevisionWatcher) run() {
 	defer close(w.done)
-	delay := time.Duration(0)
-	backoff := userRevisionPollInterval
+	delay := userRevisionPollDelayFor(w.pollInterval, w.jitterSeed)
+	backoff := w.pollInterval
 	for {
 		if !w.wait(delay) {
 			return
@@ -72,9 +94,17 @@ func (w *userRevisionWatcher) run() {
 			}
 			continue
 		}
-		backoff = userRevisionPollInterval
-		delay = userRevisionPollInterval
+		backoff = w.pollInterval
+		w.jitterSeed++
+		delay = userRevisionPollDelayFor(w.pollInterval, w.jitterSeed)
 	}
+}
+
+func userRevisionPollDelayFor(interval time.Duration, entropy uint64) time.Duration {
+	if interval <= 0 {
+		interval = userRevisionPollInterval
+	}
+	return interval + time.Duration(entropy%1000)*time.Millisecond
 }
 
 func (w *userRevisionWatcher) poll() error {

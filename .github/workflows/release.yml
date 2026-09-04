@@ -11,6 +11,9 @@ on:
       - "**/*.go"
       - "go.mod"
       - "go.sum"
+      - "Dockerfile"
+      - "script/with-xray-core.sh"
+      - "patches/xray-core/**"
       - ".github/workflows/release.yml"
   pull_request:
     types: [opened, synchronize, reopened]
@@ -18,6 +21,9 @@ on:
       - "**/*.go"
       - "go.mod"
       - "go.sum"
+      - "Dockerfile"
+      - "script/with-xray-core.sh"
+      - "patches/xray-core/**"
       - ".github/workflows/release.yml"
 
 permissions:
@@ -37,17 +43,19 @@ jobs:
       - name: Set up Go
         uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
         with:
-          go-version: '1.26.5'
+          go-version: '1.27.1'
           cache: true
       - name: Download locked modules
-        run: GOEXPERIMENT=jsonv2 go mod download
+        run: go mod download
       - name: Run tests and static analysis
         run: |
-          GOEXPERIMENT=jsonv2 ./script/with-xray-core.sh go test ./...
-          GOEXPERIMENT=jsonv2 ./script/with-xray-core.sh go vet ./...
-          GOEXPERIMENT=jsonv2 ./script/with-xray-core.sh go test -race ./common/format ./api/v2board ./agent ./core/app/dispatcher ./core ./node ./limiter
+          ./script/with-xray-core.sh go test ./...
+          ./script/with-xray-core.sh go vet ./...
+          ./script/with-xray-core.sh go test -race ./common/format ./api/v2board ./agent ./core/app/dispatcher ./core ./node ./limiter
       - name: Scan reachable Go vulnerabilities
-        run: GOEXPERIMENT=jsonv2 ./script/with-xray-core.sh go run golang.org/x/vuln/cmd/govulncheck@v1.6.0 ./...
+        run: ./script/with-xray-core.sh go run golang.org/x/vuln/cmd/govulncheck@v1.6.0 ./...
+      - name: Smoke build Docker builder
+        run: docker build --target builder -t znode-builder-ci .
 
   build:
     needs: test
@@ -132,7 +140,7 @@ jobs:
       - name: Set up Go
         uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
         with:
-          go-version: '1.26.5'
+          go-version: '1.27.1'
 
       - name: Get project dependencies
         run: |
@@ -149,13 +157,13 @@ jobs:
         run: |
           echo "version: $version"
           mkdir -p build_assets
-          GOEXPERIMENT=jsonv2 ./script/with-xray-core.sh go build -v -o build_assets/znode -trimpath -ldflags "-X 'github.com/AZZ-vopp/znode/cmd.version=$version' -s -w -buildid="
+          ./script/with-xray-core.sh go build -v -o build_assets/znode -trimpath -ldflags "-X 'github.com/AZZ-vopp/znode/cmd.version=$version' -s -w -buildid="
 
       - name: Build Mips softfloat znode
         if: matrix.goarch == 'mips' || matrix.goarch == 'mipsle'
         run: |
           echo "version: $version"
-          GOEXPERIMENT=jsonv2 GOMIPS=softfloat ./script/with-xray-core.sh go build -v -o build_assets/znode_softfloat -trimpath -ldflags "-X 'github.com/AZZ-vopp/znode/cmd.version=$version' -s -w -buildid="
+          GOMIPS=softfloat ./script/with-xray-core.sh go build -v -o build_assets/znode_softfloat -trimpath -ldflags "-X 'github.com/AZZ-vopp/znode/cmd.version=$version' -s -w -buildid="
       - name: Rename Windows znode
         if: matrix.goos == 'windows'
         run: |

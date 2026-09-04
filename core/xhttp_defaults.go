@@ -40,7 +40,12 @@ func applyXHTTPAntiTSPUDefaults(config *coreConf.SplitHTTPConfig) error {
 }
 
 func applyXHTTPRawDefaults(raw json.RawMessage) (json.RawMessage, error) {
-	if strings.TrimSpace(string(raw)) == "null" {
+	trimmed := strings.TrimSpace(string(raw))
+	// PHP's json_encode serializes an empty associative array as [] while
+	// Xray's SplitHTTP extra block is an object. Treat that harmless legacy
+	// representation as an empty object so one malformed field cannot stop
+	// every inbound from starting.
+	if trimmed == "null" || trimmed == "[]" {
 		raw = json.RawMessage(`{}`)
 	}
 	var config coreConf.SplitHTTPConfig

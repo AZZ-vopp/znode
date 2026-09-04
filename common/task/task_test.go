@@ -47,6 +47,35 @@ func TestCloseWaitsForActiveExecutionToObserveCancellation(t *testing.T) {
 	}
 }
 
+func TestSignalStopDoesNotWaitForAnUncooperativeCallback(t *testing.T) {
+	started := make(chan struct{})
+	release := make(chan struct{})
+	task := &Task{
+		Name:     "terminal-signal-test",
+		Interval: time.Hour,
+		Execute: func(context.Context) error {
+			close(started)
+			<-release
+			return nil
+		},
+	}
+	if err := task.Start(true); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatal("task did not start")
+	}
+
+	startedStop := time.Now()
+	task.SignalStop()
+	if elapsed := time.Since(startedStop); elapsed > 100*time.Millisecond {
+		t.Fatalf("signal stop waited for callback: %v", elapsed)
+	}
+	close(release)
+}
+
 func TestTaskRetriesAfterTransientPanelFailure(t *testing.T) {
 	var attempts atomic.Int32
 	recovered := make(chan struct{})

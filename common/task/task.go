@@ -27,6 +27,12 @@ type Task struct {
 }
 
 func (t *Task) Start(first bool) error {
+	return t.StartAfter(first, 0)
+}
+
+// StartAfter starts a periodic task with an optional initial phase offset.
+// Subsequent executions retain the configured interval.
+func (t *Task) StartAfter(first bool, initialDelay time.Duration) error {
 	t.Access.Lock()
 	if t.Running {
 		t.Access.Unlock()
@@ -47,16 +53,25 @@ func (t *Task) Start(first bool) error {
 			t.Access.Unlock()
 			close(done)
 		}()
-		timer := time.NewTimer(t.Interval)
-		defer timer.Stop()
 		if first {
 			if err := t.executeWithTimeout(stop); err != nil {
 				log.Errorf("Task %s initial execution error: %v; retrying after %s", t.Name, err, t.Interval)
 			}
 		}
 
+		if !first && initialDelay > 0 {
+			timer := time.NewTimer(initialDelay)
+			select {
+			case <-timer.C:
+			case <-stop:
+				timer.Stop()
+				return
+			}
+		}
+
+		timer := time.NewTimer(t.Interval)
+		defer timer.Stop()
 		for {
-			timer.Reset(t.Interval)
 			select {
 			case <-timer.C:
 				// continue
@@ -70,6 +85,7 @@ func (t *Task) Start(first bool) error {
 				// periodic worker alive so it heals without restarting Xray.
 				log.Errorf("Task %s execution error: %v; keeping runtime and retrying", t.Name, err)
 			}
+			timer.Reset(t.Interval)
 		}
 	}(stop, done)
 
@@ -142,4 +158,11 @@ func (t *Task) Close() {
 		<-done
 	}
 	log.Warningf("Task %s stopped", t.Name)
+}
+
+// SignalStop prevents future executions without waiting for an already-running
+// callback. Terminal process shutdown uses this bounded primitive; Close keeps
+// its existing wait-for-completion behavior for ordinary reloads.
+func (t *Task) SignalStop() {
+	_ = t.safeStop()
 }

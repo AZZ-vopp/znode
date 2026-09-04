@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"hash/fnv"
 	"reflect"
 	"time"
 
@@ -14,25 +15,32 @@ import (
 )
 
 func (c *Controller) startTasks(node *panel.NodeInfo) {
+	infoDelay := controllerTaskJitter(c.tag+":info", node.PullInterval)
+	reportDelay := controllerTaskJitter(c.tag+":report", node.PushInterval)
+	reloadCh, err := c.coreExecutor().reloadChannel(context.Background())
+	if err != nil {
+		log.WithError(err).WithField("tag", c.tag).Warn("Skip background tasks without an active core")
+		return
+	}
 	// fetch node info task
 	c.nodeInfoMonitorPeriodic = &task.Task{
 		Name:     "nodeInfoMonitor",
 		Interval: node.PullInterval,
 		Execute:  c.nodeInfoMonitor,
-		ReloadCh: c.server.ReloadCh,
+		ReloadCh: reloadCh,
 	}
 	// fetch user list task
 	c.userReportPeriodic = &task.Task{
 		Name:     "reportUserTrafficTask",
 		Interval: node.PushInterval,
 		Execute:  c.reportUserTrafficTask,
-		ReloadCh: c.server.ReloadCh,
+		ReloadCh: reloadCh,
 	}
 	log.WithField("tag", c.tag).Info("Start monitor node status")
 	// delay to start nodeInfoMonitor
-	_ = c.nodeInfoMonitorPeriodic.Start(false)
+	_ = c.nodeInfoMonitorPeriodic.StartAfter(false, infoDelay)
 	log.WithField("tag", c.tag).Info("Start report node status")
-	_ = c.userReportPeriodic.Start(false)
+	_ = c.userReportPeriodic.StartAfter(false, reportDelay)
 	if node.Security == panel.Tls {
 		switch c.info.Common.CertInfo.CertMode {
 		case "none", "", "file", "self":
@@ -41,13 +49,27 @@ func (c *Controller) startTasks(node *panel.NodeInfo) {
 				Name:     "renewCertTask",
 				Interval: time.Hour * 24,
 				Execute:  c.renewCertTask,
-				ReloadCh: c.server.ReloadCh,
+				ReloadCh: reloadCh,
 			}
 			log.WithField("tag", c.tag).Info("Start renew cert")
 			// delay to start renewCert
 			_ = c.renewCertPeriodic.Start(true)
 		}
 	}
+}
+
+func controllerTaskJitter(seed string, interval time.Duration) time.Duration {
+	if interval <= 0 {
+		return 0
+	}
+	window := interval / 5
+	windowMillis := uint64(window / time.Millisecond)
+	if windowMillis == 0 {
+		return 0
+	}
+	hash := fnv.New32a()
+	_, _ = hash.Write([]byte(seed))
+	return time.Duration(uint64(hash.Sum32())%(windowMillis+1)) * time.Millisecond
 }
 
 func (c *Controller) nodeInfoMonitor(ctx context.Context) (err error) {
@@ -73,7 +95,9 @@ func (c *Controller) nodeInfoMonitor(ctx context.Context) (err error) {
 	if newN != nil {
 		if reportingThresholdOnlyChange(c.info, newN) {
 			c.applyReportingThresholds(newN)
-			c.server.RequestSnapshot()
+			if err := c.coreExecutor().requestSnapshot(ctx); err != nil {
+				return err
+			}
 			log.WithFields(log.Fields{
 				"tag":                       c.tag,
 				"node_report_min_traffic":   newN.Common.BaseConfig.NodeReportMinTraffic,
@@ -84,9 +108,13 @@ func (c *Controller) nodeInfoMonitor(ctx context.Context) (err error) {
 		log.WithFields(log.Fields{
 			"tag": c.tag,
 		}).Error("Got new node info, reload")
-		if c.server.ReloadCh != nil {
+		reloadCh, err := c.coreExecutor().reloadChannel(ctx)
+		if err != nil {
+			return err
+		}
+		if reloadCh != nil {
 			select {
-			case c.server.ReloadCh <- struct{}{}:
+			case reloadCh <- struct{}{}:
 			default:
 			}
 		} else {
@@ -197,7 +225,7 @@ func (c *Controller) syncUsersState(ctx context.Context, includeAlive bool) (err
 	// disk persistence is recovering, the comparison below must see it as an
 	// addition and restore the runtime credential.
 	if len(c.quiescedUsers) > 0 {
-		quiesced, quiesceErr := c.server.QuiesceUsers(c.quiescedUsers, c.tag)
+		quiesced, quiesceErr := c.coreExecutor().quiesceUsers(ctx, c.quiescedUsers, c.tag)
 		c.quiescedUsers = mergeUsersByCredential(c.quiescedUsers, quiesced)
 		if quiesceErr != nil {
 			log.WithFields(log.Fields{
@@ -230,7 +258,7 @@ func (c *Controller) syncUsersState(ctx context.Context, includeAlive bool) (err
 		// Stop new sessions and close old links, but retain UID mappings and
 		// counters until the final capture is fsynced. A disk failure keeps the
 		// users quiesced (fail closed) and retries the durable capture later.
-		quiesced, quiesceErr := c.server.QuiesceUsers(deleted, c.tag)
+		quiesced, quiesceErr := c.coreExecutor().quiesceUsers(ctx, deleted, c.tag)
 		c.quiescedUsers = mergeUsersByCredential(c.quiescedUsers, quiesced)
 		if quiesceErr != nil {
 			log.WithFields(log.Fields{
@@ -256,11 +284,7 @@ func (c *Controller) syncUsersState(ctx context.Context, includeAlive bool) (err
 	}
 	if len(added) > 0 {
 		// have added users
-		_, err = c.server.AddUsers(&vCore.AddUsersParams{
-			Tag:      c.tag,
-			NodeInfo: c.info,
-			Users:    added,
-		})
+		_, err = c.coreExecutor().addUsers(ctx, false, &vCore.AddUsersParams{Tag: c.tag, NodeInfo: c.info, Users: added})
 		if err != nil {
 			log.WithFields(log.Fields{
 				"tag": c.tag,
@@ -279,7 +303,9 @@ func (c *Controller) syncUsersState(ctx context.Context, includeAlive bool) (err
 	c.userList = newU
 	log.WithField("tag", c.tag).Infof("%d user deleted, %d user added, %d user modified", len(deleted), len(added), len(modified))
 	if len(deleted) > 0 || len(added) > 0 || len(modified) > 0 {
-		c.server.RequestSnapshot()
+		if err := c.coreExecutor().requestSnapshot(ctx); err != nil {
+			return err
+		}
 	}
 	return nil
 }
@@ -295,7 +321,9 @@ func (c *Controller) finalizeQuiescedUsersLocked() error {
 		return err
 	}
 	completed := append([]panel.UserInfo(nil), c.quiescedUsers...)
-	c.server.ForgetUsers(completed, c.tag)
+	if err := c.coreExecutor().forgetUsers(context.Background(), completed, c.tag); err != nil {
+		return err
+	}
 	if c.limiter != nil {
 		c.limiter.UpdateUser(c.tag, nil, completed, nil)
 	}

@@ -8,6 +8,7 @@ import (
 	"io"
 	"net/http"
 	"strings"
+	"time"
 
 	"encoding/json/jsontext"
 	"encoding/json/v2"
@@ -49,8 +50,9 @@ const maxPanelUserResponseBytes int64 = 64 << 20
 const trafficCapabilityPath = "/api/v1/server/UniProxy/capability"
 const userRevisionPath = "/api/v1/server/UniProxy/revision"
 
-// GetUserRevision fetches a tiny desired-state marker. The node can poll this
-// frequently and only rebuild the complete user list when the marker changes.
+// GetUserRevision fetches a tiny authenticated desired-state marker. Even in
+// Redis-primary mode this request remains enabled so token rotation/revocation
+// is observed while Redis supplies the heavier user snapshot.
 func (c *Client) GetUserRevision(ctx context.Context) (string, error) {
 	r, err := c.client.R().
 		SetContext(ctx).
@@ -63,7 +65,7 @@ func (c *Client) GetUserRevision(ctx context.Context) (string, error) {
 		return "", fmt.Errorf("get user revision: panel returned no response")
 	}
 	if r.StatusCode() < http.StatusOK || r.StatusCode() >= http.StatusMultipleChoices {
-		return "", fmt.Errorf("get user revision: panel returned HTTP %d", r.StatusCode())
+		return "", &userRevisionHTTPError{Status: r.StatusCode()}
 	}
 	var body UserRevisionBody
 	if err := json.Unmarshal(r.Body(), &body); err != nil {
@@ -82,10 +84,43 @@ func (c *Client) GetUserRevision(ctx context.Context) (string, error) {
 	return revision, nil
 }
 
+// UserRevisionPollInterval lets Redis-primary nodes retain a lightweight
+// authorization check without creating the old two-second request storm.
+func (c *Client) UserRevisionPollInterval() time.Duration {
+	if c.userSourceMode() == "redis_primary" {
+		return 15 * time.Second
+	}
+	return 2 * time.Second
+}
+
 // GetUserList keeps ZBoard authoritative. Redis is consulted only after the
 // live panel request fails, and every fallback snapshot must pass the Agent
 // token HMAC before it can change runtime credentials.
 func (c *Client) GetUserList(ctx context.Context) ([]UserInfo, error) {
+	if c.userSourceMode() == "redis_primary" {
+		// Keep the lightweight panel authorization check even when Redis is the
+		// preferred user source. Network failures may use Redis; explicit 401/403
+		// responses must never be bypassed by a still-valid old snapshot.
+		if _, revisionErr := c.GetUserRevision(ctx); revisionErr != nil {
+			var statusError *userRevisionHTTPError
+			if errors.As(revisionErr, &statusError) && (statusError.Status == http.StatusUnauthorized ||
+				statusError.Status == http.StatusForbidden || statusError.Status == http.StatusGone) {
+				return nil, revisionErr
+			}
+		}
+		users, fallbackErr := c.getFallbackUserList(ctx)
+		if fallbackErr == nil {
+			c.userEtag = ""
+			c.UserList = &UserListBody{Users: cloneUserList(users)}
+			return cloneUserList(users), nil
+		}
+		users, panelErr := c.getUserListFromPanel(ctx)
+		if panelErr == nil {
+			markZBoardControlPlaneHealthy(c.APIHost, c.AgentID)
+			return users, nil
+		}
+		return nil, fmt.Errorf("signed Redis snapshot unavailable: %v; live ZBoard fallback failed: %w", fallbackErr, panelErr)
+	}
 	users, err := c.getUserListFromPanel(ctx)
 	if err == nil {
 		markZBoardControlPlaneHealthy(c.APIHost, c.AgentID)
@@ -106,6 +141,15 @@ func (c *Client) GetUserList(ctx context.Context) ([]UserInfo, error) {
 	c.userEtag = ""
 	c.UserList = &UserListBody{Users: cloneUserList(fallback)}
 	return cloneUserList(fallback), nil
+}
+
+func (c *Client) userSourceMode() string {
+	c.fallbackMu.Lock()
+	defer c.fallbackMu.Unlock()
+	if c.fallbackConfig != nil && c.fallbackConfig.UserSourceMode == "redis_primary" {
+		return "redis_primary"
+	}
+	return "web_primary"
 }
 
 func (c *Client) getUserListFromPanel(ctx context.Context) ([]UserInfo, error) {
@@ -181,6 +225,14 @@ func (c *Client) getUserListFromPanel(ctx context.Context) ([]UserInfo, error) {
 
 type userListHTTPError struct {
 	Status int
+}
+
+type userRevisionHTTPError struct {
+	Status int
+}
+
+func (e *userRevisionHTTPError) Error() string {
+	return fmt.Sprintf("get user revision: panel returned HTTP %d", e.Status)
 }
 
 func (e *userListHTTPError) Error() string {

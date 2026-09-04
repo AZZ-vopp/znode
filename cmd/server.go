@@ -2,6 +2,7 @@ package cmd
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net/http"
 	_ "net/http/pprof"
@@ -89,7 +90,11 @@ func serverHandle(_ *cobra.Command, _ []string) {
 		log.WithField("err", err).Error("Start runtime failed")
 		return
 	}
-	defer func() { closeRuntimeUntilDurable(running) }()
+	defer func() {
+		if err := shutdownRuntime(running, 30*time.Second); err != nil {
+			log.WithField("err", err).Error("Terminal shutdown completed with incomplete accounting")
+		}
+	}()
 	logRevokedAssignment(running.assignment)
 	log.WithField("nodes", len(running.config.NodeConfigs)).Info("Nodes started")
 	if err := persistRuntimeSnapshot(running.preparedRuntime); err != nil {
@@ -205,8 +210,18 @@ type preparedRuntime struct {
 
 type runningRuntime struct {
 	*preparedRuntime
-	core *core.V2Core
+	core          *core.V2Core
+	terminalNodes nodeTerminator
+	terminalCore  coreCloser
 }
+
+type nodeTerminator interface {
+	BeginTerminalCoreOperations()
+	Shutdown(context.Context) error
+	CloseCoreOperations(context.Context) error
+}
+
+type coreCloser interface{ Close() error }
 
 func prepareRuntime(configPath string) (*preparedRuntime, error) {
 	newConf := conf.New()
@@ -244,7 +259,7 @@ func startPreparedRuntime(prepared *preparedRuntime, reloadCh chan struct{}, sna
 		_ = newCore.Close()
 		return nil, err
 	}
-	return &runningRuntime{preparedRuntime: prepared, core: newCore}, nil
+	return &runningRuntime{preparedRuntime: prepared, core: newCore, terminalNodes: prepared.nodes, terminalCore: newCore}, nil
 }
 
 func reloadRuntime(configPath string, old *runningRuntime, reloadCh chan struct{}) (*runningRuntime, error) {
@@ -288,7 +303,7 @@ func reloadRuntime(configPath string, old *runningRuntime, reloadCh chan struct{
 
 	applyLogConfig(prepared.config)
 	runtime.GC()
-	return &runningRuntime{preparedRuntime: prepared, core: newCore}, nil
+	return &runningRuntime{preparedRuntime: prepared, core: newCore, terminalNodes: prepared.nodes, terminalCore: newCore}, nil
 }
 
 // restorePreviousRuntime is the final rollback barrier for errors that can
@@ -305,6 +320,7 @@ func restorePreviousRuntime(old *runningRuntime, reloadCh chan struct{}) error {
 		return err
 	}
 	old.core = restored.core
+	old.terminalCore = restored.core
 	return nil
 }
 
@@ -327,15 +343,40 @@ func (r *runningRuntime) Close() error {
 	return nil
 }
 
-func closeRuntimeUntilDurable(r *runningRuntime) {
-	for {
-		if err := r.Close(); err != nil {
-			log.WithField("err", err).Error("Shutdown accounting barrier failed; retrying without discarding traffic")
-			time.Sleep(2 * time.Second)
-			continue
-		}
-		return
+// Shutdown closes a runtime for process termination. It always tries the core
+// close after the bounded node accounting attempt and never invokes the
+// transactional Close path that can restore listeners for reload.
+func (r *runningRuntime) Shutdown(ctx context.Context) error {
+	if r == nil {
+		return nil
 	}
+	var shutdownErr error
+	terminator := r.terminalNodes
+	if terminator == nil && r.nodes != nil {
+		terminator = r.nodes
+	}
+	if terminator != nil {
+		// Close admission for every controller before one slow terminal drain can
+		// consume the shared deadline. Otherwise a later controller can begin a
+		// raw-core operation after the runtime is already preparing to close it.
+		terminator.BeginTerminalCoreOperations()
+		shutdownErr = errors.Join(shutdownErr, terminator.Shutdown(ctx))
+		shutdownErr = errors.Join(shutdownErr, terminator.CloseCoreOperations(ctx))
+	}
+	closer := r.terminalCore
+	if closer == nil && r.core != nil {
+		closer = r.core
+	}
+	if closer != nil {
+		shutdownErr = errors.Join(shutdownErr, closer.Close())
+	}
+	return shutdownErr
+}
+
+func shutdownRuntime(r *runningRuntime, timeout time.Duration) error {
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	return r.Shutdown(ctx)
 }
 
 func applyLogConfig(config *conf.Conf) {

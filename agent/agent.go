@@ -67,6 +67,77 @@ type manifestFetcher interface {
 // threshold on the following polls.
 const authorizationRevocationThreshold = 3
 
+const manifestPollMaxBackoff = 5 * time.Minute
+
+const manifestPollMaxInterval = time.Hour
+
+const manifestReloadRetryBase = 30 * time.Second
+
+// manifestPollDelay backs off failed manifest reads while retaining a bounded
+// jitter window. entropy is an argument so the timing policy stays testable
+// without relying on wall-clock scheduling.
+func manifestPollDelay(interval time.Duration, failures uint, entropy uint64) time.Duration {
+	if interval <= 0 {
+		interval = 15 * time.Second
+	}
+	if failures == 0 {
+		return interval
+	}
+	delay := interval
+	for attempt := uint(1); attempt < failures && delay < manifestPollMaxBackoff; attempt++ {
+		if delay > manifestPollMaxBackoff/2 {
+			delay = manifestPollMaxBackoff
+			break
+		}
+		delay *= 2
+	}
+	if delay > manifestPollMaxBackoff {
+		delay = manifestPollMaxBackoff
+	}
+	// Spread retries by +/- 20%, without ever exceeding the cap.
+	window := delay / 5
+	if window == 0 {
+		return delay
+	}
+	offset := time.Duration(entropy%uint64(2*window+1)) - window
+	delay += offset
+	if delay > manifestPollMaxBackoff {
+		return manifestPollMaxBackoff
+	}
+	if delay < interval {
+		return interval
+	}
+	return delay
+}
+
+// healthyManifestPollDelay deterministically spreads healthy agents across up
+// to 20% of their configured interval. Using AgentID/instance entropy avoids
+// all VPS agents waking on the same deploy second without adding random drift.
+func healthyManifestPollDelay(interval time.Duration, entropy uint64) time.Duration {
+	if interval <= 0 {
+		interval = 15 * time.Second
+	}
+	window := interval / 5
+	windowMillis := uint64(window / time.Millisecond)
+	if windowMillis == 0 {
+		return interval
+	}
+	delay := interval + time.Duration(entropy%(windowMillis+1))*time.Millisecond
+	if delay > manifestPollMaxInterval {
+		return manifestPollMaxInterval
+	}
+	return delay
+}
+
+func manifestPollEntropy(config conf.AgentConfig) uint64 {
+	value := config.AgentID + ":" + config.AgentInstanceID
+	var entropy uint64
+	for _, ch := range value {
+		entropy = entropy*131 + uint64(ch)
+	}
+	return entropy
+}
+
 type fetcherFactory func(conf.AgentConfig) (manifestFetcher, error)
 
 func defaultFetcherFactory(config conf.AgentConfig) (manifestFetcher, error) {
@@ -88,6 +159,10 @@ type Monitor struct {
 	authorizationDenials    int
 	pollInterval            time.Duration
 	generation              uint64
+	pendingReloadRevision   string
+	reloadAttempts          uint
+	nextReloadAt            time.Time
+	now                     func() time.Time
 	reloadCh                chan<- struct{}
 	fallbackCh              chan<- FallbackUpdate
 	wake                    chan struct{}
@@ -114,6 +189,7 @@ func newMonitorWithFallback(reloadCh chan<- struct{}, fallbackCh chan<- Fallback
 		factory:    factory,
 		reloadCh:   reloadCh,
 		fallbackCh: fallbackCh,
+		now:        time.Now,
 		wake:       make(chan struct{}, 1),
 		stop:       make(chan struct{}),
 		done:       make(chan struct{}),
@@ -149,6 +225,11 @@ func (m *Monitor) MarkApplied(config conf.AgentConfig, assignment Assignment) er
 	}
 	m.appliedFallbackRevision = assignment.FallbackRevision
 	m.authorizationDenials = 0
+	// A successful apply ends the retry cycle for the desired revision. This is
+	// deliberately only called by the runtime after the replacement is live.
+	m.pendingReloadRevision = ""
+	m.reloadAttempts = 0
+	m.nextReloadAt = time.Time{}
 	m.pollInterval = pollInterval
 	m.generation++
 	m.mu.Unlock()
@@ -166,9 +247,13 @@ func (m *Monitor) Start() {
 
 func (m *Monitor) run() {
 	defer close(m.done)
+	m.mu.RLock()
+	initialEntropy := manifestPollEntropy(m.config)
+	m.mu.RUnlock()
+	delay := healthyManifestPollDelay(m.currentInterval(), initialEntropy)
+	var failures uint
 	for {
-		interval := m.currentInterval()
-		timer := time.NewTimer(interval)
+		timer := time.NewTimer(delay)
 		select {
 		case <-timer.C:
 			ctx, cancel := context.WithTimeout(context.Background(), conf.DefaultNodeTimeout*time.Second)
@@ -176,6 +261,14 @@ func (m *Monitor) run() {
 			cancel()
 			if err != nil {
 				log.WithField("err", err).Warn("Poll agent assignment manifest failed; keeping current nodes")
+				failures++
+				delay = manifestPollDelay(m.currentInterval(), failures, uint64(time.Now().UnixNano()))
+			} else {
+				failures = 0
+				m.mu.RLock()
+				entropy := manifestPollEntropy(m.config)
+				m.mu.RUnlock()
+				delay = healthyManifestPollDelay(m.currentInterval(), entropy)
 			}
 		case <-m.wake:
 			if !timer.Stop() {
@@ -184,6 +277,9 @@ func (m *Monitor) run() {
 				default:
 				}
 			}
+			// Apply credentials/configuration changes immediately; a previous
+			// remote failure must not delay maintenance or a deliberate wake-up.
+			delay = 0
 		case <-m.stop:
 			if !timer.Stop() {
 				select {
@@ -266,19 +362,13 @@ func (m *Monitor) pollOnce(ctx context.Context) error {
 	m.mu.Unlock()
 
 	if !componentAware {
-		if legacyChanged && m.reloadCh != nil {
-			select {
-			case m.reloadCh <- struct{}{}:
-			default:
-			}
+		if legacyChanged {
+			m.signalReload("legacy:" + revision)
 		}
 		return nil
 	}
-	if nodeChanged && m.reloadCh != nil {
-		select {
-		case m.reloadCh <- struct{}{}:
-		default:
-		}
+	if nodeChanged {
+		m.signalReload("node:" + nodeRevision)
 		return nil
 	}
 	if fallbackChanged && fallbackCh != nil && hotSwappableFallback(manifest.GlobalDeviceLimitConfig) {
@@ -301,13 +391,42 @@ func (m *Monitor) pollOnce(ctx context.Context) error {
 	}
 	// Device-limiter changes need a complete controller reconciliation. The hot
 	// path above is deliberately limited to Enable=false user-list fallback.
-	if fallbackChanged && m.reloadCh != nil {
-		select {
-		case m.reloadCh <- struct{}{}:
-		default:
-		}
+	if fallbackChanged {
+		m.signalReload("fallback:" + fallbackRevision)
 	}
 	return nil
+}
+
+// signalReload coalesces a desired full-runtime update while it is waiting to
+// be applied. A different desired revision always gets an immediate attempt;
+// failed attempts for the same revision back off so a drain failure cannot
+// interrupt listeners on every manifest poll.
+func (m *Monitor) signalReload(revision string) {
+	if revision == "" || m.reloadCh == nil {
+		return
+	}
+	m.mu.Lock()
+	now := m.now()
+	if revision == m.pendingReloadRevision && now.Before(m.nextReloadAt) {
+		m.mu.Unlock()
+		return
+	}
+	if revision != m.pendingReloadRevision {
+		m.pendingReloadRevision = revision
+		m.reloadAttempts = 0
+	}
+	m.reloadAttempts++
+	m.nextReloadAt = now.Add(manifestReloadRetryDelay(m.reloadAttempts, uint64(now.UnixNano())))
+	m.mu.Unlock()
+
+	select {
+	case m.reloadCh <- struct{}{}:
+	default:
+	}
+}
+
+func manifestReloadRetryDelay(attempt uint, entropy uint64) time.Duration {
+	return manifestPollDelay(manifestReloadRetryBase, attempt, entropy)
 }
 
 func hotSwappableFallback(config *conf.GlobalDeviceLimitConfig) bool {

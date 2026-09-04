@@ -1,17 +1,22 @@
 package core
 
 import (
+	"context"
 	"fmt"
 
 	panel "github.com/AZZ-vopp/znode/api/v2board"
 )
 
 func (v *V2Core) AddNode(tag string, info *panel.NodeInfo) error {
+	return v.AddNodeContext(context.Background(), tag, info)
+}
+
+func (v *V2Core) AddNodeContext(ctx context.Context, tag string, info *panel.NodeInfo) error {
 	inBoundConfig, err := buildInbound(info, tag)
 	if err != nil {
 		return fmt.Errorf("build inbound error: %s", err)
 	}
-	err = v.addInbound(inBoundConfig)
+	err = v.addInboundContext(ctx, inBoundConfig)
 	if err != nil {
 		return fmt.Errorf("add inbound error: %s", err)
 	}
@@ -19,7 +24,11 @@ func (v *V2Core) AddNode(tag string, info *panel.NodeInfo) error {
 }
 
 func (v *V2Core) DelNode(tag string) error {
-	err := v.removeInbound(tag)
+	return v.DelNodeContext(context.Background(), tag)
+}
+
+func (v *V2Core) DelNodeContext(ctx context.Context, tag string) error {
+	err := v.removeInboundContext(ctx, tag)
 	if err != nil {
 		return fmt.Errorf("remove in error: %s", err)
 	}

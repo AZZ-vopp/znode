@@ -126,8 +126,8 @@ func New() *Conf {
 			UplinkOnly:   2,
 			DownlinkOnly: 4,
 			BufferSize:   128,
-			// Keep UDP/QUIC content sniffing on so domain rules can route TikTok
-			// QUIC traffic through the selected outbound (for example WireGuard).
+			// Keep UDP/QUIC content sniffing enabled by default so domain rules can
+			// route QUIC. The panel can disable it explicitly for selected Node IDs.
 			DisableUDPContentSniffing: false,
 			MaxConnectionsPerUser:     128,
 			MaxConnections:            32768,

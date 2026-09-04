@@ -1,11 +1,11 @@
 # Build go
-FROM golang:1.26.5-alpine AS builder
+FROM golang:1.27.1-alpine AS builder
 WORKDIR /app
 COPY . .
 ENV CGO_ENABLED=0
 RUN apk --update --no-cache add patch
-RUN GOEXPERIMENT=jsonv2 go mod download
-RUN GOEXPERIMENT=jsonv2 ./script/with-xray-core.sh go build -v -o znode
+RUN go mod download
+RUN ./script/with-xray-core.sh go build -v -o znode
 
 FROM alpine AS geodata
 RUN apk --update --no-cache add ca-certificates curl \

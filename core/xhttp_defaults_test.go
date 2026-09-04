@@ -70,6 +70,21 @@ func TestXHTTPAntiTSPUDefaultsApplyInsideExtra(t *testing.T) {
 	}
 }
 
+func TestXHTTPAntiTSPUDefaultsNormalizeEmptyArrayExtra(t *testing.T) {
+	config := &coreConf.SplitHTTPConfig{Extra: json.RawMessage(`[]`)}
+	if err := applyXHTTPAntiTSPUDefaults(config); err != nil {
+		t.Fatalf("apply xhttp defaults to empty array: %v", err)
+	}
+
+	var extra coreConf.SplitHTTPConfig
+	if err := json.Unmarshal(config.Extra, &extra); err != nil {
+		t.Fatalf("decode normalized extra: %v", err)
+	}
+	if extra.Xmux.MaxConnections.From != 3 || extra.Xmux.MaxConnections.To != 3 {
+		t.Fatalf("normalized maxConnections = %#v, want 3-3", extra.Xmux.MaxConnections)
+	}
+}
+
 func TestXHTTPAntiTSPUDefaultsReachDownloadSettings(t *testing.T) {
 	download := &coreConf.SplitHTTPConfig{}
 	config := &coreConf.SplitHTTPConfig{

@@ -1,13 +1,35 @@
 package core
 
 import (
+	"context"
+	"errors"
 	"sync"
 	"testing"
+	"time"
 
 	panel "github.com/AZZ-vopp/znode/api/v2board"
 	"github.com/AZZ-vopp/znode/common/counter"
 	"github.com/AZZ-vopp/znode/core/app/dispatcher"
 )
+
+func TestPrepareUserTrafficCaptureContextReturnsAtDeadlineWhenUserMapIsWriteLocked(t *testing.T) {
+	core := New(nil)
+	core.dispatcher = &dispatcher.DefaultDispatcher{}
+	core.users.mapLock.Lock()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel()
+	started := time.Now()
+	_, err := core.PrepareUserTrafficCaptureContext(ctx, "node", 0)
+	core.users.mapLock.Unlock()
+
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("capture error = %v, want context deadline exceeded", err)
+	}
+	if elapsed := time.Since(started); elapsed > time.Second {
+		t.Fatalf("capture ignored its context while waiting for the user map: %v", elapsed)
+	}
+}
 
 func TestGetUserTrafficSnapshotAggregatesByUIDWithoutReset(t *testing.T) {
 	core := New(nil)

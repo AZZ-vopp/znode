@@ -47,12 +47,23 @@ func unmarshalNetworkSettings(raw json.RawMessage, target any) error {
 }
 
 func (v *V2Core) removeInbound(tag string) error {
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	return v.removeInboundContext(context.Background(), tag)
+}
+
+func (v *V2Core) removeInboundContext(parent context.Context, tag string) error {
+	ctx, cancel := context.WithTimeout(parent, 10*time.Second)
 	defer cancel()
 	return v.ihm.RemoveHandler(ctx, tag)
 }
 
 func (v *V2Core) addInbound(config *core.InboundHandlerConfig) error {
+	return v.addInboundContext(context.Background(), config)
+}
+
+func (v *V2Core) addInboundContext(parent context.Context, config *core.InboundHandlerConfig) error {
+	if err := parent.Err(); err != nil {
+		return err
+	}
 	rawHandler, err := core.CreateObject(v.Server, config)
 	if err != nil {
 		return err
@@ -61,7 +72,7 @@ func (v *V2Core) addInbound(config *core.InboundHandlerConfig) error {
 	if !ok {
 		return fmt.Errorf("not an InboundHandler: %s", err)
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	ctx, cancel := context.WithTimeout(parent, 10*time.Second)
 	defer cancel()
 	if err := v.ihm.AddHandler(ctx, handler); err != nil {
 		return err

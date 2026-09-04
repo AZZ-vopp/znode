@@ -1,6 +1,7 @@
 package dispatcher
 
 import (
+	"context"
 	"errors"
 	"io"
 	"sync"
@@ -9,7 +10,36 @@ import (
 	"time"
 
 	"github.com/xtls/xray-core/common/buf"
+	"github.com/xtls/xray-core/common/session"
 )
+
+func TestUDPContentSniffingChoiceIsScopedToInbound(t *testing.T) {
+	legacy := true
+	disabled := true
+	enabled := false
+	d := &DefaultDispatcher{}
+	d.ConfigureUDPContentSniffing(legacy)
+	d.ConfigureUDPContentSniffingByInbound(map[string]*bool{"node-a": &disabled, "node-b": &enabled})
+	if !d.udpContentSniffingDisabled(session.ContextWithInbound(context.Background(), &session.Inbound{Tag: "node-a"})) {
+		t.Fatal("node-a explicit choice was ignored")
+	}
+	if d.udpContentSniffingDisabled(session.ContextWithInbound(context.Background(), &session.Inbound{Tag: "node-b"})) {
+		t.Fatal("node-b explicit choice was ignored")
+	}
+	if !d.udpContentSniffingDisabled(session.ContextWithInbound(context.Background(), &session.Inbound{Tag: "legacy-node"})) {
+		t.Fatal("missing panel field must retain local legacy setting")
+	}
+
+	other := &DefaultDispatcher{}
+	other.ConfigureUDPContentSniffing(false)
+	other.ConfigureUDPContentSniffingByInbound(map[string]*bool{"node-a": &enabled})
+	if other.udpContentSniffingDisabled(session.ContextWithInbound(context.Background(), &session.Inbound{Tag: "node-a"})) {
+		t.Fatal("node choice leaked between dispatcher instances")
+	}
+	if !d.udpContentSniffingDisabled(session.ContextWithInbound(context.Background(), &session.Inbound{Tag: "node-a"})) {
+		t.Fatal("configuring a new runtime changed the existing dispatcher")
+	}
+}
 
 type barrierTestReader struct {
 	started     chan struct{}
@@ -527,6 +557,35 @@ func TestCloseAllBoundsBlockingShutdownHooks(t *testing.T) {
 	<-underlyingWriter.done
 	if err := manager.CloseAll(); err != nil {
 		t.Fatalf("close retry failed after shutdown hooks completed: %v", err)
+	}
+}
+
+func TestQuiesceTagContextUsesCallerDeadlineForBlockingShutdownHooks(t *testing.T) {
+	reader := &blockingShutdownReader{started: make(chan struct{}), release: make(chan struct{}), done: make(chan struct{})}
+	writer := &blockingShutdownWriter{started: make(chan struct{}), release: make(chan struct{}), done: make(chan struct{})}
+	defer func() {
+		close(reader.release)
+		close(writer.release)
+		<-reader.done
+		<-writer.done
+	}()
+	manager := &LinkManager{links: make(map[*ManagedWriter]buf.Reader), drainTimeout: time.Second}
+	managedWriter := &ManagedWriter{writer: writer, manager: manager}
+	if !manager.AddLink(managedWriter, reader) {
+		t.Fatal("test link was rejected")
+	}
+	dispatcher := &DefaultDispatcher{maxConnectionsPerUser: 4, maxConnections: 16}
+	dispatcher.LinkManagers.Store("terminal|user", manager)
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel()
+
+	started := time.Now()
+	err := dispatcher.QuiesceTagContext(ctx, "terminal")
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("quiesce error = %v, want context deadline exceeded", err)
+	}
+	if elapsed := time.Since(started); elapsed > time.Second {
+		t.Fatalf("quiesce ignored caller deadline for %v", elapsed)
 	}
 }
 

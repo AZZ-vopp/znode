@@ -75,6 +75,27 @@ func TestWebUserListAlwaysWinsOverRedisFallback(t *testing.T) {
 	}
 }
 
+func TestRedisPrimaryFallsBackToLiveWebWhenSnapshotIsUnavailable(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"users":[{"id":1,"uuid":"web-fallback","device_limit":1}]}`))
+	}))
+	defer server.Close()
+	client, err := New(&conf.NodeConfig{
+		APIHost: server.URL, NodeID: 7, Key: "agent-secret", AgentID: "agent-1",
+		GlobalDeviceLimitConfig: &conf.GlobalDeviceLimitConfig{
+			RedisNetwork: "unsupported", UserFallbackEnabled: true, UserSourceMode: "redis_primary",
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	users, err := client.GetUserList(context.Background())
+	if err != nil || len(users) != 1 || users[0].Uuid != "web-fallback" {
+		t.Fatalf("live Web fallback failed in Redis-primary mode: users=%+v err=%v", users, err)
+	}
+}
+
 func TestAuthorizationFailureNeverFallsBackToRedis(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		http.Error(w, "revoked", http.StatusUnauthorized)

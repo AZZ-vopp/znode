@@ -27,7 +27,11 @@ import (
 )
 
 func (v *V2Core) GetUserManager(tag string) (proxy.UserManager, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	return v.GetUserManagerContext(context.Background(), tag)
+}
+
+func (v *V2Core) GetUserManagerContext(parent context.Context, tag string) (proxy.UserManager, error) {
+	ctx, cancel := context.WithTimeout(parent, 30*time.Second)
 	defer cancel()
 	handler, err := v.ihm.GetHandler(ctx, tag)
 	if err != nil {
@@ -57,10 +61,16 @@ func (vc *V2Core) DelUsers(users []panel.UserInfo, tag string, _ *panel.NodeInfo
 // mutating its user manager. Controller shutdown uses this after removing the
 // listener and before its final durable traffic capture.
 func (vc *V2Core) QuiesceNodeLinks(tag string) error {
+	return vc.QuiesceNodeLinksContext(context.Background(), tag)
+}
+
+// QuiesceNodeLinksContext retains the tag rejection barrier while applying a
+// terminal caller's deadline to the drain accounting wait.
+func (vc *V2Core) QuiesceNodeLinksContext(ctx context.Context, tag string) error {
 	if vc == nil || vc.dispatcher == nil || tag == "" {
 		return nil
 	}
-	return vc.dispatcher.QuiesceTag(tag)
+	return vc.dispatcher.QuiesceTagContext(ctx, tag)
 }
 
 // ReactivateNodeLinks removes the tag/user admission barriers installed by a
@@ -75,13 +85,20 @@ func (vc *V2Core) ReactivateNodeLinks(tag string) {
 // QuiesceUsers prevents new sessions and closes current links while retaining
 // the UID mapping and counters for one final durable capture.
 func (vc *V2Core) QuiesceUsers(users []panel.UserInfo, tag string) ([]panel.UserInfo, error) {
-	userManager, err := vc.GetUserManager(tag)
+	return vc.QuiesceUsersContext(context.Background(), users, tag)
+}
+
+func (vc *V2Core) QuiesceUsersContext(ctx context.Context, users []panel.UserInfo, tag string) ([]panel.UserInfo, error) {
+	userManager, err := vc.GetUserManagerContext(ctx, tag)
 	if err != nil {
 		return nil, fmt.Errorf("get user manager error: %s", err)
 	}
 	completed := make([]panel.UserInfo, 0, len(users))
 	var quiesceErrors error
 	for i := range users {
+		if err := ctx.Err(); err != nil {
+			return completed, errors.Join(quiesceErrors, err)
+		}
 		user := format.UserTag(tag, users[i].Uuid)
 		vc.users.mapLock.RLock()
 		_, alreadyQuiesced := vc.users.quiesced[user]
@@ -93,7 +110,7 @@ func (vc *V2Core) QuiesceUsers(users []panel.UserInfo, tag string) ([]panel.User
 		// Install the rejection barrier before removing the runtime credential.
 		// Otherwise a session that finishes authentication in this small window
 		// can create a fresh link after the old links are closed.
-		quiesceErr := vc.dispatcher.QuiesceUser(user)
+		quiesceErr := vc.dispatcher.QuiesceUserContext(ctx, user)
 		// QuiesceUser installs its fail-closed sentinel before it waits for old
 		// reads to drain. Include this credential even on a timeout so a core
 		// rebuild cannot accidentally re-authorize it.
@@ -103,8 +120,8 @@ func (vc *V2Core) QuiesceUsers(users []panel.UserInfo, tag string) ([]panel.User
 				fmt.Errorf("drain user %s: %w", format.RedactUserTag(user), quiesceErr))
 			continue
 		}
-		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-		err = userManager.RemoveUser(ctx, user)
+		removeCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+		err = userManager.RemoveUser(removeCtx, user)
 		cancel()
 		if err != nil {
 			// Keep processing the remaining requested revocations. One malformed or
@@ -177,16 +194,39 @@ func (capture *UserTrafficCapture) Commit() {
 }
 
 func (vc *V2Core) PrepareUserTrafficCapture(tag string, mintraffic int) (*UserTrafficCapture, error) {
+	return vc.PrepareUserTrafficCaptureContext(context.Background(), tag, mintraffic)
+}
+
+// PrepareUserTrafficCaptureContext is the cooperative controller boundary for
+// final accounting. It observes cancellation both while waiting for the user
+// ownership map and while ranging live counters, so terminal core close never
+// has to abandon an admitted capture goroutine.
+func (vc *V2Core) PrepareUserTrafficCaptureContext(ctx context.Context, tag string, mintraffic int) (*UserTrafficCapture, error) {
 	if mintraffic < 0 || int64(mintraffic) > math.MaxInt64/1000 {
 		return nil, fmt.Errorf("invalid minimum traffic threshold")
 	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	capture := &UserTrafficCapture{Snapshot: make(map[int]int64)}
 	var captureErr error
-	vc.users.mapLock.RLock()
+	if err := readLockUserMapContext(ctx, &vc.users.mapLock); err != nil {
+		return nil, err
+	}
 	defer vc.users.mapLock.RUnlock()
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	if value, ok := vc.dispatcher.Counter.Load(tag); ok {
 		trafficCounter := value.(*counter.TrafficCounter)
 		trafficCounter.Counters.Range(func(key, value interface{}) bool {
+			if err := ctx.Err(); err != nil {
+				captureErr = err
+				return false
+			}
 			email := key.(string)
 			traffic := value.(*counter.TrafficStorage)
 			up := traffic.UpCounter.Load()
@@ -238,6 +278,21 @@ func (vc *V2Core) PrepareUserTrafficCapture(tag string, mintraffic int) (*UserTr
 	return capture, nil
 }
 
+func readLockUserMapContext(ctx context.Context, mutex *sync.RWMutex) error {
+	ticker := time.NewTicker(time.Millisecond)
+	defer ticker.Stop()
+	for {
+		if mutex.TryRLock() {
+			return nil
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-ticker.C:
+		}
+	}
+}
+
 // GetUserTrafficSnapshotAndSlice preserves the legacy immediate-capture API.
 // Controller reporting uses PrepareUserTrafficCapture so disk persistence
 // happens before Commit.
@@ -270,6 +325,10 @@ func (vc *V2Core) GetUserTrafficSnapshot(tag string) map[int]int64 {
 }
 
 func (v *V2Core) AddUsers(p *AddUsersParams) (added int, err error) {
+	return v.AddUsersContext(context.Background(), p)
+}
+
+func (v *V2Core) AddUsersContext(ctx context.Context, p *AddUsersParams) (added int, err error) {
 	if p == nil || p.NodeInfo == nil || p.Common == nil {
 		return 0, fmt.Errorf("invalid add-users parameters")
 	}
@@ -306,14 +365,21 @@ func (v *V2Core) AddUsers(p *AddUsersParams) (added int, err error) {
 		}
 		memoryUsers = append(memoryUsers, memoryUser)
 	}
-	man, err := v.GetUserManager(p.Tag)
+	man, err := v.GetUserManagerContext(ctx, p.Tag)
 	if err != nil {
 		return 0, fmt.Errorf("get user manager error: %s", err)
 	}
 	addedEmails := make([]string, 0, len(memoryUsers))
 	for _, memoryUser := range memoryUsers {
-		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-		err = man.AddUser(ctx, memoryUser)
+		if err := ctx.Err(); err != nil {
+			rollbackErr := removeRuntimeUsers(man, addedEmails)
+			if rollbackErr != nil {
+				return 0, fmt.Errorf("add users canceled: %w; rollback failed: %v", err, rollbackErr)
+			}
+			return 0, err
+		}
+		addCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+		err = man.AddUser(addCtx, memoryUser)
 		cancel()
 		if err != nil {
 			rollbackErr := removeRuntimeUsers(man, addedEmails)

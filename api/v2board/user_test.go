@@ -68,6 +68,49 @@ func TestUserRevisionAcceptsOnlyTheAuthenticatedHexMarker(t *testing.T) {
 	}
 }
 
+func TestRedisPrimaryStillChecksPanelRevisionForAuthorization(t *testing.T) {
+	const revision = "0123456789abcdef0123456789abcdef"
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+		if request.URL.Path != userRevisionPath {
+			t.Fatalf("unexpected revision path %q", request.URL.Path)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"revision":"` + revision + `"}`))
+	}))
+	defer server.Close()
+	client, err := New(&conf.NodeConfig{
+		APIHost: server.URL, NodeID: 2, Key: "agent-token", AgentID: "agent-a",
+		GlobalDeviceLimitConfig: &conf.GlobalDeviceLimitConfig{UserSourceMode: "redis_primary"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, err := client.GetUserRevision(context.Background()); err != nil || got != revision {
+		t.Fatalf("redis-primary revision=%q err=%v, want authenticated marker", got, err)
+	}
+}
+
+func TestRedisPrimaryDoesNotBypassPanelAuthorizationFailure(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+		if request.URL.Path == userRevisionPath {
+			http.Error(w, "revoked", http.StatusUnauthorized)
+			return
+		}
+		http.NotFound(w, request)
+	}))
+	defer server.Close()
+	client, err := New(&conf.NodeConfig{
+		APIHost: server.URL, NodeID: 2, Key: "agent-token", AgentID: "agent-a",
+		GlobalDeviceLimitConfig: &conf.GlobalDeviceLimitConfig{UserSourceMode: "redis_primary"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := client.GetUserList(context.Background()); err == nil || !strings.Contains(err.Error(), "HTTP 401") {
+		t.Fatalf("Redis-primary bypassed revoked panel credentials: %v", err)
+	}
+}
+
 func TestUserRevisionRejectsMalformedSuccessfulResponse(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "application/json")

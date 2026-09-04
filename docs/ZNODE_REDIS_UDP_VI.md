@@ -86,13 +86,17 @@ không làm Pub/Sub nhanh hơn. Redis nên nằm cùng private network với ZNo
   luồng video UDP/QUIC, nhưng vẫn thấp hơn mặc định 512 KiB của Xray trên amd64.
 - `ConnIdle` mặc định 120 giây để các luồng video tải trước không bị ngắt quá
   sớm trong lúc tạm thời không truyền dữ liệu.
-- `DisableUDPContentSniffing=false` giữ gói QUIC đầu tiên để nhận diện hostname.
-  Nhờ đó rule hostname có thể route UDP/QUIC TikTok qua WireGuard thay vì rơi
-  vào route mặc định. Đổi thành `true` chỉ khi không cần domain routing cho UDP
-  và chấp nhận traffic QUIC không được phân loại theo hostname.
-- Cài mới dùng `false`. Khi nâng cấp, installer giữ nguyên giá trị hiện có để
-  không ghi đè lựa chọn của operator. Máy cũ đang để `true` cần đổi thủ công
-  thành `false` rồi restart ZNode nếu dùng rule TikTok theo domain.
+- Web Admin lưu `disable_udp_content_sniffing` riêng theo từng Node ID và mặc
+  định là `false`. Node cần route TikTok/YouTube QUIC theo hostname giữ công tắc
+  “Tắt nhận diện UDP/QUIC” ở trạng thái tắt để ZNode sniff gói QUIC đầu tiên.
+- Với Node Meta/Facebook không ổn định trên một số tuyến VPS Việt Nam, bật công
+  tắc đó riêng cho Node ID tương ứng. Khi bật, rule hostname vẫn áp dụng cho
+  TCP/TLS, còn UDP/QUIC chỉ có IP sẽ không được phân loại theo tên miền.
+- Hai Node ID chạy chung một Agent/VPS có thể dùng hai lựa chọn khác nhau; ZNode
+  ánh xạ cờ theo inbound tag của từng node. Giá trị `ConnectionConfig` cục bộ
+  chỉ là fallback khi kết nối tới panel cũ chưa trả trường per-node.
+- Khi nâng cấp, installer luôn giữ nguyên giá trị hiện có, không ghi đè lựa chọn
+  của operator.
 - Sniffing inbound mặc định tắt khi node không có rule domain/protocol. Khi có
   rule cần nhận diện nội dung, ZNode dùng `routeOnly=true`: hostname chỉ phục vụ
   chọn route, không thay IP đích bằng kết quả DNS của VPS. Cơ chế này tránh lỗi
@@ -111,13 +115,13 @@ riêng.
 ## Kiểm thử
 
 ```bash
-GOEXPERIMENT=jsonv2 ./script/with-xray-core.sh go test ./...
-GOEXPERIMENT=jsonv2 ./script/with-xray-core.sh go test -bench BenchmarkDeviceTrackerSameIP -benchmem ./limiter
+./script/with-xray-core.sh go test ./...
+./script/with-xray-core.sh go test -bench BenchmarkDeviceTrackerSameIP -benchmem ./limiter
 ```
 
 Race detector cần CGO và một C compiler (`gcc`/MinGW). Sau khi cài toolchain,
 nên chạy thêm:
 
 ```bash
-CGO_ENABLED=1 GOEXPERIMENT=jsonv2 ./script/with-xray-core.sh go test -race ./...
+CGO_ENABLED=1 ./script/with-xray-core.sh go test -race ./...
 ```

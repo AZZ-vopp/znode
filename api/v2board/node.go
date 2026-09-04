@@ -80,6 +80,9 @@ type CommonNode struct {
 	//tuic
 	CongestionControl string `json:"congestion_control"`
 	ZeroRTTHandshake  bool   `json:"zero_rtt_handshake"`
+	// Nil means an older panel did not send the per-node choice, so ZNode keeps
+	// the local legacy ConnectionConfig behavior for compatibility.
+	DisableUDPContentSniffing *bool `json:"disable_udp_content_sniffing,omitempty"`
 	//anytls
 	PaddingScheme []string `json:"padding_scheme,omitempty"`
 	//hysteria hysteria2

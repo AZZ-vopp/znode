@@ -53,11 +53,11 @@ hoặc tự thay URL tải bằng nguồn không tin cậy.
 
 ## Biên dịch
 
-Yêu cầu Go 1.26.5 và experiment JSON v2:
+Yêu cầu Go 1.27.1. `encoding/json/v2` đã ổn định từ Go 1.27:
 
 ```bash
-GOEXPERIMENT=jsonv2 ./script/with-xray-core.sh go test ./...
-GOEXPERIMENT=jsonv2 ./script/with-xray-core.sh go build -v -o build_assets/znode \
+./script/with-xray-core.sh go test ./...
+./script/with-xray-core.sh go build -v -o build_assets/znode \
   -trimpath \
   -ldflags "-X 'github.com/AZZ-vopp/znode/cmd.version=dev' -s -w -buildid="
 ```

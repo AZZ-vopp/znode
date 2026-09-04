@@ -125,20 +125,21 @@ func (r *cachedReader) Interrupt() {
 
 // DefaultDispatcher is a default implementation of Dispatcher.
 type DefaultDispatcher struct {
-	ohm                       outbound.Manager
-	router                    routing.Router
-	policy                    policy.Manager
-	stats                     stats.Manager
-	fdns                      dns.FakeDNSEngine
-	Counter                   sync.Map
-	LinkManagers              sync.Map // map[string]*LinkManager
-	quiescedTags              sync.Map // map[string]struct{}
-	linkManagersMu            sync.Mutex
-	disableUDPContentSniffing bool
-	activeLinks               atomic.Int64
-	maxConnectionsPerUser     int
-	maxConnections            int
-	drainTimeout              time.Duration
+	ohm                                outbound.Manager
+	router                             routing.Router
+	policy                             policy.Manager
+	stats                              stats.Manager
+	fdns                               dns.FakeDNSEngine
+	Counter                            sync.Map
+	LinkManagers                       sync.Map // map[string]*LinkManager
+	quiescedTags                       sync.Map // map[string]struct{}
+	linkManagersMu                     sync.Mutex
+	disableUDPContentSniffing          bool
+	disableUDPContentSniffingByInbound map[string]bool
+	activeLinks                        atomic.Int64
+	maxConnectionsPerUser              int
+	maxConnections                     int
+	drainTimeout                       time.Duration
 }
 
 func (d *DefaultDispatcher) trafficDrainTimeout() time.Duration {
@@ -160,6 +161,37 @@ var runtimeMaxConnections atomic.Int64
 
 func ConfigureUDPContentSniffing(disabled bool) {
 	runtimeDisableUDPContentSniffing.Store(disabled)
+}
+
+// ConfigureUDPContentSniffing sets the legacy fallback on this dispatcher
+// instance. V2Core calls it before Start so concurrent core construction
+// cannot exchange process-global fallback values.
+func (d *DefaultDispatcher) ConfigureUDPContentSniffing(disabled bool) {
+	d.disableUDPContentSniffing = disabled
+}
+
+// ConfigureUDPContentSniffingByInbound stores explicit Node choices on this
+// dispatcher instance. Keeping the map instance-scoped prevents a failed
+// transactional reload from changing the behavior of the still-running core.
+func (d *DefaultDispatcher) ConfigureUDPContentSniffingByInbound(choices map[string]*bool) {
+	next := make(map[string]bool, len(choices))
+	for tag, disabled := range choices {
+		if disabled != nil {
+			next[tag] = *disabled
+		}
+	}
+	d.disableUDPContentSniffingByInbound = next
+}
+
+func (d *DefaultDispatcher) udpContentSniffingDisabled(ctx context.Context) bool {
+	inbound := session.InboundFromContext(ctx)
+	if inbound != nil {
+		value, ok := d.disableUDPContentSniffingByInbound[inbound.Tag]
+		if ok {
+			return value
+		}
+	}
+	return d.disableUDPContentSniffing
 }
 
 func ConfigureSessionLimits(perUser, global int) {
@@ -276,6 +308,10 @@ func (d *DefaultDispatcher) addManagedLink(user string, writer *ManagedWriter, r
 // session authenticated just before RemoveUser cannot create a fresh manager
 // after the old links have been closed.
 func (d *DefaultDispatcher) QuiesceUser(user string) error {
+	return d.QuiesceUserContext(context.Background(), user)
+}
+
+func (d *DefaultDispatcher) QuiesceUserContext(ctx context.Context, user string) error {
 	d.linkManagersMu.Lock()
 	value, _ := d.LinkManagers.LoadOrStore(user, d.newLinkManager(user))
 	manager := value.(*LinkManager)
@@ -285,7 +321,7 @@ func (d *DefaultDispatcher) QuiesceUser(user string) error {
 	// The quiesced sentinel is already visible in LinkManagers. Closing pipes
 	// and waiting for their final counter reads no longer serializes lifecycle
 	// operations for every other user in the process.
-	return manager.finishCloseAll(shutdowns)
+	return manager.finishCloseAllContext(ctx, shutdowns)
 }
 
 // QuiesceTag closes every established session on one inbound and rejects a
@@ -293,6 +329,12 @@ func (d *DefaultDispatcher) QuiesceUser(user string) error {
 // A single tag sentinel avoids allocating one empty LinkManager per offline
 // account when a node with a large user list is drained for reload/shutdown.
 func (d *DefaultDispatcher) QuiesceTag(tag string) error {
+	return d.QuiesceTagContext(context.Background(), tag)
+}
+
+// QuiesceTagContext applies the caller's terminal-shutdown deadline while
+// retaining QuiesceTag's persistent admission barrier.
+func (d *DefaultDispatcher) QuiesceTagContext(ctx context.Context, tag string) error {
 	type drain struct {
 		manager   *LinkManager
 		shutdowns []*managedLinkShutdown
@@ -317,6 +359,11 @@ func (d *DefaultDispatcher) QuiesceTag(tag string) error {
 	// blocked first reader could prevent later readers from ever receiving their
 	// interruption signal.
 	deadline := time.Now().Add(d.trafficDrainTimeout())
+	callerDeadlineBound := false
+	if callerDeadline, ok := ctx.Deadline(); ok && callerDeadline.Before(deadline) {
+		deadline = callerDeadline
+		callerDeadlineBound = true
+	}
 	var drainErr error
 	for _, item := range drains {
 		for _, shutdown := range item.shutdowns {
@@ -327,6 +374,14 @@ func (d *DefaultDispatcher) QuiesceTag(tag string) error {
 		if err := item.manager.waitForCounterReads(time.Until(deadline)); err != nil {
 			drainErr = stderrors.Join(drainErr, err)
 		}
+	}
+	if err := ctx.Err(); err != nil {
+		drainErr = stderrors.Join(drainErr, err)
+	} else if callerDeadlineBound && !time.Now().Before(deadline) {
+		// The timer used by managed links can reach the same wall-clock deadline
+		// a few scheduler ticks before ctx.Done() is delivered. Preserve the
+		// caller-visible deadline cause in that narrow window.
+		drainErr = stderrors.Join(drainErr, context.DeadlineExceeded)
 	}
 	return drainErr
 }
@@ -561,7 +616,7 @@ func (d *DefaultDispatcher) Dispatch(ctx context.Context, destination net.Destin
 				reader: outbound.Reader.(*pipe.Reader),
 			}
 			outbound.Reader = cReader
-			metadataOnly := sniffingRequest.MetadataOnly || (destination.Network == net.Network_UDP && d.disableUDPContentSniffing)
+			metadataOnly := sniffingRequest.MetadataOnly || (destination.Network == net.Network_UDP && d.udpContentSniffingDisabled(ctx))
 			result, err := sniffer(ctx, cReader, metadataOnly, destination.Network)
 			if err == nil {
 				content.Protocol = result.Protocol()
@@ -671,7 +726,7 @@ func (d *DefaultDispatcher) DispatchLink(ctx context.Context, destination net.De
 			reader: outbound.Reader.(buf.TimeoutReader),
 		}
 		outbound.Reader = cReader
-		metadataOnly := sniffingRequest.MetadataOnly || (destination.Network == net.Network_UDP && d.disableUDPContentSniffing)
+		metadataOnly := sniffingRequest.MetadataOnly || (destination.Network == net.Network_UDP && d.udpContentSniffingDisabled(ctx))
 		result, err := sniffer(ctx, cReader, metadataOnly, destination.Network)
 		if err == nil {
 			content.Protocol = result.Protocol()

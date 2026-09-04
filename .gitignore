@@ -13,6 +13,8 @@ example/.lego
 example/cert
 ./vscode
 output/*
+build_assets/
+corexrayr/
 .idea/*
 new.sh
 quick_update.sh

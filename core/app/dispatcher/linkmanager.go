@@ -1,6 +1,7 @@
 package dispatcher
 
 import (
+	"context"
 	"errors"
 	"io"
 	"sync"
@@ -219,6 +220,10 @@ func (m *LinkManager) trafficDrainTimeout() time.Duration {
 }
 
 func (m *LinkManager) waitForCounterReads(timeout time.Duration) error {
+	return m.waitForCounterReadsContext(context.Background(), timeout)
+}
+
+func (m *LinkManager) waitForCounterReadsContext(ctx context.Context, timeout time.Duration) error {
 	m.mu.RLock()
 	if m.activeReads == 0 {
 		m.mu.RUnlock()
@@ -235,6 +240,8 @@ func (m *LinkManager) waitForCounterReads(timeout time.Duration) error {
 	select {
 	case <-drained:
 		return nil
+	case <-ctx.Done():
+		return ctx.Err()
 	case <-timer.C:
 		return ErrTrafficDrainTimeout
 	}
@@ -362,6 +369,10 @@ func (s *managedLinkShutdown) result() (error, bool) {
 }
 
 func (s *managedLinkShutdown) waitUntil(deadline time.Time) error {
+	return s.waitUntilContext(context.Background(), deadline)
+}
+
+func (s *managedLinkShutdown) waitUntilContext(ctx context.Context, deadline time.Time) error {
 	remaining := time.Until(deadline)
 	if remaining <= 0 {
 		if err, done := s.result(); done {
@@ -375,21 +386,30 @@ func (s *managedLinkShutdown) waitUntil(deadline time.Time) error {
 	case <-s.done:
 		err, _ := s.result()
 		return err
+	case <-ctx.Done():
+		return ctx.Err()
 	case <-timer.C:
 		return ErrManagedLinkShutdownTimeout
 	}
 }
 
 func (m *LinkManager) finishCloseAll(shutdowns []*managedLinkShutdown) error {
+	return m.finishCloseAllContext(context.Background(), shutdowns)
+}
+
+func (m *LinkManager) finishCloseAllContext(ctx context.Context, shutdowns []*managedLinkShutdown) error {
 	deadline := time.Now().Add(m.trafficDrainTimeout())
+	if callerDeadline, ok := ctx.Deadline(); ok && callerDeadline.Before(deadline) {
+		deadline = callerDeadline
+	}
 	var shutdownErr error
 	for _, shutdown := range shutdowns {
-		shutdownErr = errors.Join(shutdownErr, shutdown.waitUntil(deadline))
+		shutdownErr = errors.Join(shutdownErr, shutdown.waitUntilContext(ctx, deadline))
 	}
 	// CounterReader publishes its final byte count before signaling the drain.
 	// The controller can therefore capture immediately after a successful
 	// CloseAll without racing a late read completion.
-	drainErr := m.waitForCounterReads(time.Until(deadline))
+	drainErr := m.waitForCounterReadsContext(ctx, time.Until(deadline))
 	return errors.Join(shutdownErr, drainErr)
 }
 

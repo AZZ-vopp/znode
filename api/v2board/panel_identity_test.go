@@ -94,6 +94,33 @@ func TestNodeConfigWithoutBaseConfigUsesSafeIntervals(t *testing.T) {
 	}
 }
 
+func TestNodeConfigKeepsUDPContentSniffingPresence(t *testing.T) {
+	for name, payload := range map[string]string{
+		"absent": `{"panel_type":"zboard","protocol":"vmess","listen_ip":"127.0.0.1","server_port":443,"network":"tcp","tls":0}`,
+		"false":  `{"panel_type":"zboard","protocol":"vmess","listen_ip":"127.0.0.1","server_port":443,"network":"tcp","tls":0,"disable_udp_content_sniffing":false}`,
+		"true":   `{"panel_type":"zboard","protocol":"vmess","listen_ip":"127.0.0.1","server_port":443,"network":"tcp","tls":0,"disable_udp_content_sniffing":true}`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { _, _ = w.Write([]byte(payload)) }))
+			defer server.Close()
+			client, err := New(&conf.NodeConfig{APIHost: server.URL, NodeID: 1, Key: "token", AgentID: "agent-a"})
+			if err != nil {
+				t.Fatal(err)
+			}
+			node, err := client.GetNodeInfo(context.Background())
+			if err != nil {
+				t.Fatal(err)
+			}
+			if name == "absent" && node.Common.DisableUDPContentSniffing != nil {
+				t.Fatal("absent field must remain nil")
+			}
+			if name != "absent" && (node.Common.DisableUDPContentSniffing == nil || *node.Common.DisableUDPContentSniffing != (name == "true")) {
+				t.Fatalf("unexpected setting: %+v", node.Common.DisableUDPContentSniffing)
+			}
+		})
+	}
+}
+
 func TestNodeConfigRejectsExecutableDNSProvider(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "application/json")

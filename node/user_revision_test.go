@@ -4,7 +4,19 @@ import (
 	"context"
 	"errors"
 	"testing"
+	"time"
 )
+
+func TestUserRevisionPollDelayStaggersWithinThreeSeconds(t *testing.T) {
+	first := userRevisionPollDelay(0)
+	second := userRevisionPollDelay(999)
+	if first != userRevisionPollInterval || second != 2999*time.Millisecond {
+		t.Fatalf("unexpected stagger: first=%s second=%s", first, second)
+	}
+	if first < 2*time.Second || second >= 3*time.Second {
+		t.Fatalf("stagger outside responsive range: first=%s second=%s", first, second)
+	}
+}
 
 type revisionClientStub struct {
 	revision string
