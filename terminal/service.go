@@ -9,7 +9,6 @@ import (
 	"os"
 	"os/exec"
 	"strconv"
-	"syscall"
 	"time"
 
 	panel "github.com/AZZ-vopp/znode/api/v2board"
@@ -235,7 +234,7 @@ func startPTY() (*os.File, *exec.Cmd, error) {
 
 func stopPTY(ptmx *os.File, cmd *exec.Cmd) {
 	if cmd != nil && cmd.Process != nil {
-		_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGTERM)
+		terminatePTYProcess(cmd, false)
 	}
 	if ptmx != nil {
 		_ = ptmx.Close()
@@ -250,7 +249,7 @@ func stopPTY(ptmx *os.File, cmd *exec.Cmd) {
 		case <-waitDone:
 		case <-time.After(5 * time.Second):
 			if cmd.Process != nil {
-				_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
+				terminatePTYProcess(cmd, true)
 			}
 			<-waitDone
 		}
