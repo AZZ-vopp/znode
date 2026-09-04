@@ -53,7 +53,10 @@ jobs:
           ./script/with-xray-core.sh go vet ./...
           ./script/with-xray-core.sh go test -race ./common/format ./api/v2board ./agent ./core/app/dispatcher ./core ./node ./limiter
       - name: Scan reachable Go vulnerabilities
-        run: ./script/with-xray-core.sh go run golang.org/x/vuln/cmd/govulncheck@v1.6.0 ./...
+        # govulncheck launches its own package loader and cannot inherit the
+        # wrapper's temporary -modfile. The checked-in replacement still pins
+        # the same Xray fork; source patches are covered by test/vet/race above.
+        run: go run golang.org/x/vuln/cmd/govulncheck@v1.6.0 ./...
       - name: Smoke build Docker builder
         run: docker build --target builder -t znode-builder-ci .
 
