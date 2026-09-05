@@ -46,11 +46,20 @@ type UserLimitInfo struct {
 }
 
 func AddLimiter(nodetype string, tag string, users []panel.UserInfo, alive map[int]int, deviceConfig *conf.GlobalDeviceLimitConfig, namespace string) *Limiter {
+	// Every limiter key is a user credential (UUID/HWID), so all protocols can
+	// safely apply the same short IP migration grace. This intentionally leaves
+	// Enable=false when no config was supplied, so it never creates Redis.
+	if deviceConfig == nil {
+		deviceConfig = &conf.GlobalDeviceLimitConfig{}
+	}
 	if deviceConfig != nil {
 		copyConfig := *deviceConfig
 		// The config type lives in conf so it can be decoded without an import cycle.
 		// Keep the same safe defaults when callers construct it directly in tests.
 		applyDeviceDefaults(&copyConfig)
+		// The limiter key is the per-user credential, not the transport. A
+		// VLESS/Trojan/VMess client may also move between Wi-Fi and cellular.
+		copyConfig.CredentialHandover = true
 		deviceConfig = &copyConfig
 	}
 
@@ -240,15 +249,20 @@ func (l *Limiter) CheckLimit(ctx context.Context, taguuid string, ip string) (*r
 // It is safe to call from the data path because same-IP touches are allocation
 // free. Fail-open Redis refreshes are queued in bounded background workers;
 // FailClosed keeps its synchronous enforcement semantics.
-func (l *Limiter) TouchDevice(taguuid, ip string) {
+// TouchDevice refreshes a device lease and reports whether the current flow
+// remains admitted. Hysteria2 uses this result to close a provisional
+// Wi-Fi-to-mobile overlap if both addresses continue carrying traffic past the
+// grace window.
+func (l *Limiter) TouchDevice(taguuid, ip string) bool {
 	value, ok := l.UserLimitInfo.Load(taguuid)
 	if !ok {
-		return
+		return false
 	}
 	if ip == "" {
-		return
+		return true
 	}
-	_, _ = l.devices.Observe(context.Background(), l.remote, l.failClosed, taguuid, ip, value.(UserLimitInfo).UID, value.(UserLimitInfo).DeviceLimit, time.Now())
+	allowed, _ := l.devices.Observe(context.Background(), l.remote, l.failClosed, taguuid, ip, value.(UserLimitInfo).UID, value.(UserLimitInfo).DeviceLimit, time.Now())
+	return allowed
 }
 
 func (l *Limiter) shouldLogRemoteError(now time.Time) bool {

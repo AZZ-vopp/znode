@@ -11,11 +11,17 @@ import (
 )
 
 type deviceEntry struct {
-	uid            int
-	lastSeen       time.Time
-	lastRedisTouch time.Time
-	remoteApproved bool
-	remoteInFlight bool
+	uid      int
+	lastSeen time.Time
+	// handoverStarted is non-zero only for the newly admitted address during
+	// a Hysteria2 QUIC migration. It is deliberately not extended by traffic:
+	// after one grace window the candidate must replace a silent old address or
+	// be revoked, so two actively transmitting clients cannot keep a bypass.
+	handoverStarted time.Time
+	handoverBlocked bool
+	lastRedisTouch  time.Time
+	remoteApproved  bool
+	remoteInFlight  bool
 }
 
 type deviceStore interface {
@@ -40,6 +46,7 @@ type deviceTracker struct {
 	ttl           time.Duration
 	refresh       time.Duration
 	grace         time.Duration
+	handover      bool
 	maxIPsPerUser int
 	aliveMu       sync.RWMutex
 	alive         map[int]int
@@ -65,6 +72,7 @@ func newDeviceTracker(c *conf.GlobalDeviceLimitConfig) *deviceTracker {
 		t.refresh = time.Duration(c.RefreshInterval) * time.Second
 		t.grace = time.Duration(*c.HandoverGrace) * time.Second
 		t.maxIPsPerUser = c.MaxIPsPerUser
+		t.handover = c.CredentialHandover
 	}
 	t.refreshCtx, t.refreshCancel = context.WithCancel(context.Background())
 	return t
@@ -79,6 +87,27 @@ func (t *deviceTracker) Observe(ctx context.Context, remote deviceStore, failClo
 	}
 	t.pruneLocked(entries, now)
 	entry, exists := entries[ip]
+	if exists && entry.handoverBlocked {
+		if !t.releaseBlockedHandoverLocked(entries, ip, now) {
+			t.mu.Unlock()
+			return false, nil
+		}
+		entry = entries[ip]
+	}
+	if exists && !entry.handoverStarted.IsZero() && !now.Before(entry.handoverStarted.Add(t.grace)) {
+		if remote != nil {
+			// Redis owns cross-node peer visibility. Force this touch through its
+			// atomic candidate decision instead of promoting based on a partial
+			// local view.
+			entry.remoteApproved = false
+		} else {
+			if !t.finalizeHandoverLocked(entries, ip, now) {
+				t.mu.Unlock()
+				return false, nil
+			}
+			entry = entries[ip]
+		}
+	}
 	if !exists {
 		if t.maxIPsPerUser > 0 && len(entries) >= t.maxIPsPerUser {
 			// Do not let a malformed/probing client grow this process without
@@ -97,13 +126,28 @@ func (t *deviceTracker) Observe(ctx context.Context, remote deviceStore, failClo
 		// local set that this process can identify safely.
 		if remote == nil && limit > 0 && len(entries) >= limit {
 			if !t.evictHandoverLocked(entries, limit, now) {
-				t.mu.Unlock()
-				return false, nil
+				// Hysteria2 gets one temporary candidate (old IP + new IP). It
+				// is revoked on a later traffic touch if the old IP is still
+				// alive after grace. Never grow an overlap beyond two addresses.
+				if !t.handover || t.grace <= 0 || len(entries) >= 2 {
+					t.mu.Unlock()
+					return false, nil
+				}
+				entry = &deviceEntry{uid: uid, handoverStarted: now}
+				entries[ip] = entry
+				goto observed
 			}
 		}
 		entry = &deviceEntry{uid: uid}
+		// A Redis-backed Hysteria2 limiter may be seeing the old address on a
+		// different ZNode. Keep this new address provisional until Redis makes
+		// the cross-node decision at the end of grace.
+		if remote != nil && t.handover && limit == 1 && t.grace > 0 {
+			entry.handoverStarted = now
+		}
 		entries[ip] = entry
 	}
+observed:
 	entry.uid = uid
 	entry.lastSeen = now
 	requiresAdmission := remote != nil && limit > 0 && !entry.remoteApproved
@@ -162,6 +206,51 @@ func (t *deviceTracker) Observe(ctx context.Context, remote deviceStore, failClo
 	}
 	t.markRedisTouch(userKey, ip, now)
 	return true, nil
+}
+
+// finalizeHandoverLocked promotes a provisional new Hysteria2 address only
+// after every other tracked address has gone silent. If another address is
+// still moving data, the provisional (new) address is removed and its writer
+// closes the flow. This preserves the credential's device limit after grace.
+func (t *deviceTracker) finalizeHandoverLocked(entries map[string]*deviceEntry, candidateIP string, now time.Time) bool {
+	candidate := entries[candidateIP]
+	if candidate == nil {
+		return false
+	}
+	silent := now.Add(-t.grace)
+	for ip, entry := range entries {
+		if ip != candidateIP && entry.lastSeen.After(silent) {
+			candidate.handoverStarted = time.Time{}
+			candidate.handoverBlocked = true
+			return false
+		}
+	}
+	for ip := range entries {
+		if ip != candidateIP {
+			delete(entries, ip)
+		}
+	}
+	candidate.handoverStarted = time.Time{}
+	return true
+}
+
+// releaseBlockedHandoverLocked prevents a rejected candidate from reconnecting
+// immediately and receiving a fresh grace window. It can resume only once all
+// prior addresses are silent, at which point it replaces them.
+func (t *deviceTracker) releaseBlockedHandoverLocked(entries map[string]*deviceEntry, candidateIP string, now time.Time) bool {
+	silent := now.Add(-t.grace)
+	for ip, entry := range entries {
+		if ip != candidateIP && entry.lastSeen.After(silent) {
+			return false
+		}
+	}
+	for ip := range entries {
+		if ip != candidateIP {
+			delete(entries, ip)
+		}
+	}
+	entries[candidateIP].handoverBlocked = false
+	return true
 }
 
 func (t *deviceTracker) startRemoteRefresh(workers int) {
@@ -223,6 +312,9 @@ func (t *deviceTracker) completeRefresh(userKey, ip string, allowed bool, err er
 	if err == nil && allowed {
 		entry.remoteApproved = true
 		entry.lastRedisTouch = now
+		if !entry.handoverStarted.IsZero() && !now.Before(entry.handoverStarted.Add(t.grace)) {
+			entry.handoverStarted = time.Time{}
+		}
 		return
 	}
 	if err != nil {
@@ -359,6 +451,9 @@ func (t *deviceTracker) Snapshot(now time.Time) ([]panel.OnlineUser, map[string]
 		}
 		active[userKey] = struct{}{}
 		for ip, entry := range entries {
+			if entry.handoverBlocked {
+				continue
+			}
 			online = append(online, panel.OnlineUser{UID: entry.uid, IP: ip})
 		}
 	}

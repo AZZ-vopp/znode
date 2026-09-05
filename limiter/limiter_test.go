@@ -3,6 +3,7 @@ package limiter
 import (
 	"context"
 	"errors"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -450,5 +451,104 @@ func TestDeviceTrackerHandoverIsDisabledByAZeroGrace(t *testing.T) {
 	}
 	if allowed, err := tracker.Observe(ctx, nil, false, "user", "192.0.2.2", 1, 1, now.Add(5*time.Second)); allowed || err != nil {
 		t.Fatalf("a zero grace must keep the previous refusal: allowed=%v err=%v", allowed, err)
+	}
+}
+
+func TestHysteria2CredentialHandoverLetsWiFiMoveToMobile(t *testing.T) {
+	tracker := newDeviceTracker(&conf.GlobalDeviceLimitConfig{CredentialHandover: true})
+	tracker.ttl = time.Second
+	tracker.grace = 20 * time.Millisecond
+	now := time.Now()
+	ctx := context.Background()
+	if allowed, err := tracker.Observe(ctx, nil, false, "device-uuid", "192.0.2.10", 1, 1, now); !allowed || err != nil {
+		t.Fatalf("Wi-Fi admission: allowed=%v err=%v", allowed, err)
+	}
+	// The new mobile address is admitted provisionally so an in-flight QUIC
+	// migration does not lose traffic while the Wi-Fi path drains.
+	if allowed, err := tracker.Observe(ctx, nil, false, "device-uuid", "198.51.100.20", 1, 1, now.Add(time.Millisecond)); !allowed || err != nil {
+		t.Fatalf("mobile provisional admission: allowed=%v err=%v", allowed, err)
+	}
+	// Wi-Fi is silent. After grace, the mobile address is promoted and replaces
+	// it without waiting for the full TTL.
+	if allowed, err := tracker.Observe(ctx, nil, false, "device-uuid", "198.51.100.20", 1, 1, now.Add(25*time.Millisecond)); !allowed || err != nil {
+		t.Fatalf("mobile promotion: allowed=%v err=%v", allowed, err)
+	}
+	online, _ := tracker.Snapshot(now.Add(25 * time.Millisecond))
+	if len(online) != 1 || online[0].IP != "198.51.100.20" {
+		t.Fatalf("handover did not replace Wi-Fi address: %+v", online)
+	}
+}
+
+func TestHysteria2CredentialHandoverRejectsConcurrentClientsAfterGrace(t *testing.T) {
+	tracker := newDeviceTracker(&conf.GlobalDeviceLimitConfig{CredentialHandover: true})
+	tracker.ttl = time.Second
+	tracker.grace = 20 * time.Millisecond
+	now := time.Now()
+	ctx := context.Background()
+	if allowed, err := tracker.Observe(ctx, nil, false, "device-uuid", "192.0.2.10", 1, 1, now); !allowed || err != nil {
+		t.Fatalf("first client: allowed=%v err=%v", allowed, err)
+	}
+	if allowed, err := tracker.Observe(ctx, nil, false, "device-uuid", "198.51.100.20", 1, 1, now.Add(time.Millisecond)); !allowed || err != nil {
+		t.Fatalf("provisional second client: allowed=%v err=%v", allowed, err)
+	}
+	// The incumbent is still actively sending. The new address must lose its
+	// probation rather than receiving an endlessly renewed grace window.
+	if allowed, err := tracker.Observe(ctx, nil, false, "device-uuid", "192.0.2.10", 1, 1, now.Add(21*time.Millisecond)); !allowed || err != nil {
+		t.Fatalf("incumbent traffic: allowed=%v err=%v", allowed, err)
+	}
+	if allowed, err := tracker.Observe(ctx, nil, false, "device-uuid", "198.51.100.20", 1, 1, now.Add(25*time.Millisecond)); allowed || err != nil {
+		t.Fatalf("concurrent candidate remained admitted: allowed=%v err=%v", allowed, err)
+	}
+	// A reconnect from the rejected address cannot manufacture another grace
+	// period while the incumbent is still active.
+	if allowed, err := tracker.Observe(ctx, nil, false, "device-uuid", "198.51.100.20", 1, 1, now.Add(30*time.Millisecond)); allowed || err != nil {
+		t.Fatalf("blocked candidate bypassed with reconnect: allowed=%v err=%v", allowed, err)
+	}
+}
+
+func TestHysteria2NATRebindingKeepsExactIPAddressIdentity(t *testing.T) {
+	tracker := newDeviceTracker(&conf.GlobalDeviceLimitConfig{CredentialHandover: true})
+	now := time.Now()
+	for _, when := range []time.Time{now, now.Add(time.Millisecond), now.Add(2 * time.Millisecond)} {
+		if allowed, err := tracker.Observe(context.Background(), nil, false, "device-uuid", "2001:db8:100::1", 1, 1, when); !allowed || err != nil {
+			t.Fatalf("same IPv6 address must not consume another device slot: allowed=%v err=%v", allowed, err)
+		}
+	}
+	online, _ := tracker.Snapshot(now.Add(2 * time.Millisecond))
+	if len(online) != 1 || online[0].IP != "2001:db8:100::1" {
+		t.Fatalf("unexpected address grouping: %+v", online)
+	}
+}
+
+func TestCredentialHandoverIsEnabledForCredentialProtocols(t *testing.T) {
+	Init()
+	for _, protocol := range []string{"vless", "trojan", "vmess", "hysteria2"} {
+		tag := protocol + "-node"
+		l := AddLimiter(protocol, tag, nil, nil, nil, "https://panel.example")
+		defer DeleteLimiter(tag)
+		if !l.devices.handover {
+			t.Fatalf("credential handover was not enabled for %s", protocol)
+		}
+		if l.remote != nil || l.remoteEnabled {
+			t.Fatalf("local-only %s handover unexpectedly enabled Redis", protocol)
+		}
+	}
+}
+
+func TestRedisHandoverScriptHasTheSameRevocableOverlapContract(t *testing.T) {
+	// This guards the Redis half of the algorithm without requiring a Redis
+	// daemon in unit tests. The Lua state names are intentionally checked here:
+	// P is a fixed-start probation; B blocks reconnects until the old traffic is
+	// silent. Both are necessary for parity with deviceTracker.
+	for _, fragment := range []string{
+		"handoverEnabled == 1 and count < 2",
+		"'P:' .. now",
+		"state == 'B'",
+		"redis.call('HSET', handoverKey, member, 'B')",
+		"redis.call('HDEL', handoverKey, member)",
+	} {
+		if !strings.Contains(deviceLimitScript, fragment) {
+			t.Fatalf("Redis handover script is missing %q", fragment)
+		}
 	}
 }

@@ -531,7 +531,7 @@ func (d *DefaultDispatcher) getLink(ctx context.Context) (*transport.Link, *tran
 			outboundLink.Writer = rate.NewRateLimitWriter(outboundLink.Writer, w)
 		}
 		deviceIP := limiter.NormalizeIP(sessionInbound.Source.Address.IP().String())
-		touch := func() { limit.TouchDevice(user.Email, deviceIP) }
+		touch := func() bool { return limit.TouchDevice(user.Email, deviceIP) }
 		inboundLink.Writer = &deviceTouchWriter{writer: inboundLink.Writer, touch: touch}
 		outboundLink.Writer = &deviceTouchWriter{writer: outboundLink.Writer, touch: touch}
 		t := d.trafficCounter(sessionInbound.Tag)
@@ -706,7 +706,7 @@ func (d *DefaultDispatcher) DispatchLink(ctx context.Context, destination net.De
 		deviceIP := limiter.NormalizeIP(sessionInbound.Source.Address.IP().String())
 		outbound.Writer = &deviceTouchWriter{
 			writer: outbound.Writer,
-			touch:  func() { limit.TouchDevice(user.Email, deviceIP) },
+			touch:  func() bool { return limit.TouchDevice(user.Email, deviceIP) },
 		}
 		t := d.trafficCounter(sessionInbound.Tag)
 		ts := t.GetCounter(user.Email)

@@ -20,16 +20,56 @@ import (
 // two znode instances accept a new IP at the same time.
 const deviceLimitScript = `
 local key = KEYS[1]
+local handoverKey = KEYS[2]
 local member = ARGV[1]
 local limit = tonumber(ARGV[2])
 local now = tonumber(ARGV[3])
 local expiry = tonumber(ARGV[4])
 local grace = tonumber(ARGV[5])
+local handoverEnabled = tonumber(ARGV[6])
 local cutoff = now - (expiry * 1000)
 redis.call('ZREMRANGEBYSCORE', key, '-inf', cutoff)
+-- A separate hash preserves the ZSET score as the last actual traffic touch.
+-- Clear metadata whose address expired or came from an older ZNode version.
+for _, candidate in ipairs(redis.call('HKEYS', handoverKey)) do
+  if not redis.call('ZSCORE', key, candidate) then
+    redis.call('HDEL', handoverKey, candidate)
+  end
+end
 if redis.call('ZSCORE', key, member) then
+  local state = redis.call('HGET', handoverKey, member)
+  local started = nil
+  if state and string.sub(state, 1, 2) == 'P:' then
+    started = tonumber(string.sub(state, 3))
+  end
+  if state == 'B' or (started and now - started >= grace * 1000) then
+    local silent = now - (grace * 1000)
+    local peers = redis.call('ZRANGE', key, 0, -1, 'WITHSCORES')
+    for i = 1, #peers, 2 do
+      if peers[i] ~= member and tonumber(peers[i + 1]) > silent then
+        -- The new address lost probation: a simultaneous old address is still
+        -- carrying traffic, so revoke the newcomer rather than weakening the
+        -- credential limit.
+        -- Keep a blocked marker and the member itself. Otherwise every retry
+        -- would be treated as a brand-new migration and gain another grace
+        -- window while the old address keeps transmitting.
+        redis.call('HSET', handoverKey, member, 'B')
+        return {0, redis.call('ZCARD', key), 0}
+      end
+    end
+    for i = 1, #peers, 2 do
+      if peers[i] ~= member then
+        redis.call('ZREM', key, peers[i])
+        redis.call('HDEL', handoverKey, peers[i])
+      end
+    end
+    redis.call('HDEL', handoverKey, member)
+  end
   redis.call('ZADD', key, now, member)
   redis.call('EXPIRE', key, expiry)
+  if redis.call('HLEN', handoverKey) > 0 then
+    redis.call('EXPIRE', handoverKey, expiry)
+  end
   return {1, redis.call('ZCARD', key), 0}
 end
 local count = redis.call('ZCARD', key)
@@ -38,10 +78,7 @@ if limit > 0 and count >= limit then
   if grace <= 0 then
     return {0, count, 0}
   end
-  -- Free exactly as many slots as this admission needs, least recently seen
-  -- first. ZRANGE is ascending by score, so these are the oldest touches and
-  -- no others are considered. An address still inside the grace window is
-  -- transmitting, so a set that is only partly idle refuses the newcomer.
+  -- Free exactly as many silent slots as the normal device limit needs.
   local needed = count - limit + 1
   local silent = now - (grace * 1000)
   local candidates = redis.call('ZRANGE', key, 0, needed - 1, 'WITHSCORES')
@@ -51,14 +88,27 @@ if limit > 0 and count >= limit then
       evict[#evict + 1] = candidates[i]
     end
   end
-  if #evict < needed then
+  if #evict >= needed then
+    redis.call('ZREM', key, unpack(evict))
+    for _, evicted in ipairs(evict) do
+      redis.call('HDEL', handoverKey, evicted)
+    end
+    handover = #evict
+  elseif handoverEnabled == 1 and count < 2 then
+    -- Old + new is the only permitted provisional overlap. A later traffic
+    -- touch finalizes it or removes this new member atomically.
+    redis.call('HSET', handoverKey, member, 'P:' .. now)
+  else
     return {0, count, 0}
   end
-  redis.call('ZREM', key, unpack(evict))
-  handover = #evict
 end
 redis.call('ZADD', key, now, member)
 redis.call('EXPIRE', key, expiry)
+if redis.call('HLEN', handoverKey) > 0 then
+  redis.call('EXPIRE', handoverKey, expiry)
+else
+  redis.call('DEL', handoverKey)
+end
 return {1, redis.call('ZCARD', key), handover}
 `
 
@@ -71,6 +121,7 @@ type redisDeviceStore struct {
 	timeout   time.Duration
 	expiry    time.Duration
 	grace     time.Duration
+	handover  bool
 	closeOnce sync.Once
 }
 
@@ -202,7 +253,8 @@ func newRedisDeviceStore(c *conf.GlobalDeviceLimitConfig, namespace string) (*re
 		timeout:   time.Duration(c.Timeout) * time.Second,
 		expiry:    time.Duration(c.Expiry) * time.Second,
 		// applyDeviceDefaults ran above, so the pointer is set.
-		grace:     time.Duration(*c.HandoverGrace) * time.Second,
+		grace:    time.Duration(*c.HandoverGrace) * time.Second,
+		handover: c.CredentialHandover,
 	}, nil
 }
 
@@ -212,6 +264,10 @@ func (r *redisDeviceStore) key(userKey string) string {
 	return fmt.Sprintf("%s:%s:%s", r.prefix, hex.EncodeToString(nsHash[:8]), hex.EncodeToString(userHash[:16]))
 }
 
+func (r *redisDeviceStore) handoverKey(userKey string) string {
+	return r.key(userKey) + ":handover"
+}
+
 func (r *redisDeviceStore) Allow(ctx context.Context, userKey, ip string, limit int) (bool, error) {
 	if r == nil || limit <= 0 {
 		return true, nil
@@ -219,7 +275,11 @@ func (r *redisDeviceStore) Allow(ctx context.Context, userKey, ip string, limit 
 	requestCtx, cancel := context.WithTimeout(ctx, r.timeout)
 	defer cancel()
 	now := time.Now().UnixMilli()
-	result, err := r.script.Run(requestCtx, r.client, []string{r.key(userKey)}, ip, strconv.Itoa(limit), strconv.FormatInt(now, 10), strconv.FormatInt(int64(r.expiry/time.Second), 10), strconv.FormatInt(int64(r.grace/time.Second), 10)).Int64Slice()
+	handover := "0"
+	if r.handover {
+		handover = "1"
+	}
+	result, err := r.script.Run(requestCtx, r.client, []string{r.key(userKey), r.handoverKey(userKey)}, ip, strconv.Itoa(limit), strconv.FormatInt(now, 10), strconv.FormatInt(int64(r.expiry/time.Second), 10), strconv.FormatInt(int64(r.grace/time.Second), 10), handover).Int64Slice()
 	if err != nil {
 		return false, err
 	}
@@ -232,7 +292,7 @@ func (r *redisDeviceStore) Delete(ctx context.Context, userKey string) error {
 	}
 	requestCtx, cancel := context.WithTimeout(ctx, r.timeout)
 	defer cancel()
-	return r.client.Del(requestCtx, r.key(userKey)).Err()
+	return r.client.Del(requestCtx, r.key(userKey), r.handoverKey(userKey)).Err()
 }
 
 func (r *redisDeviceStore) Close() error {

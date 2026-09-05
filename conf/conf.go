@@ -95,10 +95,15 @@ type GlobalDeviceLimitConfig struct {
 	// 0 disables handover. Must stay at or above 2*RefreshInterval: an address
 	// that is still transmitting only refreshes its score at that cadence, so
 	// a shorter grace would evict a second client that is genuinely active.
-	HandoverGrace         *int     `mapstructure:"HandoverGrace"`
-	MaxIPsPerUser         int      `mapstructure:"MaxIPsPerUser"`
-	KeyPrefix             string   `mapstructure:"KeyPrefix"`
-	FailClosed            bool     `mapstructure:"FailClosed"`
+	HandoverGrace *int `mapstructure:"HandoverGrace"`
+	// CredentialHandover is set internally for credential-keyed limiters. It is
+	// not a panel-facing switch; all supported protocols use UUID/HWID identity.
+	// Keeping it on the shared config lets the local and Redis implementations
+	// use precisely the same admission rules.
+	CredentialHandover bool   `mapstructure:"-"`
+	MaxIPsPerUser      int    `mapstructure:"MaxIPsPerUser"`
+	KeyPrefix          string `mapstructure:"KeyPrefix"`
+	FailClosed         bool   `mapstructure:"FailClosed"`
 	// Pointer allows omitted SyncEnabled to default to true while still
 	// honoring an explicit false in a node config.
 	SyncEnabled *bool  `mapstructure:"SyncEnabled"`
