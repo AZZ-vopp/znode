@@ -47,6 +47,9 @@ func Resolve(ctx context.Context, config *conf.Conf) (Assignment, error) {
 	if err := reconcileCertificate(ctx, client, manifest.CertificateRequest); err != nil {
 		return Assignment{}, fmt.Errorf("reconcile agent certificate: %w", err)
 	}
+	if _, err := reconcileCertificateVault(ctx, client, manifest.CertificateVaultRequests); err != nil {
+		return Assignment{}, fmt.Errorf("reconcile certificate vault: %w", err)
+	}
 	config.NodeConfigs = manifest.NodeConfigs(config.AgentConfig)
 	return Assignment{
 		Revision:             manifest.EffectiveRevision(),
@@ -329,6 +332,14 @@ func (m *Monitor) pollOnce(ctx context.Context) error {
 			return err
 		}
 	}
+	vaultChanged := false
+	if vault, ok := fetcher.(certificateVaultClient); ok {
+		var vaultErr error
+		vaultChanged, vaultErr = reconcileCertificateVault(ctx, vault, manifest.CertificateVaultRequests)
+		if vaultErr != nil {
+			return vaultErr
+		}
+	}
 	revision := manifest.EffectiveRevision()
 	nodeRevision := manifest.EffectiveNodeRevision()
 	fallbackRevision := manifest.EffectiveFallbackRevision()
@@ -369,6 +380,10 @@ func (m *Monitor) pollOnce(ctx context.Context) error {
 	}
 	if nodeChanged {
 		m.signalReload("node:" + nodeRevision)
+		return nil
+	}
+	if vaultChanged {
+		m.signalReload("vault:" + revision)
 		return nil
 	}
 	if fallbackChanged && fallbackCh != nil && hotSwappableFallback(manifest.GlobalDeviceLimitConfig) {

@@ -20,6 +20,8 @@ import (
 const agentManifestPath = "/api/v2/server/agent/config"
 const agentMaintenanceReportPath = "/api/v2/server/agent/maintenance/report"
 const agentCertificateReportPath = "/api/v2/server/agent/certificate/report"
+const agentCertificateVaultBackupPath = "/api/v2/server/agent/certificate-vault/backup"
+const agentCertificateVaultRestorePath = "/api/v2/server/agent/certificate-vault/restore"
 const agentTerminalClaimPath = "/api/v2/server/agent/terminal/claim"
 const agentTerminalExchangePath = "/api/v2/server/agent/terminal/exchange"
 const agentAuthorizationHeader = "X-ZBoard-Agent-Authorization"
@@ -39,20 +41,32 @@ type AgentCertificateRequest struct {
 	RequestedAt int64  `json:"requested_at"`
 }
 
+type AgentCertificateVaultRequest struct {
+	ID                 string `json:"id"`
+	NodeID             int    `json:"node_id"`
+	Action             string `json:"action"`
+	CertFile           string `json:"cert_file"`
+	KeyFile            string `json:"key_file"`
+	RequestedAt        int64  `json:"requested_at"`
+	ExpectedSHA256     string `json:"expected_sha256,omitempty"`
+	ExpectedGeneration int    `json:"expected_generation,omitempty"`
+}
+
 // AgentManifest is the desired logical-node assignment returned by V2Board.
 // Revision should change whenever Nodes changes. If an older panel omits it,
 // EffectiveRevision derives a stable value from the sorted node IDs.
 type AgentManifest struct {
-	PanelType               string                        `json:"panel_type"`
-	Revision                string                        `json:"revision"`
-	NodeRevision            string                        `json:"node_revision,omitempty"`
-	FallbackRevision        string                        `json:"fallback_revision,omitempty"`
-	Nodes                   []int                         `json:"nodes"`
-	PollInterval            int                           `json:"poll_interval"`
-	Maintenance             *AgentMaintenance             `json:"maintenance,omitempty"`
-	CertificateRequest      *AgentCertificateRequest      `json:"certificate_request,omitempty"`
-	GlobalDeviceLimitConfig *conf.GlobalDeviceLimitConfig `json:"global_device_limit_config,omitempty"`
-	AuthorizationRevoked    bool                          `json:"-"`
+	PanelType                string                         `json:"panel_type"`
+	Revision                 string                         `json:"revision"`
+	NodeRevision             string                         `json:"node_revision,omitempty"`
+	FallbackRevision         string                         `json:"fallback_revision,omitempty"`
+	Nodes                    []int                          `json:"nodes"`
+	PollInterval             int                            `json:"poll_interval"`
+	Maintenance              *AgentMaintenance              `json:"maintenance,omitempty"`
+	CertificateRequest       *AgentCertificateRequest       `json:"certificate_request,omitempty"`
+	CertificateVaultRequests []AgentCertificateVaultRequest `json:"certificate_vault_requests,omitempty"`
+	GlobalDeviceLimitConfig  *conf.GlobalDeviceLimitConfig  `json:"global_device_limit_config,omitempty"`
+	AuthorizationRevoked     bool                           `json:"-"`
 }
 
 // AgentClient is deliberately separate from Client: it authenticates a VPS
@@ -342,6 +356,49 @@ type CertificateReport struct {
 	Message         string
 }
 
+type CertificateVaultMaterial struct {
+	CertificatePEM  string `json:"certificate_pem"`
+	PrivateKeyPEM   string `json:"private_key_pem"`
+	SHA256          string `json:"sha256"`
+	PublicKeySHA256 string `json:"public_key_sha256"`
+}
+
+func (c *AgentClient) BackupCertificateVault(ctx context.Context, request AgentCertificateVaultRequest, certificatePEM, privateKeyPEM string) (*CertificateVaultMaterial, error) {
+	var payload struct {
+		Accepted        bool   `json:"accepted"`
+		Message         string `json:"message"`
+		SHA256          string `json:"sha256"`
+		PublicKeySHA256 string `json:"public_key_sha256"`
+	}
+	response, err := c.client.R().SetContext(ctx).SetResult(&payload).SetBody(map[string]any{"id": request.ID, "node_id": request.NodeID, "certificate_pem": certificatePEM, "private_key_pem": privateKeyPEM}).ForceContentType("application/json").Post(agentCertificateVaultBackupPath)
+	if err != nil || response.IsError() || !payload.Accepted {
+		if err != nil {
+			return nil, fmt.Errorf("backup certificate vault: %w", err)
+		}
+		return nil, fmt.Errorf("backup certificate vault rejected")
+	}
+	return &CertificateVaultMaterial{SHA256: payload.SHA256, PublicKeySHA256: payload.PublicKeySHA256}, nil
+}
+
+func (c *AgentClient) RestoreCertificateVault(ctx context.Context, request AgentCertificateVaultRequest) (*CertificateVaultMaterial, error) {
+	var payload struct {
+		Accepted        bool   `json:"accepted"`
+		Message         string `json:"message"`
+		CertificatePEM  string `json:"certificate_pem"`
+		PrivateKeyPEM   string `json:"private_key_pem"`
+		SHA256          string `json:"sha256"`
+		PublicKeySHA256 string `json:"public_key_sha256"`
+	}
+	response, err := c.client.R().SetContext(ctx).SetResult(&payload).SetBody(map[string]any{"id": request.ID, "node_id": request.NodeID}).ForceContentType("application/json").Post(agentCertificateVaultRestorePath)
+	if err != nil || response.IsError() || !payload.Accepted {
+		if err != nil {
+			return nil, fmt.Errorf("restore certificate vault: %w", err)
+		}
+		return nil, fmt.Errorf("restore certificate vault rejected")
+	}
+	return &CertificateVaultMaterial{CertificatePEM: payload.CertificatePEM, PrivateKeyPEM: payload.PrivateKeyPEM, SHA256: payload.SHA256, PublicKeySHA256: payload.PublicKeySHA256}, nil
+}
+
 func (m *AgentManifest) Validate() error {
 	if !strings.EqualFold(strings.TrimSpace(m.PanelType), conf.RequiredPanelType) {
 		return fmt.Errorf("invalid agent manifest panel_type %q: ZNode requires %s", m.PanelType, conf.RequiredPanelType)
@@ -396,6 +453,28 @@ func (m *AgentManifest) Validate() error {
 		}
 		if len(m.CertificateRequest.CertFile) == 0 || len(m.CertificateRequest.CertFile) > 4096 {
 			return fmt.Errorf("invalid agent certificate request path")
+		}
+	}
+	for _, request := range m.CertificateVaultRequests {
+		if len(request.ID) != 32 {
+			return fmt.Errorf("invalid certificate vault request ID")
+		}
+		if _, err := hex.DecodeString(request.ID); err != nil {
+			return fmt.Errorf("invalid certificate vault request ID: %w", err)
+		}
+		if request.NodeID <= 0 || (request.Action != "backup" && request.Action != "restore" && request.Action != "sync") || len(request.CertFile) == 0 || len(request.KeyFile) == 0 || request.CertFile == request.KeyFile {
+			return fmt.Errorf("invalid certificate vault request")
+		}
+		if request.ExpectedGeneration < 0 {
+			return fmt.Errorf("invalid certificate vault generation")
+		}
+		if request.ExpectedSHA256 != "" {
+			if len(request.ExpectedSHA256) != 64 {
+				return fmt.Errorf("invalid certificate vault SHA256")
+			}
+			if _, err := hex.DecodeString(request.ExpectedSHA256); err != nil {
+				return fmt.Errorf("invalid certificate vault SHA256: %w", err)
+			}
 		}
 	}
 	return nil
