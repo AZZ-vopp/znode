@@ -252,7 +252,7 @@ func startPreparedRuntime(prepared *preparedRuntime, reloadCh chan struct{}, sna
 		newCore.SnapshotCh = snapshotChannels[0]
 	}
 	if err := newCore.Start(prepared.nodes.NodeInfos); err != nil {
-		return nil, err
+		return nil, errors.Join(err, newCore.Close())
 	}
 	if err := prepared.nodes.Start(prepared.config.NodeConfigs, newCore); err != nil {
 		_ = prepared.nodes.Close()
@@ -270,40 +270,34 @@ func reloadRuntime(configPath string, old *runningRuntime, reloadCh chan struct{
 		return nil, err
 	}
 
-	// The base core has no inbounds yet, so this is also safe to preflight while
-	// old ports are still listening.
-	newCore := core.New(prepared.config)
-	newCore.ReloadCh = reloadCh
-	if old != nil && old.core != nil {
-		newCore.SnapshotCh = old.core.SnapshotCh
-	}
-	if err := newCore.Start(prepared.nodes.NodeInfos); err != nil {
+	// Build all Xray configuration before stopping the healthy runtime, but do
+	// not construct/start a core here: WireGuard construction creates TUNs and
+	// observatory probes. A replacement starts only after the old runtime exits.
+	if err := core.ValidateConfig(prepared.config, prepared.nodes.NodeInfos); err != nil {
 		return nil, err
 	}
 
+	snapshotCh := old.core.SnapshotCh
 	if err := old.nodes.Close(); err != nil {
-		_ = newCore.Close()
 		return nil, fmt.Errorf("close old nodes: %w", err)
 	}
 	if err := old.core.Close(); err != nil {
-		_ = newCore.Close()
 		if restoreErr := restorePreviousRuntime(old, reloadCh); restoreErr != nil {
 			return nil, fmt.Errorf("close old core: %w; restore previous runtime: %v", err, restoreErr)
 		}
 		return nil, fmt.Errorf("close old core: %w; previous runtime restored", err)
 	}
-	if err := prepared.nodes.Start(prepared.config.NodeConfigs, newCore); err != nil {
-		_ = prepared.nodes.Close()
-		_ = newCore.Close()
+	newRuntime, err := startPreparedRuntime(prepared, reloadCh, snapshotCh)
+	if err != nil {
 		if restoreErr := restorePreviousRuntime(old, reloadCh); restoreErr != nil {
-			return nil, fmt.Errorf("start replacement nodes: %w; restore previous runtime: %v", err, restoreErr)
+			return nil, fmt.Errorf("start replacement runtime: %w; restore previous runtime: %v", err, restoreErr)
 		}
-		return nil, fmt.Errorf("start replacement nodes: %w; previous runtime restored", err)
+		return nil, fmt.Errorf("start replacement runtime: %w; previous runtime restored", err)
 	}
 
 	applyLogConfig(prepared.config)
 	runtime.GC()
-	return &runningRuntime{preparedRuntime: prepared, core: newCore, terminalNodes: prepared.nodes, terminalCore: newCore}, nil
+	return newRuntime, nil
 }
 
 // restorePreviousRuntime is the final rollback barrier for errors that can

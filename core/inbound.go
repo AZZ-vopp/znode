@@ -89,7 +89,7 @@ func needsInboundSniffing(nodeInfo *panel.NodeInfo) bool {
 	}
 	for _, route := range nodeInfo.Common.Routes {
 		switch route.Action {
-		case "block", "route", "protocol":
+		case "block", "route", "route_wg_balancer", "protocol":
 			if len(route.Match) > 0 {
 				return true
 			}

@@ -71,6 +71,14 @@ func New(config *conf.Conf) *V2Core {
 func (v *V2Core) Start(infos []*panel.NodeInfo) error {
 	v.access.Lock()
 	defer v.access.Unlock()
+	// These values are read by the dispatcher registration callback while the
+	// Xray instance is being constructed. Keep the process-wide defaults scoped
+	// to an actual runtime start; config validation must remain side-effect free.
+	dispatcher.ConfigureUDPContentSniffing(v.Config.ConnectionConfig.DisableUDPContentSniffing)
+	dispatcher.ConfigureSessionLimits(
+		v.Config.ConnectionConfig.MaxConnectionsPerUser,
+		v.Config.ConnectionConfig.MaxConnections,
+	)
 	server, err := getCore(v.Config, infos)
 	if err != nil {
 		return err
@@ -94,6 +102,14 @@ func (v *V2Core) Start(infos []*panel.NodeInfo) error {
 	return nil
 }
 
+// ValidateConfig builds the complete Xray configuration without constructing
+// an instance. Reload uses this while an old runtime is live, so WireGuard
+// outbounds cannot create a second TUN device or start observatory probes.
+func ValidateConfig(c *conf.Conf, infos []*panel.NodeInfo) error {
+	_, err := buildCoreConfig(c, infos)
+	return err
+}
+
 func (v *V2Core) Close() error {
 	v.access.Lock()
 	defer v.access.Unlock()
@@ -115,11 +131,19 @@ func (v *V2Core) Close() error {
 }
 
 func getCore(c *conf.Conf, infos []*panel.NodeInfo) (*core.Instance, error) {
-	dispatcher.ConfigureUDPContentSniffing(c.ConnectionConfig.DisableUDPContentSniffing)
-	dispatcher.ConfigureSessionLimits(
-		c.ConnectionConfig.MaxConnectionsPerUser,
-		c.ConnectionConfig.MaxConnections,
-	)
+	config, err := buildCoreConfig(c, infos)
+	if err != nil {
+		return nil, err
+	}
+	server, err := core.New(config)
+	if err != nil {
+		return nil, fmt.Errorf("create core instance: %w", err)
+	}
+	log.Info("Xray Core Version: ", core.Version())
+	return server, nil
+}
+
+func buildCoreConfig(c *conf.Conf, infos []*panel.NodeInfo) (*core.Config, error) {
 	// Log Config
 	coreLogConfig := &coreConf.LogConfig{
 		LogLevel:  c.LogConfig.Level,
@@ -163,15 +187,9 @@ func getCore(c *conf.Conf, infos []*panel.NodeInfo) (*core.Instance, error) {
 		// custom.go; it supplies real per-outbound probe status to balancers.
 		apps = append(apps, serial.ToTypedMessage(observatoryConfig))
 	}
-	config := &core.Config{
+	return &core.Config{
 		App:      apps,
 		Inbound:  inBoundConfig,
 		Outbound: outBoundConfig,
-	}
-	server, err := core.New(config)
-	if err != nil {
-		return nil, fmt.Errorf("create core instance: %w", err)
-	}
-	log.Info("Xray Core Version: ", core.Version())
-	return server, nil
+	}, nil
 }

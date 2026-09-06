@@ -516,7 +516,10 @@ func (d *DefaultDispatcher) getLink(ctx context.Context) (*transport.Link, *tran
 		managedWriter := &ManagedWriter{
 			writer: uplinkWriter,
 		}
-		manager := d.addManagedLink(user.Email, managedWriter, outboundLink.Reader)
+		// Close the uplink writer and interrupt the opposite pipe reader. Xray's
+		// pipe wakes both ends, so shutdown releases blocked reads and writes in
+		// both directions instead of leaving the downlink write behind.
+		manager := d.addManagedLink(user.Email, managedWriter, inboundLink.Reader)
 		if manager == nil {
 			common.Close(outboundLink.Writer)
 			common.Close(inboundLink.Writer)
@@ -524,7 +527,12 @@ func (d *DefaultDispatcher) getLink(ctx context.Context) (*transport.Link, *tran
 			common.Interrupt(inboundLink.Reader)
 			return nil, nil, nil, errors.New("user session limit reached or account was quiesced")
 		}
-		inboundLink.Writer = managedWriter
+		// Account at the transport boundary. A delayed rate limiter must not
+		// keep the accounting drain barrier open during runtime reload.
+		t := d.trafficCounter(sessionInbound.Tag)
+		ts := t.GetCounter(user.Email)
+		inboundLink.Writer = &trafficWriter{counter: &ts.UpCounter, manager: manager, writer: managedWriter}
+		outboundLink.Writer = &trafficWriter{counter: &ts.DownCounter, manager: manager, writer: outboundLink.Writer}
 		if w != nil {
 			sessionInbound.CanSpliceCopy = 3
 			inboundLink.Writer = rate.NewRateLimitWriter(inboundLink.Writer, w)
@@ -534,18 +542,6 @@ func (d *DefaultDispatcher) getLink(ctx context.Context) (*transport.Link, *tran
 		touch := func() bool { return limit.TouchDevice(user.Email, deviceIP) }
 		inboundLink.Writer = &deviceTouchWriter{writer: inboundLink.Writer, touch: touch}
 		outboundLink.Writer = &deviceTouchWriter{writer: outboundLink.Writer, touch: touch}
-		t := d.trafficCounter(sessionInbound.Tag)
-		ts := t.GetCounter(user.Email)
-		inboundLink.Writer = &trafficWriter{
-			counter: &ts.UpCounter,
-			manager: manager,
-			writer:  inboundLink.Writer,
-		}
-		outboundLink.Writer = &trafficWriter{
-			counter: &ts.DownCounter,
-			manager: manager,
-			writer:  outboundLink.Writer,
-		}
 	}
 
 	return inboundLink, outboundLink, limit, nil
@@ -698,7 +694,11 @@ func (d *DefaultDispatcher) DispatchLink(ctx context.Context, destination net.De
 			common.Interrupt(outbound.Reader)
 			return errors.New("user session limit reached or account was quiesced")
 		}
-		outbound.Writer = managedWriter
+		t := d.trafficCounter(sessionInbound.Tag)
+		ts := t.GetCounter(user.Email)
+		// Keep accounting inside the rate/device wrappers for the same reason as
+		// getLink above: throttling delay is not an in-flight transport write.
+		outbound.Writer = &trafficWriter{counter: &ts.DownCounter, manager: manager, writer: managedWriter}
 		if w != nil {
 			sessionInbound.CanSpliceCopy = 3
 			outbound.Writer = rate.NewRateLimitWriter(outbound.Writer, w)
@@ -708,14 +708,7 @@ func (d *DefaultDispatcher) DispatchLink(ctx context.Context, destination net.De
 			writer: outbound.Writer,
 			touch:  func() bool { return limit.TouchDevice(user.Email, deviceIP) },
 		}
-		t := d.trafficCounter(sessionInbound.Tag)
-		ts := t.GetCounter(user.Email)
 		outbound.Reader = newManagedTimeoutReader(outbound.Reader, &ts.UpCounter, manager)
-		outbound.Writer = &trafficWriter{
-			counter: &ts.DownCounter,
-			manager: manager,
-			writer:  outbound.Writer,
-		}
 	}
 
 	sniffingRequest := content.SniffingRequest

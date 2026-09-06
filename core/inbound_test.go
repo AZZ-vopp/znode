@@ -108,6 +108,19 @@ func TestBuildInboundUsesRouteOnlySniffingForDomainRoutes(t *testing.T) {
 	}
 }
 
+func TestBuildInboundUsesRouteOnlySniffingForWireGuardBalancerRoutes(t *testing.T) {
+	sniffing := buildSniffingSettings(t, []panel.Route{{
+		Action: "route_wg_balancer",
+		Match:  []string{"domain:live.example"},
+	}})
+	if sniffing == nil || !sniffing.GetEnabled() || !sniffing.GetRouteOnly() {
+		t.Fatalf("WireGuard balancer domain route must enable route-only sniffing: %#v", sniffing)
+	}
+	if sniffing := buildSniffingSettings(t, []panel.Route{{Action: "route_wg_balancer"}}); sniffing.GetEnabled() {
+		t.Fatal("empty WireGuard balancer match must not enable sniffing")
+	}
+}
+
 func TestBuildInboundRejectsUnknownSecurityMode(t *testing.T) {
 	if _, err := buildInbound(&panel.NodeInfo{
 		Type:     "vmess",
