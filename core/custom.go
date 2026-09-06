@@ -47,8 +47,8 @@ func buildWireGuardBalancer(routeID int, value *string, existing []*core.Outboun
 	if strategy != "roundrobin" && strategy != "leastping" && strategy != "leastload" {
 		return "", nil, nil, nil, fmt.Errorf("unsupported WireGuard balancer strategy %q", config.Strategy)
 	}
-	if len(config.Outbounds) < 2 || len(config.Outbounds) > 8 {
-		return "", nil, nil, nil, fmt.Errorf("WireGuard balancer must contain 2 to 8 outbounds")
+	if len(config.Outbounds) < 1 || len(config.Outbounds) > 8 {
+		return "", nil, nil, nil, fmt.Errorf("WireGuard balancer must contain 1 to 8 outbounds")
 	}
 	runtimeBalancerTag := fmt.Sprintf("__znode_wg_balancer_group_%d", routeID)
 
