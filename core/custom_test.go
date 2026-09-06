@@ -175,6 +175,38 @@ func TestWireGuardBalancerRejectsDuplicateOutboundTags(t *testing.T) {
 	}
 }
 
+func TestWireGuardBalancerValidatesNativeOutboundShape(t *testing.T) {
+	base := `{"tag":"wg-group","strategy":"roundRobin","outbounds":[{"tag":"wg-a","protocol":"wireguard","settings":{"secretKey":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=","address":["10.0.0.2/32"],"peers":[{"endpoint":"198.51.100.10:51820","publicKey":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=","allowedIPs":["0.0.0.0/0"]}]}}]}`
+	for name, mutate := range map[string]string{
+		"missing settings":   `{"tag":"wg-group","strategy":"roundRobin","outbounds":[{"tag":"wg-a","protocol":"wireguard"}]}`,
+		"missing address":    strings.Replace(base, `"address":["10.0.0.2/32"],`, "", 1),
+		"null peer":          strings.Replace(base, `{"endpoint":"198.51.100.10:51820","publicKey":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=","allowedIPs":["0.0.0.0/0"]}`, "null", 1),
+		"missing allowedIPs": strings.Replace(base, `,"allowedIPs":["0.0.0.0/0"]`, "", 1),
+		"bad reserved":       strings.Replace(base, `}]}}]}`, `}],"reserved":"AQI="}}]}`, 1),
+		"bad mtu":            strings.Replace(base, `}]}}]}`, `}],"mtu":9001}}]}`, 1),
+		"stream settings":    strings.Replace(base, `,"settings":{`, `,"streamSettings":{},"settings":{`, 1),
+	} {
+		t.Run(name, func(t *testing.T) {
+			if _, _, _, _, err := GetCustomConfig([]*panel.NodeInfo{{
+				Id: 1, Tag: "node", Common: &panel.CommonNode{Routes: []panel.Route{{Id: 20, Action: "route_wg_balancer", ActionValue: &mutate}}},
+			}}); err == nil {
+				t.Fatalf("invalid WireGuard shape was accepted")
+			}
+		})
+	}
+}
+
+func TestWireGuardBalancerRejectsZeroAndConflictingRouteIDs(t *testing.T) {
+	value := `{"tag":"wg-group","strategy":"roundRobin","outbounds":[{"tag":"wg-a","protocol":"wireguard","settings":{"secretKey":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=","address":["10.0.0.2/32"],"peers":[{"endpoint":"198.51.100.10:51820","publicKey":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=","allowedIPs":["0.0.0.0/0"]}]}},{"tag":"wg-b","protocol":"wireguard","settings":{"secretKey":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=","address":["10.0.0.3/32"],"peers":[{"endpoint":"198.51.100.11:51820","publicKey":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=","allowedIPs":["0.0.0.0/0"]}]}}]}`
+	if _, _, _, _, err := GetCustomConfig([]*panel.NodeInfo{{Id: 1, Tag: "node", Common: &panel.CommonNode{Routes: []panel.Route{{Action: "route_wg_balancer", ActionValue: &value}}}}}); err == nil {
+		t.Fatal("zero route ID was accepted")
+	}
+	conflicting := strings.Replace(value, "198.51.100.11", "203.0.113.11", 1)
+	if _, _, _, _, err := GetCustomConfig([]*panel.NodeInfo{{Id: 1, Tag: "node-a", Common: &panel.CommonNode{Routes: []panel.Route{{Id: 21, Action: "route_wg_balancer", ActionValue: &value}}}}, {Id: 2, Tag: "node-b", Common: &panel.CommonNode{Routes: []panel.Route{{Id: 21, Action: "route_wg_balancer", ActionValue: &conflicting}}}}}); err == nil {
+		t.Fatal("conflicting route ID configuration was accepted")
+	}
+}
+
 func TestWireGuardBalancerRejectsReservedGroupTags(t *testing.T) {
 	for _, tag := range []string{"Default", "block", "dns_out"} {
 		t.Run(tag, func(t *testing.T) {

@@ -223,6 +223,26 @@ type nodeTerminator interface {
 
 type coreCloser interface{ Close() error }
 
+// runtimeStartError keeps replacement cleanup failures distinguishable from
+// ordinary startup errors. Reload may roll back only after every resource owned
+// by the failed replacement has been released; otherwise a rollback would
+// create a second core/TUN on top of leaked resources.
+type runtimeStartError struct {
+	startErr   error
+	cleanupErr error
+}
+
+func (e *runtimeStartError) Error() string {
+	if e.cleanupErr == nil {
+		return e.startErr.Error()
+	}
+	return fmt.Sprintf("%v; replacement cleanup: %v", e.startErr, e.cleanupErr)
+}
+
+func (e *runtimeStartError) Unwrap() error {
+	return errors.Join(e.startErr, e.cleanupErr)
+}
+
 func prepareRuntime(configPath string) (*preparedRuntime, error) {
 	newConf := conf.New()
 	if err := newConf.LoadFromPath(configPath); err != nil {
@@ -252,11 +272,16 @@ func startPreparedRuntime(prepared *preparedRuntime, reloadCh chan struct{}, sna
 		newCore.SnapshotCh = snapshotChannels[0]
 	}
 	if err := newCore.Start(prepared.nodes.NodeInfos); err != nil {
-		return nil, errors.Join(err, newCore.Close())
+		if cleanupErr := newCore.Close(); cleanupErr != nil {
+			return nil, &runtimeStartError{startErr: err, cleanupErr: cleanupErr}
+		}
+		return nil, err
 	}
 	if err := prepared.nodes.Start(prepared.config.NodeConfigs, newCore); err != nil {
-		_ = prepared.nodes.Close()
-		_ = newCore.Close()
+		cleanupErr := errors.Join(prepared.nodes.Close(), newCore.Close())
+		if cleanupErr != nil {
+			return nil, &runtimeStartError{startErr: err, cleanupErr: cleanupErr}
+		}
 		return nil, err
 	}
 	return &runningRuntime{preparedRuntime: prepared, core: newCore, terminalNodes: prepared.nodes, terminalCore: newCore}, nil
@@ -282,13 +307,20 @@ func reloadRuntime(configPath string, old *runningRuntime, reloadCh chan struct{
 		return nil, fmt.Errorf("close old nodes: %w", err)
 	}
 	if err := old.core.Close(); err != nil {
-		if restoreErr := restorePreviousRuntime(old, reloadCh); restoreErr != nil {
-			return nil, fmt.Errorf("close old core: %w; restore previous runtime: %v", err, restoreErr)
+		// V2Core.Close intentionally keeps Server non-nil after an error. Do not
+		// construct another core here: a failed close may have left WireGuard TUNs
+		// and observatory workers alive. Restore controllers on the same core only.
+		if restoreErr := restorePreviousControllers(old); restoreErr != nil {
+			return nil, fmt.Errorf("close old core: %w; restore previous controllers: %v", err, restoreErr)
 		}
-		return nil, fmt.Errorf("close old core: %w; previous runtime restored", err)
+		return nil, fmt.Errorf("close old core: %w; previous controllers restored", err)
 	}
 	newRuntime, err := startPreparedRuntime(prepared, reloadCh, snapshotCh)
 	if err != nil {
+		var startFailure *runtimeStartError
+		if errors.As(err, &startFailure) && startFailure.cleanupErr != nil {
+			return nil, fmt.Errorf("start replacement runtime: %w; previous runtime not restored because replacement cleanup failed", err)
+		}
 		if restoreErr := restorePreviousRuntime(old, reloadCh); restoreErr != nil {
 			return nil, fmt.Errorf("start replacement runtime: %w; restore previous runtime: %v", err, restoreErr)
 		}
@@ -298,6 +330,16 @@ func reloadRuntime(configPath string, old *runningRuntime, reloadCh chan struct{
 	applyLogConfig(prepared.config)
 	runtime.GC()
 	return newRuntime, nil
+}
+
+// restorePreviousControllers reuses the still-live old core after a failed
+// core close. Starting a fresh core here could duplicate WireGuard TUNs when
+// the old close returned before all features were actually released.
+func restorePreviousControllers(old *runningRuntime) error {
+	if old == nil || old.preparedRuntime == nil || old.nodes == nil || old.core == nil {
+		return fmt.Errorf("previous runtime is unavailable")
+	}
+	return old.nodes.Start(old.config.NodeConfigs, old.core)
 }
 
 // restorePreviousRuntime is the final rollback barrier for errors that can

@@ -1,6 +1,7 @@
 package core
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"sort"
@@ -67,6 +68,9 @@ func buildWireGuardBalancer(routeID int, value *string, existing []*core.Outboun
 		if _, duplicate := seenTags[userTag]; duplicate {
 			return "", nil, nil, nil, fmt.Errorf("WireGuard balancer outbound tag %q is already in use", userTag)
 		}
+		if err := validateWireGuardOutbound(outbound); err != nil {
+			return "", nil, nil, nil, fmt.Errorf("validate WireGuard outbound %q: %w", userTag, err)
+		}
 		seenTags[userTag] = struct{}{}
 		// Manager.Select is prefix based. Do not use an operator supplied member
 		// tag as a selector: map it to a reserved per-route internal tag so an
@@ -103,6 +107,62 @@ func buildWireGuardBalancer(routeID int, value *string, existing []*core.Outboun
 		FallbackTag: tags[0],
 	}
 	return runtimeBalancerTag, builtOutbounds, balancer, tags, nil
+}
+
+// validateWireGuardOutbound enforces the standalone Xray WireGuard shape.
+// WireGuard is a native device outbound and must not carry transport settings.
+func validateWireGuardOutbound(outbound *coreConf.OutboundDetourConfig) error {
+	if outbound == nil || outbound.Settings == nil {
+		return fmt.Errorf("settings are required")
+	}
+	if outbound.StreamSetting != nil {
+		return fmt.Errorf("streamSettings is not supported")
+	}
+	var settings coreConf.WireGuardConfig
+	if err := json.Unmarshal(*outbound.Settings, &settings); err != nil {
+		return fmt.Errorf("decode settings: %w", err)
+	}
+	if strings.TrimSpace(settings.SecretKey) == "" {
+		return fmt.Errorf("secretKey is required")
+	}
+	if _, err := coreConf.ParseWireGuardKey(settings.SecretKey); err != nil {
+		return fmt.Errorf("invalid secretKey: %w", err)
+	}
+	if len(settings.Address) == 0 {
+		return fmt.Errorf("address must contain at least one value")
+	}
+	for i, address := range settings.Address {
+		if strings.TrimSpace(address) == "" {
+			return fmt.Errorf("address[%d] is empty", i)
+		}
+	}
+	if len(settings.Peers) == 0 {
+		return fmt.Errorf("peers must contain at least one peer")
+	}
+	for i, peer := range settings.Peers {
+		if peer == nil {
+			return fmt.Errorf("peers[%d] is null", i)
+		}
+		if strings.TrimSpace(peer.PublicKey) == "" {
+			return fmt.Errorf("peers[%d].publicKey is required", i)
+		}
+		if _, err := coreConf.ParseWireGuardKey(peer.PublicKey); err != nil {
+			return fmt.Errorf("peers[%d].publicKey is invalid: %w", i, err)
+		}
+		if strings.TrimSpace(peer.Endpoint) == "" {
+			return fmt.Errorf("peers[%d].endpoint is required", i)
+		}
+		if len(peer.AllowedIPs) == 0 {
+			return fmt.Errorf("peers[%d].allowedIPs must contain at least one value", i)
+		}
+	}
+	if len(settings.Reserved) != 0 && len(settings.Reserved) != 3 {
+		return fmt.Errorf("reserved must contain exactly 3 bytes")
+	}
+	if settings.MTU != 0 && (settings.MTU < 576 || settings.MTU > 9000) {
+		return fmt.Errorf("mtu must be between 576 and 9000")
+	}
+	return nil
 }
 
 func hasOutboundWithTag(list []*core.OutboundHandlerConfig, tag string) bool {
@@ -189,6 +249,7 @@ func GetCustomConfig(infos []*panel.NodeInfo) (*dns.Config, []*core.OutboundHand
 		DomainStrategy: &domainStrategy,
 	}
 	balancerTags := make(map[string]struct{})
+	balancerConfigs := make(map[string]string)
 	observedOutboundTags := make(map[string]struct{})
 
 	for _, info := range infos {
@@ -295,7 +356,21 @@ func GetCustomConfig(infos []*panel.NodeInfo) (*dns.Config, []*core.OutboundHand
 					coreOutboundConfig = append(coreOutboundConfig, customOutbound)
 				}
 			case "route_wg_balancer":
+				canonical := ""
+				if route.ActionValue != nil {
+					var compact bytes.Buffer
+					if err := json.Compact(&compact, []byte(*route.ActionValue)); err == nil {
+						canonical = compact.String()
+					}
+				}
+				runtimeTag := fmt.Sprintf("__znode_wg_balancer_group_%d", route.Id)
+				if previous, exists := balancerConfigs[runtimeTag]; exists && previous != canonical {
+					return nil, nil, nil, nil, fmt.Errorf("node %d route %d: conflicting WireGuard balancer configuration reuses route ID", info.Id, route.Id)
+				}
 				balancerTag, customOutbounds, balancer, observedTags, err := buildWireGuardBalancer(route.Id, route.ActionValue, coreOutboundConfig)
+				if err == nil && route.Id <= 0 {
+					return nil, nil, nil, nil, fmt.Errorf("node %d route %d: WireGuard balancer route ID must be positive", info.Id, route.Id)
+				}
 				if err != nil {
 					// The same saved route can be assigned to multiple node inbounds.
 					// Once built, reuse that balancer rather than treating it as a tag clash.
@@ -307,6 +382,7 @@ func GetCustomConfig(infos []*panel.NodeInfo) (*dns.Config, []*core.OutboundHand
 					coreOutboundConfig = append(coreOutboundConfig, customOutbounds...)
 					coreRouterConfig.Balancers = append(coreRouterConfig.Balancers, balancer)
 					balancerTags[balancerTag] = struct{}{}
+					balancerConfigs[balancerTag] = canonical
 					for _, tag := range observedTags {
 						observedOutboundTags[tag] = struct{}{}
 					}
