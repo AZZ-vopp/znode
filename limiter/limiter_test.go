@@ -303,8 +303,89 @@ func TestFailOpenDeviceRefreshOpensCircuitAfterRedisError(t *testing.T) {
 	tracker.circuitUntil = time.Now().Add(-time.Millisecond)
 	tracker.mu.Unlock()
 	store.allow = func(context.Context, string, string, int) (bool, error) { return false, nil }
+	if allowed, err := tracker.Observe(context.Background(), store, false, "user", "192.0.2.2", 1, 2, time.Now()); !allowed || err != nil {
+		t.Fatalf("fail-open recovery retry blocked existing traffic: allowed=%v err=%v", allowed, err)
+	}
+	waitForDeviceStoreCalls(t, store, 2)
 	if allowed, err := tracker.Observe(context.Background(), store, false, "user", "192.0.2.2", 1, 2, time.Now()); allowed || err != nil {
-		t.Fatalf("unapproved fail-open entry bypassed Redis after recovery: allowed=%v err=%v", allowed, err)
+		t.Fatalf("healthy Redis denial was not enforced after background recovery: allowed=%v err=%v", allowed, err)
+	}
+}
+
+func TestFailOpenRedisRetryNeverBlocksExistingTrafficAfterAdmissionError(t *testing.T) {
+	tracker := newDeviceTracker(nil)
+	tracker.refresh = time.Millisecond
+	started := make(chan struct{}, 1)
+	release := make(chan struct{})
+	var first atomic.Bool
+	first.Store(true)
+	store := &fakeDeviceStore{allow: func(ctx context.Context, _ string, _ string, _ int) (bool, error) {
+		if first.CompareAndSwap(true, false) {
+			return false, errors.New("redis unavailable")
+		}
+		started <- struct{}{}
+		select {
+		case <-release:
+			return true, nil
+		case <-ctx.Done():
+			return false, ctx.Err()
+		}
+	}}
+	tracker.startRemoteRefresh(1)
+	defer tracker.Close()
+
+	now := time.Now()
+	if allowed, err := tracker.Observe(context.Background(), store, false, "user", "192.0.2.1", 1, 1, now); !allowed || err == nil {
+		t.Fatalf("initial Redis failure should fail open: allowed=%v err=%v", allowed, err)
+	}
+	tracker.mu.Lock()
+	tracker.circuitUntil = time.Now().Add(-time.Millisecond)
+	tracker.mu.Unlock()
+
+	start := time.Now()
+	if allowed, err := tracker.Observe(context.Background(), store, false, "user", "192.0.2.1", 1, 1, now.Add(time.Second)); !allowed || err != nil {
+		t.Fatalf("existing traffic retry: allowed=%v err=%v", allowed, err)
+	}
+	if elapsed := time.Since(start); elapsed > 100*time.Millisecond {
+		t.Fatalf("existing traffic blocked on Redis retry for %s", elapsed)
+	}
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatal("Redis retry did not move to the background worker")
+	}
+	close(release)
+}
+
+func TestRedisHandoverDenialAfterGraceIsSynchronous(t *testing.T) {
+	tracker := newDeviceTracker(&conf.GlobalDeviceLimitConfig{CredentialHandover: true})
+	tracker.ttl = time.Second
+	tracker.grace = 20 * time.Millisecond
+	var calls atomic.Int32
+	store := &fakeDeviceStore{allow: func(context.Context, string, string, int) (bool, error) {
+		// Admit the incumbent and provisional candidate, then keep the incumbent
+		// active. Redis must synchronously reject the candidate after its grace.
+		return calls.Add(1) < 4, nil
+	}}
+	tracker.startRemoteRefresh(1)
+	defer tracker.Close()
+
+	now := time.Now()
+	ctx := context.Background()
+	if allowed, err := tracker.Observe(ctx, store, false, "user", "192.0.2.1", 1, 1, now); !allowed || err != nil {
+		t.Fatalf("incumbent admission: allowed=%v err=%v", allowed, err)
+	}
+	if allowed, err := tracker.Observe(ctx, store, false, "user", "192.0.2.2", 1, 1, now.Add(time.Millisecond)); !allowed || err != nil {
+		t.Fatalf("candidate admission: allowed=%v err=%v", allowed, err)
+	}
+	if allowed, err := tracker.Observe(ctx, store, false, "user", "192.0.2.1", 1, 1, now.Add(21*time.Millisecond)); !allowed || err != nil {
+		t.Fatalf("incumbent refresh: allowed=%v err=%v", allowed, err)
+	}
+	if allowed, err := tracker.Observe(ctx, store, false, "user", "192.0.2.2", 1, 1, now.Add(25*time.Millisecond)); allowed || err != nil {
+		t.Fatalf("candidate handover denial: allowed=%v err=%v", allowed, err)
+	}
+	if got := store.calls.Load(); got != 4 {
+		t.Fatalf("Redis handover calls = %d, want 4 synchronous decisions", got)
 	}
 }
 

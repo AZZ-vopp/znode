@@ -18,7 +18,12 @@ import (
 )
 
 const (
-	wgBalancerProbeDestination  = "https://connectivitycheck.gstatic.com/generate_204"
+	// Use Cloudflare for the routed probe. Some WireGuard providers block or
+	// throttle Google's connectivity-check hosts even when general traffic is
+	// healthy, which made every member look dead and pinned the balancer to its
+	// fallback. The direct connectivity control deliberately stays on a separate
+	// provider so an outage at one endpoint does not look like a VPS outage.
+	wgBalancerProbeDestination  = "https://cp.cloudflare.com/generate_204"
 	wgBalancerProbeConnectivity = "https://www.gstatic.com/generate_204"
 	wgBalancerInternalTagPrefix = "__znode_wg_balancer_"
 )

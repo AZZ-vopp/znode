@@ -84,6 +84,9 @@ func TestWireGuardBalancerBuildsBalancingRuleAndHealthObserver(t *testing.T) {
 	if observer == nil || len(observer.GetSubjectSelector()) != 2 || observer.GetPingConfig().GetInterval() != int64(30*time.Second) {
 		t.Fatalf("missing conservative health observer: %#v", observer)
 	}
+	if got := observer.GetPingConfig().GetDestination(); got != wgBalancerProbeDestination || strings.Contains(got, "google") || strings.Contains(got, "gstatic") {
+		t.Fatalf("WireGuard health probe still depends on Google: %q", got)
+	}
 	for _, selector := range observer.GetSubjectSelector() {
 		if !strings.HasPrefix(selector, "__znode_wg_balancer_7_") {
 			t.Fatalf("unsafe prefix selector %q", selector)

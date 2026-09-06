@@ -21,6 +21,10 @@ type deviceEntry struct {
 	handoverBlocked bool
 	lastRedisTouch  time.Time
 	remoteApproved  bool
+	// remoteAttempted separates a brand-new admission from retries after Redis
+	// failed open. Only the first admission may block the caller; later retries
+	// run in background so a Redis outage cannot pause the traffic writer.
+	remoteAttempted bool
 	remoteInFlight  bool
 }
 
@@ -100,6 +104,7 @@ func (t *deviceTracker) Observe(ctx context.Context, remote deviceStore, failClo
 			// atomic candidate decision instead of promoting based on a partial
 			// local view.
 			entry.remoteApproved = false
+			entry.remoteAttempted = false
 		} else {
 			if !t.finalizeHandoverLocked(entries, ip, now) {
 				t.mu.Unlock()
@@ -150,17 +155,21 @@ func (t *deviceTracker) Observe(ctx context.Context, remote deviceStore, failClo
 observed:
 	entry.uid = uid
 	entry.lastSeen = now
-	requiresAdmission := remote != nil && limit > 0 && !entry.remoteApproved
+	requiresAdmission := remote != nil && limit > 0 && !entry.remoteApproved && !entry.remoteAttempted
 	shouldTouchRedis := remote != nil && limit > 0 && (requiresAdmission || entry.lastRedisTouch.IsZero() || now.Sub(entry.lastRedisTouch) >= t.refresh)
 	if shouldTouchRedis && !failClosed {
 		if now.Before(t.circuitUntil) {
+			// This entry was admitted under the explicit fail-open policy. Mark the
+			// admission as attempted so its first packet after cooldown retries in
+			// the background instead of stalling an established stream.
+			entry.remoteAttempted = true
 			t.mu.Unlock()
 			return true, nil
 		}
 		// A concurrent TTL refresh may reuse the last successful admission. A
 		// concurrent first admission may not: it must obtain Redis' atomic
 		// decision too, otherwise a healthy denial could race with fail-open.
-		if entry.remoteInFlight && entry.remoteApproved {
+		if entry.remoteInFlight && (entry.remoteApproved || entry.remoteAttempted) {
 			t.mu.Unlock()
 			return true, nil
 		}
@@ -309,6 +318,7 @@ func (t *deviceTracker) completeRefresh(userKey, ip string, allowed bool, err er
 	}
 	entry := entries[ip]
 	entry.remoteInFlight = false
+	entry.remoteAttempted = true
 	if err == nil && allowed {
 		entry.remoteApproved = true
 		entry.lastRedisTouch = now
@@ -370,6 +380,7 @@ func (t *deviceTracker) markRedisTouch(userKey, ip string, now time.Time) {
 	if entries := t.users[userKey]; entries != nil {
 		if entry := entries[ip]; entry != nil {
 			entry.remoteApproved = true
+			entry.remoteAttempted = true
 			entry.lastRedisTouch = now
 			entry.remoteInFlight = false
 		}
