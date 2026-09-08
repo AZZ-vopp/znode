@@ -757,8 +757,8 @@ generate_znode_agent_config() {
         "AgentToken": "${agent_token}",
         "PollInterval": ${poll_interval},
         "GlobalDeviceLimitConfig": {
-            "Enable": true,
-            "SyncEnabled": true,
+            "Enable": false,
+            "SyncEnabled": false,
             "SyncChannel": "v2board:device-sync",
             "RedisNetwork": "tcp",
             "RedisAddr": "127.0.0.1:6379",
