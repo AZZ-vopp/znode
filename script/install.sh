@@ -226,6 +226,63 @@ migrate_legacy_connection_profile() {
     echo -e "${green}Đã nâng giới hạn kết nối cũ cho luồng video.${plain}"
 }
 
+# Agent Redis settings are delivered by the signed ZBoard manifest and kept in
+# the root-only runtime snapshot. Older installers wrote a disabled localhost
+# example into config.json; remove only that exact generated object so it can no
+# longer be mistaken for the effective Redis endpoint. Any operator-customized
+# fallback is preserved byte-for-byte.
+migrate_legacy_agent_redis_placeholder() {
+    local config_file="${1:-/etc/znode/config.json}"
+    local temporary
+    [[ -f "$config_file" ]] || return 0
+    grep -Fq '"GlobalDeviceLimitConfig"' "$config_file" || return 0
+
+    temporary=$(mktemp "${config_file}.XXXXXX") || return 1
+    if ! awk '
+        {
+            lines[NR] = $0
+            if (start == 0 && $0 ~ /^[[:space:]]*"GlobalDeviceLimitConfig"[[:space:]]*:[[:space:]]*\{[[:space:]]*$/) {
+                start = NR
+                next
+            }
+            if (start > 0 && finish == 0 && NR > start && $0 ~ /^[[:space:]]*\}[[:space:]]*,?[[:space:]]*$/) {
+                finish = NR
+            }
+        }
+        END {
+            expected = "\"GlobalDeviceLimitConfig\":{\"Enable\":false,\"SyncEnabled\":false,\"SyncChannel\":\"v2board:device-sync\",\"RedisNetwork\":\"tcp\",\"RedisAddr\":\"127.0.0.1:6379\",\"RedisDB\":0,\"Timeout\":2,\"Expiry\":120,\"RefreshInterval\":40,\"MaxIPsPerUser\":256,\"KeyPrefix\":\"znode:device\",\"FailClosed\":false}"
+            actual = ""
+            if (start > 0 && finish >= start) {
+                for (i = start; i <= finish; i++) {
+                    compact = lines[i]
+                    gsub(/[[:space:]]/, "", compact)
+                    actual = actual compact
+                }
+            }
+            remove = (actual == expected)
+            for (i = 1; i <= NR; i++) {
+                if (remove && i >= start && i <= finish) continue
+                output = lines[i]
+                if (remove && i == start - 1) sub(/,[[:space:]]*$/, "", output)
+                print output
+            }
+        }
+    ' "$config_file" > "$temporary"; then
+        rm -f "$temporary"
+        return 1
+    fi
+
+    if cmp -s "$config_file" "$temporary"; then
+        rm -f "$temporary"
+        return 0
+    fi
+    if ! chmod 600 "$temporary" || ! mv -f "$temporary" "$config_file"; then
+        rm -f "$temporary"
+        return 1
+    fi
+    echo -e "${green}Đã bỏ Redis localhost mẫu; ZNode sẽ dùng Redis do ZBoard Agent đồng bộ.${plain}"
+}
+
 secure_znode_config_permissions() {
     local config_file="/etc/znode/config.json"
     [[ -e "$config_file" ]] || return 0
@@ -757,21 +814,7 @@ generate_znode_agent_config() {
         "AgentID": "${agent_id}",
 		"AgentInstanceID": "${agent_instance_id}",
         "AgentToken": "${agent_token}",
-        "PollInterval": ${poll_interval},
-        "GlobalDeviceLimitConfig": {
-            "Enable": false,
-            "SyncEnabled": false,
-            "SyncChannel": "v2board:device-sync",
-            "RedisNetwork": "tcp",
-            "RedisAddr": "127.0.0.1:6379",
-            "RedisDB": 0,
-            "Timeout": 2,
-            "Expiry": 120,
-            "RefreshInterval": 40,
-            "MaxIPsPerUser": 256,
-            "KeyPrefix": "znode:device",
-            "FailClosed": false
-        }
+        "PollInterval": ${poll_interval}
     },
     "Nodes": []
 }
@@ -1328,6 +1371,13 @@ EOF
             echo -e "${red}Không thể nâng cấu hình kết nối; đang rollback runtime.${plain}"
             if ! rollback_activated_runtime "$had_previous"; then
                 echo -e "${red}Không thể rollback sau lỗi migration; hãy kiểm tra dịch vụ thủ công.${plain}"
+            fi
+            exit 1
+        fi
+        if ! migrate_legacy_agent_redis_placeholder; then
+            echo -e "${red}Không thể dọn Redis localhost mẫu; đang rollback runtime.${plain}"
+            if ! rollback_activated_runtime "$had_previous"; then
+                echo -e "${red}Không thể rollback sau lỗi migration Redis; hãy kiểm tra dịch vụ thủ công.${plain}"
             fi
             exit 1
         fi

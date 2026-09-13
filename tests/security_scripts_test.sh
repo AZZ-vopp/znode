@@ -148,6 +148,51 @@ migrate_legacy_connection_profile "$migration_directory/custom.json" >/dev/null
 grep -Fq '"MaxConnectionsPerUser":256,' "$migration_directory/custom.json" \
     || fail 'custom per-user session limit was unexpectedly changed'
 
+eval "$(extract_function_before "$installer" migrate_legacy_agent_redis_placeholder secure_znode_config_permissions)"
+cat > "$migration_directory/legacy-redis.json" <<'EOF'
+{
+  "Agent": {
+    "PollInterval": 15,
+    "GlobalDeviceLimitConfig": {
+      "Enable": false,
+      "SyncEnabled": false,
+      "SyncChannel": "v2board:device-sync",
+      "RedisNetwork": "tcp",
+      "RedisAddr": "127.0.0.1:6379",
+      "RedisDB": 0,
+      "Timeout": 2,
+      "Expiry": 120,
+      "RefreshInterval": 40,
+      "MaxIPsPerUser": 256,
+      "KeyPrefix": "znode:device",
+      "FailClosed": false
+    }
+  }
+}
+EOF
+migrate_legacy_agent_redis_placeholder "$migration_directory/legacy-redis.json" >/dev/null
+not_contains "$migration_directory/legacy-redis.json" 'GlobalDeviceLimitConfig'
+not_contains "$migration_directory/legacy-redis.json" '127.0.0.1:6379'
+grep -Fq '"PollInterval": 15' "$migration_directory/legacy-redis.json" \
+    || fail 'Redis placeholder migration damaged the preceding Agent setting'
+
+cat > "$migration_directory/custom-redis.json" <<'EOF'
+{
+  "Agent": {
+    "PollInterval": 15,
+    "GlobalDeviceLimitConfig": {
+      "Enable": true,
+      "RedisAddr": "redis.custom:6380",
+      "Timeout": 3
+    }
+  }
+}
+EOF
+cp "$migration_directory/custom-redis.json" "$migration_directory/custom-redis.before"
+migrate_legacy_agent_redis_placeholder "$migration_directory/custom-redis.json" >/dev/null
+cmp -s "$migration_directory/custom-redis.before" "$migration_directory/custom-redis.json" \
+    || fail 'custom Redis fallback was unexpectedly changed'
+
 eval "$(extract_function_before "$installer" rewrite_agent_token validate_existing_agent_binding)"
 test_directory=$(mktemp -d)
 trap 'rm -rf "$test_directory"' EXIT
@@ -299,6 +344,8 @@ contains "$installer" '"DisableUDPContentSniffing": false'
 contains "$installer" '"MaxConnectionsPerUser": 512'
 contains "$installer" 's/"MaxConnectionsPerUser"[[:space:]]*:[[:space:]]*128[[:space:]]*,/"MaxConnectionsPerUser": 512,/'
 not_contains "$installer" 's/"DisableUDPContentSniffing"[[:space:]]*:[[:space:]]*true/"DisableUDPContentSniffing": false/'
+not_contains "$installer" '"RedisAddr": "127.0.0.1:6379"'
+contains "$installer" 'migrate_legacy_agent_redis_placeholder'
 
 rollback_geodata_line=$(grep -nF 'if ! install_runtime_geodata /usr/local/znode; then' "$manager" | head -n 1 | cut -d: -f1)
 rollback_start_line=$(grep -nF '    start_znode_service || true' "$manager" | head -n 1 | cut -d: -f1)
