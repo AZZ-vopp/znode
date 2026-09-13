@@ -228,9 +228,9 @@ migrate_legacy_connection_profile() {
 
 # Agent Redis settings are delivered by the signed ZBoard manifest and kept in
 # the root-only runtime snapshot. Older installers wrote a disabled localhost
-# example into config.json; remove only that exact generated object so it can no
-# longer be mistaken for the effective Redis endpoint. Any operator-customized
-# fallback is preserved byte-for-byte.
+# example into config.json; remove any Agent fallback that still points at the
+# local Redis port so it cannot override or confuse the panel-supplied endpoint.
+# Remote operator-configured fallbacks are preserved byte-for-byte.
 migrate_legacy_agent_redis_placeholder() {
     local config_file="${1:-/etc/znode/config.json}"
     local temporary
@@ -250,7 +250,6 @@ migrate_legacy_agent_redis_placeholder() {
             }
         }
         END {
-            expected = "\"GlobalDeviceLimitConfig\":{\"Enable\":false,\"SyncEnabled\":false,\"SyncChannel\":\"v2board:device-sync\",\"RedisNetwork\":\"tcp\",\"RedisAddr\":\"127.0.0.1:6379\",\"RedisDB\":0,\"Timeout\":2,\"Expiry\":120,\"RefreshInterval\":40,\"MaxIPsPerUser\":256,\"KeyPrefix\":\"znode:device\",\"FailClosed\":false}"
             actual = ""
             if (start > 0 && finish >= start) {
                 for (i = start; i <= finish; i++) {
@@ -259,7 +258,7 @@ migrate_legacy_agent_redis_placeholder() {
                     actual = actual compact
                 }
             }
-            remove = (actual == expected)
+            remove = (index(actual, "\"RedisAddr\":\"127.0.0.1:6379\"") > 0)
             for (i = 1; i <= NR; i++) {
                 if (remove && i >= start && i <= finish) continue
                 output = lines[i]

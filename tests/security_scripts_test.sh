@@ -193,6 +193,22 @@ migrate_legacy_agent_redis_placeholder "$migration_directory/custom-redis.json" 
 cmp -s "$migration_directory/custom-redis.before" "$migration_directory/custom-redis.json" \
     || fail 'custom Redis fallback was unexpectedly changed'
 
+cat > "$migration_directory/enabled-local-redis.json" <<'EOF'
+{
+  "Agent": {
+    "PollInterval": 15,
+    "GlobalDeviceLimitConfig": {
+      "Enable": true,
+      "SyncEnabled": true,
+      "RedisAddr": "127.0.0.1:6379",
+      "Timeout": 2
+    }
+  }
+}
+EOF
+migrate_legacy_agent_redis_placeholder "$migration_directory/enabled-local-redis.json" >/dev/null
+not_contains "$migration_directory/enabled-local-redis.json" '127.0.0.1:6379'
+
 eval "$(extract_function_before "$installer" rewrite_agent_token validate_existing_agent_binding)"
 test_directory=$(mktemp -d)
 trap 'rm -rf "$test_directory"' EXIT
