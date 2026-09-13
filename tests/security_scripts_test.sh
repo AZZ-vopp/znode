@@ -134,6 +134,20 @@ if https_api_origin 'https://panel.example:70000' >/dev/null; then
     fail 'out-of-range HTTPS port was accepted'
 fi
 
+green=
+plain=
+eval "$(extract_function_before "$installer" migrate_legacy_connection_profile secure_znode_config_permissions)"
+migration_directory=$(mktemp -d)
+trap 'rm -rf "$migration_directory"' EXIT
+printf '%s\n' '{"ConnectionConfig":{"MaxConnectionsPerUser":128,"MaxConnections":32768}}' > "$migration_directory/legacy.json"
+migrate_legacy_connection_profile "$migration_directory/legacy.json" >/dev/null
+grep -Fq '"MaxConnectionsPerUser": 512,' "$migration_directory/legacy.json" \
+    || fail 'legacy per-user session limit was not migrated to 512'
+printf '%s\n' '{"ConnectionConfig":{"MaxConnectionsPerUser":256,"MaxConnections":32768}}' > "$migration_directory/custom.json"
+migrate_legacy_connection_profile "$migration_directory/custom.json" >/dev/null
+grep -Fq '"MaxConnectionsPerUser":256,' "$migration_directory/custom.json" \
+    || fail 'custom per-user session limit was unexpectedly changed'
+
 eval "$(extract_function_before "$installer" rewrite_agent_token validate_existing_agent_binding)"
 test_directory=$(mktemp -d)
 trap 'rm -rf "$test_directory"' EXIT
@@ -282,6 +296,8 @@ openrc_restart_line=$(grep -nF '            service znode restart' "$installer" 
 [[ "$openrc_restart_line" -gt "$migration_line" ]] || fail 'Alpine update must restart, not merely start, the service'
 
 contains "$installer" '"DisableUDPContentSniffing": false'
+contains "$installer" '"MaxConnectionsPerUser": 512'
+contains "$installer" 's/"MaxConnectionsPerUser"[[:space:]]*:[[:space:]]*128[[:space:]]*,/"MaxConnectionsPerUser": 512,/'
 not_contains "$installer" 's/"DisableUDPContentSniffing"[[:space:]]*:[[:space:]]*true/"DisableUDPContentSniffing": false/'
 
 rollback_geodata_line=$(grep -nF 'if ! install_runtime_geodata /usr/local/znode; then' "$manager" | head -n 1 | cut -d: -f1)

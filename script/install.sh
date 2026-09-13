@@ -200,10 +200,10 @@ EOF
 # DisableUDPContentSniffing here: an existing true value may be an operator's
 # deliberate choice rather than an installer-generated default.
 migrate_legacy_connection_profile() {
-    local config_file="/etc/znode/config.json"
+    local config_file="${1:-/etc/znode/config.json}"
     local temporary
     [[ -f "$config_file" ]] || return 0
-    if ! grep -Eq '"Handshake"[[:space:]]*:[[:space:]]*4([[:space:]]*,)|"ConnIdle"[[:space:]]*:[[:space:]]*30([[:space:]]*,)|"BufferSize"[[:space:]]*:[[:space:]]*16([[:space:]]*,)' "$config_file"; then
+    if ! grep -Eq '"Handshake"[[:space:]]*:[[:space:]]*4([[:space:]]*,)|"ConnIdle"[[:space:]]*:[[:space:]]*30([[:space:]]*,)|"BufferSize"[[:space:]]*:[[:space:]]*16([[:space:]]*,)|"MaxConnectionsPerUser"[[:space:]]*:[[:space:]]*128([[:space:]]*,|[[:space:]]*})' "$config_file"; then
         return 0
     fi
     temporary=$(mktemp "${config_file}.XXXXXX") || return 1
@@ -212,6 +212,8 @@ migrate_legacy_connection_profile() {
         -e 's/"Handshake"[[:space:]]*:[[:space:]]*4[[:space:]]*,/"Handshake": 15,/' \
         -e 's/"ConnIdle"[[:space:]]*:[[:space:]]*30[[:space:]]*,/"ConnIdle": 120,/' \
         -e 's/"BufferSize"[[:space:]]*:[[:space:]]*16[[:space:]]*,/"BufferSize": 128,/' \
+        -e 's/"MaxConnectionsPerUser"[[:space:]]*:[[:space:]]*128[[:space:]]*,/"MaxConnectionsPerUser": 512,/' \
+        -e 's/"MaxConnectionsPerUser"[[:space:]]*:[[:space:]]*128[[:space:]]*}/"MaxConnectionsPerUser": 512}/' \
         "$config_file" > "$temporary"; then
         rm -f "$temporary"
         return 1
@@ -746,7 +748,7 @@ generate_znode_agent_config() {
         "DownlinkOnly": 4,
         "BufferSize": 128,
         "DisableUDPContentSniffing": false,
-        "MaxConnectionsPerUser": 128,
+        "MaxConnectionsPerUser": 512,
         "MaxConnections": 32768
     },
     "Agent": {
