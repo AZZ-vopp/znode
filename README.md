@@ -68,8 +68,12 @@ sửa và build sẽ dừng ngay nếu patch không còn tương thích với fo
 
 ## Relay UDP PROXY v2
 
-Với Hysteria2 hoặc TUIC qua relay SNAT, chạy relay tích hợp để gửi PROXY v2 UDP
-trên từng datagram:
+Với Hysteria2 hoặc TUIC qua relay SNAT, bật **Tự động relay UDP PROXY v2 qua VPS
+Agent** trong Node Editor của ZBoard. Panel sẽ tự lấy cổng dịch vụ của node gốc
+làm cổng relay và gửi cấu hình `udp_relays` trong Agent manifest; ZNode trên VPS
+relay tự mở, cập nhật hoặc dừng listener, không cần chạy lệnh thủ công.
+
+Lệnh dưới đây chỉ là chế độ thủ công/diagnostic khi không dùng Agent manifest:
 
 ```bash
 znode udp-relay --network udp4 --listen :443 --upstream ZNODE_IPV4:443 --ttl 2m --max-flows 512
