@@ -1,0 +1,215 @@
+diff --git a/transport/internet/proxy_packet_conn.go b/transport/internet/proxy_packet_conn.go
+new file mode 100644
+index 0000000..0000000
+--- /dev/null
++++ b/transport/internet/proxy_packet_conn.go
+@@ -0,0 +1,189 @@
++package internet
++
++import (
++	"fmt"
++	stdnet "net"
++	"sync"
++	"time"
++
++	"github.com/pires/go-proxyproto"
++	"github.com/xtls/xray-core/common/net"
++)
++
++// UDP PROXY protocol is datagram scoped: a valid v2 UDP header is required
++// before every QUIC datagram. The wrapper exposes the logical client address
++// to QUIC and routes its replies to the physical relay which sent that
++// datagram. The table is deliberately bounded and expires idle flows.
++const (
++	proxyPacketConnTTL      = 2 * time.Minute
++	proxyPacketConnMaxFlows = 65536
++	proxyPacketConnBuffer   = 65535
++)
++
++type proxyPacketFlow struct {
++	relay    net.Addr
++	lastSeen time.Time
++}
++
++type proxyPacketConn struct {
++	net.PacketConn
++	mu                  sync.Mutex
++	flows               map[string]proxyPacketFlow
++	ttl                 time.Duration
++	maxFlows            int
++	nextCleanup         time.Time
++	nextCapacityCleanup time.Time
++	trusted             []*stdnet.IPNet
++}
++
++var proxyPacketConnBuffers = sync.Pool{New: func() any {
++	return make([]byte, proxyPacketConnBuffer)
++}}
++
++func newProxyPacketConn(conn net.PacketConn, trusted []string) (net.PacketConn, error) {
++	ranges, err := parseProxyPacketTrustedRanges(trusted)
++	if err != nil {
++		return nil, err
++	}
++	return &proxyPacketConn{
++		PacketConn: conn,
++		flows:      make(map[string]proxyPacketFlow),
++		ttl:        proxyPacketConnTTL,
++		maxFlows:   proxyPacketConnMaxFlows,
++		trusted:    ranges,
++	}, nil
++}
++
++func (c *proxyPacketConn) ReadFrom(p []byte) (int, net.Addr, error) {
++	buffer := proxyPacketConnBuffers.Get().([]byte)
++	defer proxyPacketConnBuffers.Put(buffer)
++	for {
++		n, relay, err := c.PacketConn.ReadFrom(buffer)
++		if err != nil {
++			return 0, nil, err
++		}
++		if !c.isTrustedRelay(relay) {
++			continue
++		}
++		header, payload, err := proxyproto.ParseUDPDatagram(buffer[:n])
++		if err != nil || header == nil || header.Version != 2 || header.Command != proxyproto.PROXY ||
++			(header.TransportProtocol != proxyproto.UDPv4 && header.TransportProtocol != proxyproto.UDPv6) {
++			continue
++		}
++		source, destination, ok := header.UDPAddrs()
++		if !ok || source == nil || destination == nil || source.IP == nil || destination.IP == nil || source.Port <= 0 || destination.Port <= 0 {
++			continue
++		}
++		if !c.remember(source, relay) {
++			continue
++		}
++		return copy(p, payload), source, nil
++	}
++}
++
++func (c *proxyPacketConn) WriteTo(p []byte, addr net.Addr) (int, error) {
++	relay, ok := c.relayFor(addr)
++	if !ok {
++		return 0, fmt.Errorf("no active UDP PROXY protocol flow for %q", addr)
++	}
++	return c.PacketConn.WriteTo(p, relay)
++}
++
++func (c *proxyPacketConn) remember(source net.Addr, relay net.Addr) bool {
++	key := source.String()
++	now := time.Now()
++	c.mu.Lock()
++	defer c.mu.Unlock()
++	c.cleanupLocked(now, false)
++	if _, exists := c.flows[key]; !exists && len(c.flows) >= c.maxFlows {
++		// The periodic sweep is intentionally not on every packet. When the
++		// table is full, allow at most one extra full sweep per second so
++		// expired entries cannot block new QUIC clients for the whole normal
++		// cleanup interval while a spoofed-source flood cannot force O(n) work
++		// on every datagram.
++		if c.nextCapacityCleanup.IsZero() || !now.Before(c.nextCapacityCleanup) {
++			c.cleanupLocked(now, true)
++			c.nextCapacityCleanup = now.Add(time.Second)
++		}
++	}
++	if _, exists := c.flows[key]; !exists && len(c.flows) >= c.maxFlows {
++		return false
++	}
++	c.flows[key] = proxyPacketFlow{relay: relay, lastSeen: now}
++	return true
++}
++
++func (c *proxyPacketConn) relayFor(source net.Addr) (net.Addr, bool) {
++	key := source.String()
++	now := time.Now()
++	c.mu.Lock()
++	defer c.mu.Unlock()
++	c.cleanupLocked(now, false)
++	flow, ok := c.flows[key]
++	if !ok {
++		return nil, false
++	}
++	flow.lastSeen = now
++	c.flows[key] = flow
++	return flow.relay, true
++}
++
++func (c *proxyPacketConn) cleanupLocked(now time.Time, force bool) {
++	if !force && !c.nextCleanup.IsZero() && now.Before(c.nextCleanup) {
++		return
++	}
++	for key, flow := range c.flows {
++		if now.Sub(flow.lastSeen) >= c.ttl {
++			delete(c.flows, key)
++		}
++	}
++	interval := c.ttl / 2
++	if interval <= 0 {
++		interval = time.Second
++	}
++	if interval > 30*time.Second {
++		interval = 30 * time.Second
++	}
++	c.nextCleanup = now.Add(interval)
++}
++
++func (c *proxyPacketConn) isTrustedRelay(relay net.Addr) bool {
++	udpRelay, ok := relay.(*net.UDPAddr)
++	if !ok || udpRelay.IP == nil {
++		return false
++	}
++	for _, trusted := range c.trusted {
++		if trusted.Contains(udpRelay.IP) {
++			return true
++		}
++	}
++	return false
++}
++
++func parseProxyPacketTrustedRanges(values []string) ([]*stdnet.IPNet, error) {
++	if len(values) == 0 {
++		return nil, fmt.Errorf("UDP PROXY protocol requires trusted relay IP/CIDR")
++	}
++	ranges := make([]*stdnet.IPNet, 0, len(values))
++	for _, value := range values {
++		if ip := stdnet.ParseIP(value); ip != nil {
++			bits := 128
++			if ip.To4() != nil {
++				ip = ip.To4()
++				bits = 32
++			}
++			ranges = append(ranges, &stdnet.IPNet{IP: ip, Mask: stdnet.CIDRMask(bits, bits)})
++			continue
++		}
++		_, network, err := stdnet.ParseCIDR(value)
++		if err != nil {
++			return nil, fmt.Errorf("invalid UDP PROXY trusted relay %q", value)
++		}
++		ones, _ := network.Mask.Size()
++		if ones == 0 {
++			return nil, fmt.Errorf("UDP PROXY trusted relay %q must not be a wildcard CIDR", value)
++		}
++		ranges = append(ranges, network)
++	}
++	return ranges, nil
++}
+diff --git a/transport/internet/system_listener.go b/transport/internet/system_listener.go
+index 50d8a4c..0000000 100644
+--- a/transport/internet/system_listener.go
++++ b/transport/internet/system_listener.go
+@@ -178,5 +178,14 @@ func (dl *DefaultListener) ListenPacket(ctx context.Context, addr net.Addr, sock
+ 
+ 	lc.Control = getControlFunc(ctx, sockopt, dl.controllers)
+ 
+-	return lc.ListenPacket(ctx, addr.Network(), addr.String())
++	conn, err := lc.ListenPacket(ctx, addr.Network(), addr.String())
++	if err != nil || sockopt == nil || !sockopt.AcceptProxyProtocol {
++		return conn, err
++	}
++	wrapped, wrapErr := newProxyPacketConn(conn, sockopt.TrustedXForwardedFor)
++	if wrapErr != nil {
++		_ = conn.Close()
++		return nil, wrapErr
++	}
++	return wrapped, nil
+ }

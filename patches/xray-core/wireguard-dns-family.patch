@@ -1,0 +1,84 @@
+diff --git a/proxy/wireguard/netstack.go b/proxy/wireguard/netstack.go
+--- a/proxy/wireguard/netstack.go
++++ b/proxy/wireguard/netstack.go
+@@ -500,6 +500,10 @@ func skipToAnswer(p *dnsmessage.Parser, qtype dnsmessage.Type) error {
+ 	}
+ }
+ 
++func (tnet *Net) canReachDNSServer(server netip.Addr) bool {
++	return server.Is4() && tnet.hasV4 || server.Is6() && tnet.hasV6
++}
++
+ func (tnet *Net) tryOneName(ctx context.Context, name string, qtype dnsmessage.Type) (dnsmessage.Parser, string, error) {
+ 	var lastErr error
+ 
+@@ -515,6 +519,9 @@ func (tnet *Net) tryOneName(ctx context.Context, name string, qtype dnsmessage.T
+ 
+ 	for i := 0; i < 2; i++ {
+ 		for _, server := range tnet.dnsServers {
++			if !tnet.canReachDNSServer(server) {
++				continue
++			}
+ 			p, h, err := tnet.exchange(ctx, server, q, time.Second*5)
+ 			if err != nil {
+ 				dnsErr := &net.DNSError{
+diff --git a/proxy/wireguard/netstack_test.go b/proxy/wireguard/netstack_test.go
+new file mode 100644
+--- /dev/null
++++ b/proxy/wireguard/netstack_test.go
+@@ -0,0 +1,55 @@
++package wireguard
++
++import (
++	"net/netip"
++	"testing"
++)
++
++func TestNetCanReachDNSServer(t *testing.T) {
++	ipv4DNS := netip.MustParseAddr("1.1.1.1")
++	ipv6DNS := netip.MustParseAddr("2606:4700:4700::1111")
++
++	tests := []struct {
++		name     string
++		net      *Net
++		server   netip.Addr
++		reachable bool
++	}{
++		{
++			name:      "IPv4 tunnel accepts IPv4 DNS",
++			net:       &Net{hasV4: true},
++			server:    ipv4DNS,
++			reachable: true,
++		},
++		{
++			name:   "IPv4 tunnel rejects IPv6 DNS",
++			net:    &Net{hasV4: true},
++			server: ipv6DNS,
++		},
++		{
++			name:      "IPv6 tunnel accepts IPv6 DNS",
++			net:       &Net{hasV6: true},
++			server:    ipv6DNS,
++			reachable: true,
++		},
++		{
++			name:   "IPv6 tunnel rejects IPv4 DNS",
++			net:    &Net{hasV6: true},
++			server: ipv4DNS,
++		},
++		{
++			name:      "dual-stack tunnel accepts IPv6 DNS",
++			net:       &Net{hasV4: true, hasV6: true},
++			server:    ipv6DNS,
++			reachable: true,
++		},
++	}
++
++	for _, test := range tests {
++		t.Run(test.name, func(t *testing.T) {
++			if got := test.net.canReachDNSServer(test.server); got != test.reachable {
++				t.Fatalf("canReachDNSServer(%s) = %t, want %t", test.server, got, test.reachable)
++			}
++		})
++	}
++}

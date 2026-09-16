@@ -1,0 +1,55 @@
+diff --git a/transport/internet/hysteria/hub.go b/transport/internet/hysteria/hub.go
+--- a/transport/internet/hysteria/hub.go
++++ b/transport/internet/hysteria/hub.go
+@@ -2,7 +2,9 @@ package hysteria
+ 
+ import (
+ 	"context"
+ 	gotls "crypto/tls"
++	stderrors "errors"
++	stdnet "net"
+ 	"net/http"
+ 	"net/http/httputil"
+ 	"net/url"
+@@ -165,7 +167,32 @@ func (l *Listener) handleClient(conn *quic.Conn) {
+ 		Handler:          handler,
+ 		StreamDispatcher: handler.StreamDispatcher,
+ 	}
+-	_ = h3s.ServeQUICConn(conn)
++	serveErr := h3s.ServeQUICConn(conn)
++	cause := context.Cause(conn.Context())
++	if cause == nil {
++		cause = serveErr
++	}
++	var idleTimeoutError *quic.IdleTimeoutError
++	if stderrors.As(cause, &idleTimeoutError) {
++		stats := conn.ConnectionStats()
++		remoteIP := conn.RemoteAddr().String()
++		if host, _, splitErr := stdnet.SplitHostPort(remoteIP); splitErr == nil {
++			remoteIP = host
++		}
++		errors.LogWarning(context.Background(),
++			"hysteria QUIC idle timeout",
++			" client_ip=", remoteIP,
++			" server_idle_timeout_seconds=", l.quicParams.MaxIdleTimeout,
++			" keepalive_seconds=", l.quicParams.KeepAlivePeriod,
++			" smoothed_rtt=", stats.SmoothedRTT,
++			" packets_sent=", stats.PacketsSent,
++			" packets_received=", stats.PacketsReceived,
++			" packets_lost=", stats.PacketsLost,
++			" bytes_sent=", stats.BytesSent,
++			" bytes_received=", stats.BytesReceived,
++			" bytes_lost=", stats.BytesLost,
++		)
++	}
+ 	_ = conn.CloseWithError(closeErrCodeOK, "")
+ }
+ 
+@@ -267,6 +294,7 @@ func listenHysteria(
+ 		InitialConnectionReceiveWindow: quicParams.InitConnReceiveWindow,
+ 		MaxConnectionReceiveWindow:     quicParams.MaxConnReceiveWindow,
+ 		MaxIdleTimeout:                 time.Duration(quicParams.MaxIdleTimeout) * time.Second,
++		KeepAlivePeriod:                time.Duration(quicParams.KeepAlivePeriod) * time.Second,
+ 		MaxIncomingStreams:             quicParams.MaxIncomingStreams,
+ 		DisablePathMTUDiscovery:        quicParams.DisablePathMtuDiscovery || (runtime.GOOS != "linux" && runtime.GOOS != "windows" && runtime.GOOS != "darwin"),
+ 		EnableDatagrams:                true,

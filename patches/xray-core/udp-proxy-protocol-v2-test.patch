@@ -1,0 +1,93 @@
+diff --git a/transport/internet/proxy_packet_conn_test.go b/transport/internet/proxy_packet_conn_test.go
+new file mode 100644
+index 0000000..0000000
+--- /dev/null
++++ b/transport/internet/proxy_packet_conn_test.go
+@@ -0,0 +1,87 @@
++package internet
++
++import (
++	stdnet "net"
++	"testing"
++	"time"
++
++	"github.com/pires/go-proxyproto"
++)
++
++func TestProxyPacketConnReadsV2UDPAndRoutesReply(t *testing.T) {
++	inner, err := stdnet.ListenUDP("udp", &stdnet.UDPAddr{IP: stdnet.IPv4(127, 0, 0, 1), Port: 0})
++	if err != nil {
++		t.Fatal(err)
++	}
++	defer inner.Close()
++
++	wrappedConn, err := newProxyPacketConn(inner, []string{"127.0.0.1/32"})
++	if err != nil {
++		t.Fatal(err)
++	}
++	wrapped := wrappedConn.(*proxyPacketConn)
++	wrapped.maxFlows = 1
++	relay, err := stdnet.DialUDP("udp", nil, inner.LocalAddr().(*stdnet.UDPAddr))
++	if err != nil {
++		t.Fatal(err)
++	}
++	defer relay.Close()
++
++	// A raw packet must be ignored; the following valid packet is still read.
++	if _, err := relay.Write([]byte("raw")); err != nil {
++		t.Fatal(err)
++	}
++	source := &stdnet.UDPAddr{IP: stdnet.IPv4(127, 0, 0, 2), Port: 21000}
++	header := proxyproto.HeaderProxyFromAddrs(2, source, inner.LocalAddr())
++	datagram, err := header.FormatUDPDatagram([]byte("quic"))
++	if err != nil {
++		t.Fatal(err)
++	}
++	if _, err := relay.Write(datagram); err != nil {
++		t.Fatal(err)
++	}
++
++	buffer := make([]byte, 64)
++	n, client, err := wrapped.ReadFrom(buffer)
++	if err != nil {
++		t.Fatal(err)
++	}
++	if client.String() != source.String() || string(buffer[:n]) != "quic" {
++		t.Fatalf("client=%v payload=%q", client, buffer[:n])
++	}
++	if _, err := wrapped.WriteTo([]byte("reply"), client); err != nil {
++		t.Fatal(err)
++	}
++	_ = relay.SetReadDeadline(time.Now().Add(time.Second))
++	n, err = relay.Read(buffer)
++	if err != nil {
++		t.Fatal(err)
++	}
++	if string(buffer[:n]) != "reply" {
++		t.Fatalf("reply=%q", buffer[:n])
++	}
++
++	other := &stdnet.UDPAddr{IP: stdnet.IPv4(127, 0, 0, 3), Port: 21001}
++	if wrapped.remember(other, relay.LocalAddr()) {
++		t.Fatal("flow cap did not reject a new source")
++	}
++	wrapped.mu.Lock()
++	flow := wrapped.flows[source.String()]
++	flow.lastSeen = time.Now().Add(-wrapped.ttl - time.Second)
++	wrapped.flows[source.String()] = flow
++	wrapped.nextCleanup = time.Now().Add(30 * time.Second)
++	wrapped.nextCapacityCleanup = time.Time{}
++	wrapped.mu.Unlock()
++	if !wrapped.remember(other, relay.LocalAddr()) {
++		t.Fatal("capacity cleanup did not free an expired flow")
++	}
++}
++
++func TestProxyPacketConnRequiresSpecificTrustedRelay(t *testing.T) {
++	if _, err := newProxyPacketConn(nil, nil); err == nil {
++		t.Fatal("missing trusted relay list must fail")
++	}
++	if _, err := newProxyPacketConn(nil, []string{"0.0.0.0/0"}); err == nil {
++		t.Fatal("wildcard trusted relay must fail")
++	}
++}

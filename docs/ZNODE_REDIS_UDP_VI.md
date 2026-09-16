@@ -1,0 +1,159 @@
+# ZNode: device limit Redis và tối ưu UDP
+
+## Bật giới hạn thiết bị dùng Redis
+
+Đặt `GlobalDeviceLimitConfig` trong từng node. Các node dùng cùng panel/API host
+và cùng Redis sẽ chia sẻ giới hạn theo UUID credential (không lưu UUID thô trong
+Redis; key được băm SHA-256):
+
+Bản cài ZNode mới mặc định để `Enable=false` và `SyncEnabled=false` để không tự
+đánh thức Redis giả tại `127.0.0.1:6379`. Chỉ bật hai cờ này sau khi Redis Agent
+HA đã được tạo trong ZBoard và manifest cấp đúng `RedisAddr`, TLS CA, username
+và password. Khi manifest Redis Agent khỏe, ZBoard tự gửi cấu hình đã xác minh
+và ZNode sẽ bật limiter/Pub/Sub bằng endpoint đó.
+
+Thay đổi endpoint, TLS, Sentinel hoặc công tắc Redis từ Agent manifest được
+hot-swap trên limiter đang chạy. ZNode giữ tracker thiết bị cục bộ và các
+kết nối VPN hiện có; thay đổi riêng phần Redis không reload toàn bộ Xray.
+
+```json
+{
+  "ConnectionConfig": {
+    "Handshake": 15,
+    "ConnIdle": 120,
+    "UplinkOnly": 2,
+    "DownlinkOnly": 4,
+    "BufferSize": 128,
+    "DisableUDPContentSniffing": false
+  },
+  "Nodes": [
+    {
+      "ApiHost": "https://panel.example.com",
+      "NodeID": 1,
+      "ApiKey": "NODE_TOKEN",
+      "Timeout": 15,
+      "GlobalDeviceLimitConfig": {
+        "Enable": true,
+        "SyncEnabled": true,
+        "SyncChannel": "v2board:device-sync",
+        "RedisNetwork": "tcp",
+        "RedisAddr": "127.0.0.1:6379",
+        "RedisUsername": "",
+        "RedisPassword": "CHANGE_ME",
+        "RedisDB": 0,
+        "Timeout": 1,
+        "Expiry": 60,
+        "RefreshInterval": 20,
+        "MaxIPsPerUser": 256,
+        "KeyPrefix": "znode:device",
+        "FailClosed": false
+      }
+    }
+  ]
+}
+```
+
+## Đồng bộ UUID tức thời
+
+Khi `SyncEnabled=true`, znode subscribe Redis Pub/Sub trên `SyncChannel`. Nếu
+không khai báo trường này thì mặc định là `true`; đặt `false` để tắt watcher.
+Mỗi
+lần người dùng bind, xoá hoặc khoá một device, v2board phát sự kiện và node gọi
+lại API user ngay lập tức; không cần chờ `PullInterval`. Sự kiện được lọc theo
+`ApiHost`, vì vậy có thể dùng chung Redis cho nhiều panel. Nếu Redis tạm thời
+không khả dụng, watcher tự reconnect và cơ chế pull định kỳ vẫn là fallback.
+
+Trên v2board cần bật `device_sync_redis_enable` (mặc định bật) và để
+`device_sync_redis_connection` trỏ tới Redis dùng chung. `SyncChannel` phải
+giống nhau giữa panel và từng node.
+
+`Expiry` là thời gian một IP được xem là online sau lần refresh cuối. Nên để
+`RefreshInterval` nhỏ hơn `Expiry` (thường bằng một phần ba). Lua script trên
+Redis thực hiện xoá IP hết hạn, kiểm tra số lượng, thêm IP và refresh TTL trong
+một thao tác nguyên tử, nên hai node đồng thời không thể cùng vượt slot.
+
+Profile khuyến nghị để đồng bộ nhanh nhưng vẫn nhẹ cho VPS là `Expiry=60`,
+`RefreshInterval=20`, `Timeout=1`, `FailClosed=false`. Với fail-open, một Redis
+lỗi vì vậy chỉ có thể giữ lần nhận diện IP mới tối đa một giây trước khi ZNode
+dùng tracker cục bộ. Redis chỉ được chạm tối
+đa một lần mỗi 20 giây cho mỗi IP đang hoạt động, không ghi theo từng packet.
+Không nên hạ refresh dưới 5 giây; mức quá thấp chỉ tăng IOPS và CPU Redis mà
+không làm Pub/Sub nhanh hơn. Redis nên nằm cùng private network với ZNode.
+
+- `FailClosed=false`: khi Redis tạm thời lỗi, node dùng tracker local có TTL để
+  giữ dịch vụ hoạt động.
+- `FailClosed=true`: kết nối có IP mới bị từ chối nếu không xác nhận được với
+  Redis; chỉ nên bật khi Redis có HA/monitoring.
+- `MaxIPsPerUser` giới hạn bộ nhớ local cho một user. User không đặt
+  `device_limit` vẫn được cho qua, nhưng chỉ giữ tối đa số IP này để tránh
+  client lỗi hoặc scan làm phình RAM.
+
+## IP relay không tính thiết bị
+
+Khi một logical node nhận kết nối qua máy chuyển tiếp, ZBoard có thể trả về
+`device_limit_excluded_ips` trong JSON cấu hình node. Đây là danh sách IP
+IPv4/IPv6 **chính xác** của relay; ZNode chuẩn hoá địa chỉ IPv4-mapped nhưng
+không coi đây là CIDR hoặc mở rộng IPv6 theo `/64`. IP khớp danh sách vẫn phải
+qua xác thực và giới hạn tốc độ, nhưng không được ghi Redis/local tracker,
+không chiếm `device_limit` và không xuất hiện trong báo cáo online.
+
+Chỉ thêm IP egress cố định của relay thuộc quyền vận hành. Không dùng dải IP
+rộng hoặc IP khách hàng, vì IP khớp danh sách sẽ không còn được giới hạn thiết
+bị trên node đó.
+- Tracker luôn có trần toàn tiến trình là 65.536 credential và 262.144 entry.
+  Khi đầy, credential có device limit bị từ chối an toàn; traffic không có
+  device limit vẫn đi qua nhưng không tạo thêm entry. Entry hết `Expiry` được
+  dọn khi snapshot chạy hoặc khi tracker cần lấy lại capacity. Đây là guard nội
+  bộ và không mở thêm contract cấu hình từ panel.
+- `MaxIPsPerUser` được chặn tối đa 1024 và `MaxIPsPerCredential` tối đa 64 để
+  cấu hình nhầm từ panel không vô hiệu hóa giới hạn bộ nhớ.
+
+## Tối ưu RAM và UDP
+
+- Không còn tạo `sync.Map` lồng nhau cho mỗi handshake. Một IP đang hoạt động
+  chỉ có một entry nhỏ, được refresh theo TTL.
+- Device limit được kiểm tra cho cả TCP và UDP. IP được chuẩn hoá IPv4-mapped
+  IPv6 để không bị tính thành hai thiết bị.
+- `BufferSize` mặc định là 128 KiB để tránh làm đầy bộ đệm và bỏ gói ở các
+  luồng video UDP/QUIC, nhưng vẫn thấp hơn mặc định 512 KiB của Xray trên amd64.
+- `ConnIdle` mặc định 120 giây để các luồng video tải trước không bị ngắt quá
+  sớm trong lúc tạm thời không truyền dữ liệu.
+- Web Admin lưu `disable_udp_content_sniffing` riêng theo từng Node ID và mặc
+  định là `false`. Node cần route TikTok/YouTube QUIC theo hostname giữ công tắc
+  “Tắt nhận diện UDP/QUIC” ở trạng thái tắt để ZNode sniff gói QUIC đầu tiên.
+- Với Node Meta/Facebook không ổn định trên một số tuyến VPS Việt Nam, bật công
+  tắc đó riêng cho Node ID tương ứng. Khi bật, rule hostname vẫn áp dụng cho
+  TCP/TLS, còn UDP/QUIC chỉ có IP sẽ không được phân loại theo tên miền.
+- Hai Node ID chạy chung một Agent/VPS có thể dùng hai lựa chọn khác nhau; ZNode
+  ánh xạ cờ theo inbound tag của từng node. Giá trị `ConnectionConfig` cục bộ
+  chỉ là fallback khi kết nối tới panel cũ chưa trả trường per-node.
+- Khi nâng cấp, installer luôn giữ nguyên giá trị hiện có, không ghi đè lựa chọn
+  của operator.
+- Sniffing inbound mặc định tắt khi node không có rule domain/protocol. Khi có
+  rule cần nhận diện nội dung, ZNode dùng `routeOnly=true`: hostname chỉ phục vụ
+  chọn route, không thay IP đích bằng kết quả DNS của VPS. Cơ chế này tránh lỗi
+  CDN Meta trên một số nhà mạng/VPS.
+- LinkManager tự loại khỏi `sync.Map` khi user không còn link; bucket speed của
+  user hết TTL cũng được thu hồi.
+
+## Giới hạn nhận diện thiết bị
+
+Một proxy node chuẩn nhận được credential và địa chỉ nguồn, không nhận được
+HWID phần cứng của điện thoại/laptop. Vì vậy Redis limiter tại node là giới hạn
+online theo UUID credential + IP. Binding HWID thật phải được thực hiện ở panel
+qua flow subscription; với v2board hiện tại mỗi device bound đã có UUID node
+riêng.
+
+## Kiểm thử
+
+```bash
+./script/with-xray-core.sh go test ./...
+./script/with-xray-core.sh go test -bench BenchmarkDeviceTrackerSameIP -benchmem ./limiter
+```
+
+Race detector cần CGO và một C compiler (`gcc`/MinGW). Sau khi cài toolchain,
+nên chạy thêm:
+
+```bash
+CGO_ENABLED=1 ./script/with-xray-core.sh go test -race ./...
+```
