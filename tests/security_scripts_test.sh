@@ -56,7 +56,10 @@ contains "$installer" 'normalized_existing_host=$(https_api_origin "$existing_ap
 contains "$installer" 'normalized_supplied_host=$(https_api_origin "$API_HOST_ARG")'
 contains "$installer" 'rewrite_agent_token /etc/znode/config.json "$updated_config" "$AGENT_TOKEN_ARG"'
 contains "$installer" '"${BASH_REMATCH[2]}" "${BASH_REMATCH[3]}" "${BASH_REMATCH[4]}"'
-contains "$installer" 'temporary_config=$(mktemp /etc/znode/config.json.XXXXXX)'
+contains "$installer" 'temporary_config=$(mktemp /etc/znode/config.yml.XXXXXX)'
+contains "$installer" 'PanelType: ZBoard'
+contains "$installer" 'ExecStart=/usr/local/znode/znode server --config /etc/znode/config.yml'
+contains "$installer" 'command_args="server --config /etc/znode/config.yml"'
 contains "$installer" 'mv -f "$temporary_config" "$config_file"'
 contains "$installer" 'checksum_url="${asset_url}.dgst"'
 contains "$installer" '/releases/tags/${version}'
@@ -78,6 +81,8 @@ contains "$installer" 'chown root:root "$config_file" && chmod 600 "$config_file
 contains "$installer" 'LimitNOFILE=262144'
 contains "$installer" 'TasksMax=8192'
 contains "$installer" 'MemoryMax=90%'
+[[ "$(grep -Fc 'TimeoutStopSec=45s' "$installer")" == 1 ]] \
+    || fail 'runtime installer must contain exactly one TimeoutStopSec=45s'
 contains "$installer" 'rollback_activated_runtime "$had_previous"'
 contains "$installer" 'acquire_znode_operation_lock || exit 1'
 contains "$installer" 'trap release_znode_operation_lock EXIT'
@@ -352,15 +357,14 @@ install_geodata_line=$(grep -nF 'if ! install_geodata "$current_directory"' "$in
 [[ "$validate_line" -lt "$activate_line" ]] || fail 'geodata must be validated before runtime activation'
 [[ "$install_geodata_line" -gt "$activate_line" ]] || fail 'geodata must not mutate /etc before runtime activation'
 
-migration_line=$(grep -nF '        if ! migrate_legacy_connection_profile; then' "$installer" | tail -n 1 | cut -d: -f1)
+ migration_line=$(grep -nF 'if [[ ! -f /etc/znode/config.yml ]]; then' "$installer" | tail -n 1 | cut -d: -f1)
 openrc_restart_line=$(grep -nF '            service znode restart' "$installer" | tail -n 1 | cut -d: -f1)
 [[ "$openrc_restart_line" -gt "$migration_line" ]] || fail 'Alpine update must restart, not merely start, the service'
 
-contains "$installer" '"DisableUDPContentSniffing": false'
-contains "$installer" '"MaxConnectionsPerUser": 512'
+contains "$installer" 'BufferSize: 128'
+contains "$installer" 'DiscoveryInterval: ${poll_interval}'
 contains "$installer" 's/"MaxConnectionsPerUser"[[:space:]]*:[[:space:]]*128[[:space:]]*,/"MaxConnectionsPerUser": 512,/'
 not_contains "$installer" 's/"DisableUDPContentSniffing"[[:space:]]*:[[:space:]]*true/"DisableUDPContentSniffing": false/'
-not_contains "$installer" '"RedisAddr": "127.0.0.1:6379"'
 contains "$installer" 'migrate_legacy_agent_redis_placeholder'
 
 rollback_geodata_line=$(grep -nF 'if ! install_runtime_geodata /usr/local/znode; then' "$manager" | head -n 1 | cut -d: -f1)

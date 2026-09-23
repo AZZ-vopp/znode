@@ -54,11 +54,6 @@ AGENT_ID_ARG=""
 AGENT_TOKEN_ARG=""
 AGENT_TOKEN_STDIN=false
 POLL_INTERVAL_ARG="15"
-DISABLE_EXECUTE_WAS_SET=false
-if [[ -n "${DISABLE_EXECUTE+x}" ]]; then
-    DISABLE_EXECUTE_WAS_SET=true
-fi
-DISABLE_EXECUTE="${DISABLE_EXECUTE:-}"
 RELEASE_REPO_ARG="${ZNODE_RELEASE_REPO:-AZZ-vopp/znode}"
 RELEASE_BRANCH_ARG="${ZNODE_RELEASE_BRANCH:-main}"
 ZNODE_OPERATION_LOCK_FILE="/run/znode-operation.lock"
@@ -292,38 +287,6 @@ secure_znode_config_permissions() {
     chown root:root "$config_file" && chmod 600 "$config_file"
 }
 
-ensure_instance_secret() {
-    local secret_file="/etc/znode/instance-secret"
-    local temporary secret
-    mkdir -p /etc/znode || return 1
-    if [[ -e "$secret_file" ]]; then
-        if [[ -L "$secret_file" || ! -f "$secret_file" ]]; then
-            echo -e "${red}Từ chối instance secret không phải regular file.${plain}"
-            return 1
-        fi
-        secret=$(tr -d '\r\n' < "$secret_file")
-        if [[ ! "$secret" =~ ^[a-f0-9]{64}$ ]]; then
-            echo -e "${red}Instance secret hiện tại không hợp lệ; không tự ghi đè khóa định danh VPS.${plain}"
-            return 1
-        fi
-        chown root:root "$secret_file" && chmod 600 "$secret_file"
-        return $?
-    fi
-    temporary=$(mktemp /etc/znode/.instance-secret.XXXXXX) || return 1
-    secret=$(openssl rand -hex 32 2>/dev/null) || {
-        rm -f "$temporary"
-        return 1
-    }
-    if [[ ! "$secret" =~ ^[a-f0-9]{64}$ ]] \
-        || ! printf '%s\n' "$secret" > "$temporary" \
-        || ! chown root:root "$temporary" \
-        || ! chmod 600 "$temporary" \
-        || ! mv -f "$temporary" "$secret_file"; then
-        rm -f "$temporary"
-        return 1
-    fi
-}
-
 # Bind every installed runtime to ZBoard. Existing ZNode configs are upgraded
 # in place, while an explicit incompatible type is never overwritten.
 ensure_zboard_config_type() {
@@ -372,11 +335,14 @@ ensure_zboard_config_type() {
     echo -e "${green}Đã khóa cấu hình ZNode với type=zboard.${plain}"
 }
 
-reject_legacy_v2node_config() {
+allow_legacy_v2node_config() {
+    # v2node and ZNode may coexist. Never import or rewrite the legacy config;
+    # ZNode always creates its own /etc/znode/config.json from the Agent
+    # command. Operators are responsible for assigning distinct listen ports.
     if [[ -f /etc/v2node/config.json && ! -f /etc/znode/config.json ]]; then
-        echo -e "${red}Không nhập cấu hình v2node cũ. Hãy cài mới bằng lệnh Agent do ZBoard cung cấp.${plain}"
-        return 1
+        echo -e "${yellow}Phát hiện cấu hình v2node cũ; giữ nguyên và cài ZNode độc lập. Hãy bảo đảm hai dịch vụ dùng cổng khác nhau.${plain}"
     fi
+    return 0
 }
 
 parse_args() {
@@ -415,21 +381,6 @@ parse_args() {
                 fi ;;
         esac
     done
-}
-
-validate_terminal_service_setting() {
-    local saved=""
-    if [[ "$DISABLE_EXECUTE_WAS_SET" != true && -f /etc/znode/terminal.env && ! -L /etc/znode/terminal.env ]]; then
-        saved=$(sed -n 's/^DISABLE_EXECUTE=\([01]\)$/\1/p' /etc/znode/terminal.env | head -n 1)
-        if [[ "$saved" == "0" || "$saved" == "1" ]]; then
-            DISABLE_EXECUTE="$saved"
-        fi
-    fi
-    DISABLE_EXECUTE="${DISABLE_EXECUTE:-0}"
-    if [[ "$DISABLE_EXECUTE" != "0" && "$DISABLE_EXECUTE" != "1" ]]; then
-        echo -e "${red}DISABLE_EXECUTE must be 0 or 1.${plain}"
-        exit 1
-    fi
 }
 
 load_agent_token() {
@@ -505,6 +456,11 @@ validate_agent_args() {
         exit 1
     fi
     if [[ -z "$AGENT_ID_ARG" && -z "$AGENT_TOKEN_ARG" ]]; then
+        if [[ -r /etc/znode/config.yml ]] \
+            && grep -Eq '^[[:space:]]*AgentID:[[:space:]]*' /etc/znode/config.yml \
+            && grep -Eq '^[[:space:]]*Token:[[:space:]]*' /etc/znode/config.yml; then
+            return 0
+        fi
         if [[ -r /etc/znode/config.json ]] \
             && grep -Eq '"AgentID"[[:space:]]*:[[:space:]]*"[^"]+"' /etc/znode/config.json \
             && grep -Eq '"AgentToken"[[:space:]]*:[[:space:]]*"[^"]+"' /etc/znode/config.json; then
@@ -562,6 +518,28 @@ rewrite_agent_token() {
 }
 
 validate_existing_agent_binding() {
+    if [[ -f /etc/znode/config.yml ]]; then
+        local yaml_agent_id yaml_api_host normalized_yaml_host normalized_supplied_host
+        yaml_agent_id=$(sed -n "s/^[[:space:]]*AgentID:[[:space:]]*['\"]\{0,1\}\([^'\"[:space:]]*\).*/\1/p" /etc/znode/config.yml | head -n 1)
+        yaml_api_host=$(sed -n "s/^[[:space:]]*ApiHost:[[:space:]]*['\"]\{0,1\}\([^'\"[:space:]]*\).*/\1/p" /etc/znode/config.yml | head -n 1)
+        if [[ -z "$yaml_agent_id" ]] || ! validate_https_api_host "$yaml_api_host"; then
+            echo -e "${red}Existing /etc/znode/config.yml is not a valid ZBoard Agent config; refusing automatic replacement.${plain}"
+            exit 1
+        fi
+        if [[ -n "$AGENT_ID_ARG" && "$yaml_agent_id" != "$AGENT_ID_ARG" ]]; then
+            echo -e "${red}This VPS is already enrolled as agent ${yaml_agent_id}; refusing to replace it.${plain}"
+            exit 1
+        fi
+        if [[ -n "$API_HOST_ARG" ]]; then
+            normalized_yaml_host=$(https_api_origin "$yaml_api_host") || exit 1
+            normalized_supplied_host=$(https_api_origin "$API_HOST_ARG") || exit 1
+            [[ "$normalized_yaml_host" == "$normalized_supplied_host" ]] || {
+                echo -e "${red}This VPS is bound to a different ApiHost; refusing to retarget it.${plain}"
+                exit 1
+            }
+        fi
+        return 0
+    fi
     if [[ ! -f /etc/znode/config.json ]]; then
         return 0
     fi
@@ -786,37 +764,36 @@ generate_znode_agent_config() {
 		agent_instance_id="$(hostname)-$(date +%s)"
 	fi
 
-        config_file="/etc/znode/config.json"
+        config_file="/etc/znode/config.yml"
         mkdir -p /etc/znode >/dev/null 2>&1 || return 1
-        temporary_config=$(mktemp /etc/znode/config.json.XXXXXX) || return 1
+        temporary_config=$(mktemp /etc/znode/config.yml.XXXXXX) || return 1
         if ! cat > "$temporary_config" <<EOF
-{
-    "type": "zboard",
-    "Log": {
-        "Level": "warning",
-        "Output": "",
-        "Access": "none"
-    },
-    "ConnectionConfig": {
-        "Handshake": 15,
-        "ConnIdle": 120,
-        "UplinkOnly": 2,
-        "DownlinkOnly": 4,
-        "BufferSize": 128,
-        "DisableUDPContentSniffing": false,
-        "MaxConnectionsPerUser": 512,
-        "MaxConnections": 32768
-    },
-    "Agent": {
-        "Enable": true,
-        "ApiHost": "${api_host}",
-        "AgentID": "${agent_id}",
-		"AgentInstanceID": "${agent_instance_id}",
-        "AgentToken": "${agent_token}",
-        "PollInterval": ${poll_interval}
-    },
-    "Nodes": []
-}
+# Generated for the ZBoard-compatible XrayR runtime distributed as znode.
+Log:
+  Level: warning
+  ShowErrorDetails: false
+ConnectionConfig:
+  Handshake: 15
+  ConnIdle: 120
+  UplinkOnly: 2
+  DownlinkOnly: 4
+  BufferSize: 128
+MachineConfig:
+  Enable: true
+  PanelType: ZBoard
+  ApiHost: '${api_host}'
+  AgentID: '${agent_id}'
+  AgentInstanceID: '${agent_instance_id}'
+  StateDir: /var/lib/znode/xrayr
+  Token: '${agent_token}'
+  Timeout: 30
+  DiscoveryInterval: ${poll_interval}
+  ControllerConfig:
+    ListenIP: 0.0.0.0
+    SendIP: 0.0.0.0
+    UpdatePeriodic: ${poll_interval}
+    WebSocketConfig:
+      Enable: false
 EOF
         then
             rm -f "$temporary_config"
@@ -868,63 +845,6 @@ verify_runtime_checksum() {
         && [[ "$expected" == "$actual" ]]
 }
 
-runtime_supports_terminal() {
-    local directory="$1"
-    [[ -x "$directory/znode" ]] && "$directory/znode" terminal --help >/dev/null 2>&1
-}
-
-remove_terminal_service() {
-    if [[ x"${release}" == x"alpine" ]]; then
-        rc-update del znode-terminal default >/dev/null 2>&1 || true
-        service znode-terminal stop >/dev/null 2>&1 || true
-        rm -f /etc/init.d/znode-terminal
-    else
-        systemctl disable --now znode-terminal >/dev/null 2>&1 || true
-        rm -f /etc/systemd/system/znode-terminal.service
-        systemctl daemon-reload >/dev/null 2>&1 || true
-        systemctl reset-failed znode-terminal >/dev/null 2>&1 || true
-    fi
-}
-
-start_terminal_service() {
-    if [[ "$DISABLE_EXECUTE" == "1" ]]; then
-        return 0
-    fi
-    if [[ x"${release}" == x"alpine" ]]; then
-        service znode-terminal restart >/dev/null 2>&1 || return 1
-        sleep 1
-        service znode-terminal status >/dev/null 2>&1
-    else
-        systemctl restart znode-terminal >/dev/null 2>&1 || return 1
-        sleep 1
-        systemctl is-active --quiet znode-terminal
-    fi
-}
-
-restore_terminal_service_for_runtime() {
-    local directory="$1"
-    if ! runtime_supports_terminal "$directory"; then
-        remove_terminal_service
-        return 0
-    fi
-    if [[ "$DISABLE_EXECUTE" == "1" ]]; then
-        if [[ x"${release}" == x"alpine" ]]; then
-            rc-update del znode-terminal default >/dev/null 2>&1 || true
-            service znode-terminal stop >/dev/null 2>&1 || true
-        else
-            systemctl disable --now znode-terminal >/dev/null 2>&1 || true
-        fi
-        return 0
-    fi
-    if [[ x"${release}" == x"alpine" ]]; then
-        rc-update add znode-terminal default >/dev/null 2>&1 || return 1
-    else
-        systemctl daemon-reload >/dev/null 2>&1 || return 1
-        systemctl enable znode-terminal >/dev/null 2>&1 || return 1
-    fi
-    start_terminal_service
-}
-
 restore_previous_runtime() {
     local current_directory="/usr/local/znode"
     local previous_directory="/usr/local/znode.previous"
@@ -936,10 +856,8 @@ restore_previous_runtime() {
     [[ -d "$current_directory" ]] || return 1
 
     if [[ x"${release}" == x"alpine" ]]; then
-        service znode-terminal stop >/dev/null 2>&1 || true
         service znode stop >/dev/null 2>&1 || true
     else
-        systemctl stop znode-terminal >/dev/null 2>&1 || true
         systemctl stop znode >/dev/null 2>&1 || true
     fi
     mv "$current_directory" "$failed_directory" || return 1
@@ -958,7 +876,6 @@ restore_previous_runtime() {
     else
         systemctl start znode >/dev/null 2>&1 || true
     fi
-    restore_terminal_service_for_runtime "$current_directory" || return 1
     sleep 2
     check_status
 }
@@ -973,14 +890,11 @@ rollback_activated_runtime() {
     fi
 
     if [[ x"${release}" == x"alpine" ]]; then
-        service znode-terminal stop >/dev/null 2>&1 || true
         service znode stop >/dev/null 2>&1 || true
     else
-        systemctl stop znode-terminal >/dev/null 2>&1 || true
         systemctl stop znode >/dev/null 2>&1 || true
     fi
     rm -rf "$current_directory"
-    remove_terminal_service
     echo -e "${yellow}Đã gỡ runtime mới vì đây là lần cài đầu và không có bản trước để khôi phục.${plain}"
 }
 
@@ -1209,13 +1123,6 @@ install_znode() {
         exit 1
     fi
     mkdir /etc/znode/ -p
-    if ! ensure_instance_secret; then
-        echo -e "${red}Không thể tạo khóa định danh riêng cho VPS; hủy cài đặt terminal.${plain}"
-        rm -rf "$staging_directory"
-        exit 1
-    fi
-    printf 'DISABLE_EXECUTE=%s\n' "$DISABLE_EXECUTE" > /etc/znode/terminal.env
-    chmod 600 /etc/znode/terminal.env
 
     # Only replace the live tree after the archive, checksum, paths, binary and
     # geodata have all passed validation. The former tree becomes the sole
@@ -1252,7 +1159,7 @@ name="znode"
 description="znode"
 
 command="/usr/local/znode/znode"
-command_args="server"
+command_args="server --config /etc/znode/config.yml"
 command_user="root"
 export XRAY_LOCATION_ASSET="/etc/znode"
 
@@ -1265,31 +1172,6 @@ depend() {
 EOF
         chmod +x /etc/init.d/znode
         rc-update add znode default
-        cat <<EOF > /etc/init.d/znode-terminal
-#!/sbin/openrc-run
-
-name="znode-terminal"
-description="znode outbound terminal relay"
-command="/usr/local/znode/znode"
-command_args="terminal"
-command_user="root"
-pidfile="/run/znode-terminal.pid"
-command_background="yes"
-start_pre() {
-    if [ -f /etc/znode/terminal.env ]; then
-        . /etc/znode/terminal.env
-        export DISABLE_EXECUTE
-    fi
-}
-depend() { need net; }
-EOF
-        chmod +x /etc/init.d/znode-terminal
-        if [[ "$DISABLE_EXECUTE" == "1" ]]; then
-            rc-update del znode-terminal default >/dev/null 2>&1 || true
-            service znode-terminal stop >/dev/null 2>&1 || true
-        else
-            rc-update add znode-terminal default
-        fi
         echo -e "${green}Đã cài znode ${last_version}${plain} và bật tự khởi động cùng hệ thống."
     else
         rm /etc/systemd/system/znode.service -f
@@ -1309,7 +1191,7 @@ TasksMax=8192
 MemoryHigh=80%
 MemoryMax=90%
 WorkingDirectory=/usr/local/znode/
-ExecStart=/usr/local/znode/znode server
+ExecStart=/usr/local/znode/znode server --config /etc/znode/config.yml
 TimeoutStopSec=45s
 Restart=always
 RestartSec=10
@@ -1317,69 +1199,38 @@ RestartSec=10
 [Install]
 WantedBy=multi-user.target
 EOF
-        cat <<EOF > /etc/systemd/system/znode-terminal.service
-[Unit]
-Description=znode outbound terminal relay
-After=network.target nss-lookup.target
-Wants=network.target
-
-[Service]
-User=root
-Group=root
-Type=simple
-WorkingDirectory=/usr/local/znode/
-EnvironmentFile=-/etc/znode/terminal.env
-ExecStart=/usr/local/znode/znode terminal
-TimeoutStopSec=45s
-Restart=on-failure
-RestartSec=10
-
-[Install]
-WantedBy=multi-user.target
-EOF
         systemctl daemon-reload
         systemctl enable znode
-        if [[ "$DISABLE_EXECUTE" == "1" ]]; then
-            systemctl disable --now znode-terminal >/dev/null 2>&1 || true
-        else
-            systemctl enable znode-terminal
-        fi
         # Keep the old runtime serving while the new tree, service unit and
         # configuration are staged. Activation below performs one short
         # restart instead of leaving every inbound offline during the update.
         echo -e "${green}Đã cài znode ${last_version}${plain} và bật tự khởi động cùng hệ thống."
     fi
 
-    if [[ ! -f /etc/znode/config.json ]]; then
+    if ! ensure_zboard_config_type; then
+        echo -e "${red}Xác minh cấu hình ZBoard cũ thất bại; đang rollback runtime.${plain}"
+        rollback_activated_runtime "$had_previous" || true
+        exit 1
+    fi
+    if [[ ! -f /etc/znode/config.yml ]]; then
+        if [[ -z "$API_HOST_ARG" && -f /etc/znode/config.json ]]; then
+            API_HOST_ARG=$(sed -n 's/^[[:space:]]*"ApiHost"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' /etc/znode/config.json | head -n 1)
+            AGENT_ID_ARG=$(sed -n 's/^[[:space:]]*"AgentID"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' /etc/znode/config.json | head -n 1)
+            AGENT_TOKEN_ARG=$(sed -n 's/^[[:space:]]*"AgentToken"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' /etc/znode/config.json | head -n 1)
+        fi
+        if [[ -z "$API_HOST_ARG" || -z "$AGENT_ID_ARG" || -z "$AGENT_TOKEN_ARG" ]]; then
+            echo -e "${red}Không thể chuyển cấu hình ZNode cũ sang XrayR an toàn; cần chạy lại lệnh Agent từ ZBoard.${plain}"
+            rollback_activated_runtime "$had_previous" || true
+            exit 1
+        fi
         if ! generate_znode_agent_config "$API_HOST_ARG" "$AGENT_ID_ARG" "$AGENT_TOKEN_ARG" "$POLL_INTERVAL_ARG"; then
             if ! rollback_activated_runtime "$had_previous"; then
                 echo -e "${red}Không thể rollback sau lỗi tạo cấu hình Agent; hãy kiểm tra dịch vụ thủ công.${plain}"
             fi
             exit 1
         fi
-        echo -e "${green}Agent config written to /etc/znode/config.json${plain}"
+        echo -e "${green}Agent config written to /etc/znode/config.yml${plain}"
     else
-        if ! ensure_zboard_config_type; then
-            echo -e "${red}Xác minh type=zboard thất bại sau activation; đang rollback runtime.${plain}"
-            if ! rollback_activated_runtime "$had_previous"; then
-                echo -e "${red}Không thể rollback sau lỗi cấu hình; hãy kiểm tra dịch vụ thủ công.${plain}"
-            fi
-            exit 1
-        fi
-        if ! migrate_legacy_connection_profile; then
-            echo -e "${red}Không thể nâng cấu hình kết nối; đang rollback runtime.${plain}"
-            if ! rollback_activated_runtime "$had_previous"; then
-                echo -e "${red}Không thể rollback sau lỗi migration; hãy kiểm tra dịch vụ thủ công.${plain}"
-            fi
-            exit 1
-        fi
-        if ! migrate_legacy_agent_redis_placeholder; then
-            echo -e "${red}Không thể dọn Redis localhost mẫu; đang rollback runtime.${plain}"
-            if ! rollback_activated_runtime "$had_previous"; then
-                echo -e "${red}Không thể rollback sau lỗi migration Redis; hãy kiểm tra dịch vụ thủ công.${plain}"
-            fi
-            exit 1
-        fi
         if [[ x"${release}" == x"alpine" ]]; then
             service znode restart
         else
@@ -1404,17 +1255,6 @@ EOF
             fi
             exit 1
         fi
-    fi
-
-    # enable --now does not replace an already-running process after an
-    # in-place runtime swap. Restart the relay here so it always executes the
-    # current binary, including the first-config path above.
-    if ! start_terminal_service; then
-        echo -e "${red}Dịch vụ terminal riêng không khởi động được; đang rollback runtime.${plain}"
-        if ! rollback_activated_runtime "$had_previous"; then
-            echo -e "${red}Không thể rollback sau lỗi terminal; hãy kiểm tra dịch vụ thủ công.${plain}"
-        fi
-        exit 1
     fi
 
 
@@ -1454,7 +1294,6 @@ EOF
 }
 
 parse_args "$@"
-validate_terminal_service_setting
 load_agent_token
 validate_release_source
 acquire_znode_operation_lock || exit 1
@@ -1463,7 +1302,7 @@ trap 'exit 129' HUP
 trap 'exit 130' INT
 trap 'exit 143' TERM
 validate_agent_args
-reject_legacy_v2node_config || exit 1
+allow_legacy_v2node_config || exit 1
 ensure_zboard_config_type || exit 1
 validate_existing_agent_binding
 echo -e "${green}Bắt đầu cài đặt${plain}"
