@@ -1162,6 +1162,7 @@ command="/usr/local/znode/znode"
 command_args="server --config /etc/znode/config.yml"
 command_user="root"
 export XRAY_LOCATION_ASSET="/etc/znode"
+export XRAY_LOCATION_CONFIG="/etc/znode"
 
 pidfile="/run/znode.pid"
 command_background="yes"
@@ -1186,6 +1187,7 @@ User=root
 Group=root
 Type=simple
 Environment=XRAY_LOCATION_ASSET=/etc/znode
+Environment=XRAY_LOCATION_CONFIG=/etc/znode
 LimitNOFILE=262144
 TasksMax=8192
 MemoryHigh=80%

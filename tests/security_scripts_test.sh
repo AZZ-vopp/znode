@@ -8,6 +8,9 @@ manager="$root/script/znode.sh"
 readme="$root/README.md"
 release_workflow="$root/.github/workflows/publish-release-assets.yml"
 
+grep -q 'Environment=XRAY_LOCATION_CONFIG=/etc/znode' "$installer"
+grep -q 'export XRAY_LOCATION_CONFIG="/etc/znode"' "$installer"
+
 fail() {
     echo "security_scripts_test: $*" >&2
     exit 1
