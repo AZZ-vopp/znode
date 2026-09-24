@@ -904,12 +904,7 @@ check_status() {
             return 1
         fi
     else
-        temp=$(systemctl status znode | grep Active | awk '{print $3}' | cut -d "(" -f2 | cut -d ")" -f1)
-        if [[ x"${temp}" == x"running" ]]; then
-            return 0
-        else
-            return 1
-        fi
+        systemctl is-active --quiet znode
     fi
 }
 

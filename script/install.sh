@@ -766,12 +766,9 @@ check_status() {
             return 1
         fi
     else
-        temp=$(systemctl status znode | grep Active | awk '{print $3}' | cut -d "(" -f2 | cut -d ")" -f1)
-        if [[ x"${temp}" == x"running" ]]; then
-            return 0
-        else
-            return 1
-        fi
+        # `systemctl status` is human-facing and its wording/localization can
+        # change. Query the machine-readable active state for the rollback gate.
+        systemctl is-active --quiet znode
     fi
 }
 
@@ -838,7 +835,7 @@ EOF
             echo -e "${green}znode agent started successfully.${plain}"
             return 0
         else
-            echo -e "${red}znode agent may have failed to start; run: znode log${plain}"
+            echo -e "${red}znode agent did not stay active. Inspect: journalctl -u znode.service -b --no-pager -n 120${plain}"
             return 1
         fi
 }
