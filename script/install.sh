@@ -1295,6 +1295,8 @@ EOF
 Description=znode Service
 After=network.target nss-lookup.target
 Wants=network.target
+StartLimitIntervalSec=300
+StartLimitBurst=5
 
 [Service]
 User=root
@@ -1308,8 +1310,8 @@ MemoryMax=90%
 WorkingDirectory=/usr/local/znode/
 ExecStart=/usr/local/znode/znode server
 TimeoutStopSec=45s
-Restart=always
-RestartSec=10
+Restart=on-failure
+RestartSec=30
 
 [Install]
 WantedBy=multi-user.target
