@@ -145,8 +145,14 @@ migration_directory=$(mktemp -d)
 trap 'rm -rf "$migration_directory"' EXIT
 printf '%s\n' '{"ConnectionConfig":{"MaxConnectionsPerUser":128,"MaxConnections":32768}}' > "$migration_directory/legacy.json"
 migrate_legacy_connection_profile "$migration_directory/legacy.json" >/dev/null
-grep -Fq '"MaxConnectionsPerUser": 512,' "$migration_directory/legacy.json" \
-    || fail 'legacy per-user session limit was not migrated to 512'
+grep -Fq '"MaxConnectionsPerUser":128,' "$migration_directory/legacy.json" \
+    || fail 'explicit 128 per-user session limit was unexpectedly changed'
+printf '%s\n' '{"ConnectionConfig":{"Handshake":4,"ConnIdle":30,"BufferSize":16,"MaxConnectionsPerUser":128,"MaxConnections":32768}}' > "$migration_directory/legacy-profile.json"
+migrate_legacy_connection_profile "$migration_directory/legacy-profile.json" >/dev/null
+grep -Fq '"BufferSize": 64,' "$migration_directory/legacy-profile.json" \
+    || fail 'legacy buffer profile was not migrated to 64 KiB'
+grep -Fq '"MaxConnectionsPerUser":128,' "$migration_directory/legacy-profile.json" \
+    || fail 'profile migration changed the explicit per-user session limit'
 printf '%s\n' '{"ConnectionConfig":{"MaxConnectionsPerUser":256,"MaxConnections":32768}}' > "$migration_directory/custom.json"
 migrate_legacy_connection_profile "$migration_directory/custom.json" >/dev/null
 grep -Fq '"MaxConnectionsPerUser":256,' "$migration_directory/custom.json" \
@@ -361,8 +367,9 @@ openrc_restart_line=$(grep -nF '            service znode restart' "$installer" 
 [[ "$openrc_restart_line" -gt "$migration_line" ]] || fail 'Alpine update must restart, not merely start, the service'
 
 contains "$installer" '"DisableUDPContentSniffing": false'
-contains "$installer" '"MaxConnectionsPerUser": 512'
-contains "$installer" 's/"MaxConnectionsPerUser"[[:space:]]*:[[:space:]]*128[[:space:]]*,/"MaxConnectionsPerUser": 512,/'
+contains "$installer" '"BufferSize": 64'
+contains "$installer" '"MaxConnectionsPerUser": 128'
+not_contains "$installer" 's/"MaxConnectionsPerUser"[[:space:]]*:[[:space:]]*128[[:space:]]*,/"MaxConnectionsPerUser": 512,/'
 not_contains "$installer" 's/"DisableUDPContentSniffing"[[:space:]]*:[[:space:]]*true/"DisableUDPContentSniffing": false/'
 not_contains "$installer" '"RedisAddr": "127.0.0.1:6379"'
 contains "$installer" 'migrate_legacy_agent_redis_placeholder'
