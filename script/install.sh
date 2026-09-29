@@ -196,24 +196,32 @@ EOF
     chmod 755 "$schedule_dir/znode-log-cleanup"
 }
 
-# Upgrade only the old handshake/idle/buffer profile. Never rewrite an
-# explicitly configured connection cap: 128 is also the current safe default.
-# Do not rewrite
-# DisableUDPContentSniffing here: an existing true value may be an operator's
-# deliberate choice rather than an installer-generated default.
+# Upgrade legacy defaults that closed idle mobile sessions too quickly,
+# starved video buffers, or held the first UDP/QUIC packets for content
+# sniffing. Keep the explicit per-user cap.
 migrate_legacy_connection_profile() {
     local config_file="${1:-/etc/znode/config.json}"
-    local temporary
+    local temporary needs_migration=false
     [[ -f "$config_file" ]] || return 0
-    if ! grep -Eq '"Handshake"[[:space:]]*:[[:space:]]*4([[:space:]]*,)|"ConnIdle"[[:space:]]*:[[:space:]]*30([[:space:]]*,)|"BufferSize"[[:space:]]*:[[:space:]]*16([[:space:]]*,)' "$config_file"; then
+    if grep -Eq '"Handshake"[[:space:]]*:[[:space:]]*4([[:space:]]*,)|"ConnIdle"[[:space:]]*:[[:space:]]*(30|120)([[:space:]]*,)|"BufferSize"[[:space:]]*:[[:space:]]*16([[:space:]]*,)' "$config_file"; then
+        needs_migration=true
+    elif grep -Eq '"BufferSize"[[:space:]]*:[[:space:]]*64([[:space:]]*,)' "$config_file" &&
+        grep -Eq '"DisableUDPContentSniffing"[[:space:]]*:[[:space:]]*false([[:space:]]*,|[[:space:]]*})' "$config_file"; then
+        # v1.37.34-v1.37.56 generated this exact regression profile. It has no
+        # marker, so require both values before upgrading a legacy file.
+        needs_migration=true
+    fi
+    if [[ "$needs_migration" != true ]]; then
         return 0
     fi
     temporary=$(mktemp "${config_file}.XXXXXX") || return 1
 
     if ! sed -E \
         -e 's/"Handshake"[[:space:]]*:[[:space:]]*4[[:space:]]*,/"Handshake": 15,/' \
-        -e 's/"ConnIdle"[[:space:]]*:[[:space:]]*30[[:space:]]*,/"ConnIdle": 120,/' \
-        -e 's/"BufferSize"[[:space:]]*:[[:space:]]*16[[:space:]]*,/"BufferSize": 64,/' \
+        -e 's/"ConnIdle"[[:space:]]*:[[:space:]]*(30|120)[[:space:]]*,/"ConnIdle": 300,/' \
+        -e 's/"BufferSize"[[:space:]]*:[[:space:]]*16[[:space:]]*,/"BufferSize": 128,/' \
+		-e 's/"BufferSize"[[:space:]]*:[[:space:]]*64[[:space:]]*,/"BufferSize": 128,/' \
+		-e 's/"DisableUDPContentSniffing"[[:space:]]*:[[:space:]]*false/"DisableUDPContentSniffing": true/' \
         "$config_file" > "$temporary"; then
         rm -f "$temporary"
         return 1
@@ -796,11 +804,11 @@ generate_znode_agent_config() {
     },
     "ConnectionConfig": {
         "Handshake": 15,
-        "ConnIdle": 120,
+        "ConnIdle": 300,
         "UplinkOnly": 2,
         "DownlinkOnly": 4,
-        "BufferSize": 64,
-        "DisableUDPContentSniffing": false,
+        "BufferSize": 128,
+        "DisableUDPContentSniffing": true,
         "MaxConnectionsPerUser": 128,
         "MaxConnections": 32768
     },

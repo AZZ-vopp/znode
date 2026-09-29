@@ -147,10 +147,22 @@ printf '%s\n' '{"ConnectionConfig":{"MaxConnectionsPerUser":128,"MaxConnections"
 migrate_legacy_connection_profile "$migration_directory/legacy.json" >/dev/null
 grep -Fq '"MaxConnectionsPerUser":128,' "$migration_directory/legacy.json" \
     || fail 'explicit 128 per-user session limit was unexpectedly changed'
-printf '%s\n' '{"ConnectionConfig":{"Handshake":4,"ConnIdle":30,"BufferSize":16,"MaxConnectionsPerUser":128,"MaxConnections":32768}}' > "$migration_directory/legacy-profile.json"
+printf '%s\n' '{"ConnectionConfig":{"Handshake":4,"ConnIdle":30,"BufferSize":16,"DisableUDPContentSniffing":false,"MaxConnectionsPerUser":128,"MaxConnections":32768}}' > "$migration_directory/legacy-profile.json"
 migrate_legacy_connection_profile "$migration_directory/legacy-profile.json" >/dev/null
-grep -Fq '"BufferSize": 64,' "$migration_directory/legacy-profile.json" \
-    || fail 'legacy buffer profile was not migrated to 64 KiB'
+grep -Fq '"BufferSize": 128,' "$migration_directory/legacy-profile.json" \
+    || fail 'legacy buffer profile was not migrated to 128 KiB'
+grep -Fq '"ConnIdle": 300,' "$migration_directory/legacy-profile.json" \
+    || fail 'legacy idle timeout was not migrated to 300 seconds'
+grep -Fq '"DisableUDPContentSniffing": true' "$migration_directory/legacy-profile.json" \
+    || fail 'legacy UDP sniffing profile was not disabled'
+printf '%s\n' '{"ConnectionConfig":{"Handshake":15,"ConnIdle":120,"BufferSize":64,"DisableUDPContentSniffing":false,"MaxConnectionsPerUser":128,"MaxConnections":32768}}' > "$migration_directory/current-regression-profile.json"
+migrate_legacy_connection_profile "$migration_directory/current-regression-profile.json" >/dev/null
+grep -Fq '"BufferSize": 128,' "$migration_directory/current-regression-profile.json" \
+    || fail 'current regression buffer profile was not migrated to 128 KiB'
+grep -Fq '"ConnIdle": 300,' "$migration_directory/current-regression-profile.json" \
+    || fail 'current idle timeout was not migrated to 300 seconds'
+grep -Fq '"DisableUDPContentSniffing": true' "$migration_directory/current-regression-profile.json" \
+    || fail 'current regression UDP sniffing profile was not disabled'
 grep -Fq '"MaxConnectionsPerUser":128,' "$migration_directory/legacy-profile.json" \
     || fail 'profile migration changed the explicit per-user session limit'
 printf '%s\n' '{"ConnectionConfig":{"MaxConnectionsPerUser":256,"MaxConnections":32768}}' > "$migration_directory/custom.json"
@@ -366,11 +378,11 @@ migration_line=$(grep -nF '        if ! migrate_legacy_connection_profile; then'
 openrc_restart_line=$(grep -nF '            service znode restart' "$installer" | tail -n 1 | cut -d: -f1)
 [[ "$openrc_restart_line" -gt "$migration_line" ]] || fail 'Alpine update must restart, not merely start, the service'
 
-contains "$installer" '"DisableUDPContentSniffing": false'
-contains "$installer" '"BufferSize": 64'
+contains "$installer" '"DisableUDPContentSniffing": true'
+contains "$installer" '"BufferSize": 128'
 contains "$installer" '"MaxConnectionsPerUser": 128'
 not_contains "$installer" 's/"MaxConnectionsPerUser"[[:space:]]*:[[:space:]]*128[[:space:]]*,/"MaxConnectionsPerUser": 512,/'
-not_contains "$installer" 's/"DisableUDPContentSniffing"[[:space:]]*:[[:space:]]*true/"DisableUDPContentSniffing": false/'
+contains "$installer" 's/"DisableUDPContentSniffing"[[:space:]]*:[[:space:]]*false/"DisableUDPContentSniffing": true/'
 not_contains "$installer" '"RedisAddr": "127.0.0.1:6379"'
 contains "$installer" 'migrate_legacy_agent_redis_placeholder'
 
