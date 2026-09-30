@@ -809,7 +809,7 @@ generate_znode_agent_config() {
         "DownlinkOnly": 4,
         "BufferSize": 128,
         "DisableUDPContentSniffing": true,
-        "MaxConnectionsPerUser": 128,
+        "MaxConnectionsPerUser": 512,
         "MaxConnections": 32768
     },
     "Agent": {

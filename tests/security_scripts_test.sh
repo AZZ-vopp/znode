@@ -380,7 +380,7 @@ openrc_restart_line=$(grep -nF '            service znode restart' "$installer" 
 
 contains "$installer" '"DisableUDPContentSniffing": true'
 contains "$installer" '"BufferSize": 128'
-contains "$installer" '"MaxConnectionsPerUser": 128'
+contains "$installer" '"MaxConnectionsPerUser": 512'
 not_contains "$installer" 's/"MaxConnectionsPerUser"[[:space:]]*:[[:space:]]*128[[:space:]]*,/"MaxConnectionsPerUser": 512,/'
 contains "$installer" 's/"DisableUDPContentSniffing"[[:space:]]*:[[:space:]]*false/"DisableUDPContentSniffing": true/'
 not_contains "$installer" '"RedisAddr": "127.0.0.1:6379"'
