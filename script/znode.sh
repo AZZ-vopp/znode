@@ -1008,7 +1008,7 @@ show_usage() {
     echo "znode x25519       - Tạo khóa x25519"
     echo "znode generate     - Hướng dẫn enrollment Agent qua ZBoard"
     echo "znode update       - Cập nhật znode"
-    echo "znode update x.x.x - Cài phiên bản znode chỉ định"
+    echo "znode update x.x.x - Cài hoặc rollback tới phiên bản chỉ định (đã xác minh SHA-256)"
     echo "znode update-geodata - Cập nhật geoip.dat và geosite.dat của Xray"
     echo "znode rollback     - Quay lại bản znode trước đó"
     echo "znode install      - Cài đặt znode"

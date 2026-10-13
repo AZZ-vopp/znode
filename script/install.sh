@@ -1001,6 +1001,20 @@ semver_key() {
     printf '%09d%09d%09d' "$major" "$minor" "${patch:-0}"
 }
 
+validate_release_transition() {
+    local target_version="$1"
+    local current_version="$2"
+    local explicit_version="$3"
+
+    if validate_release_version "$current_version" \
+        && [[ "$(semver_key "$target_version")" < "$(semver_key "$current_version")" ]] \
+        && [[ "$explicit_version" != true ]]; then
+        echo -e "${red}Release ${target_version} cũ hơn runtime hiện tại ${current_version}; hãy chỉ định phiên bản cần rollback rõ ràng.${plain}"
+        return 1
+    fi
+    return 0
+}
+
 latest_release_version() {
     local repository="$1"
     local metadata version
@@ -1147,6 +1161,7 @@ install_znode() {
     local previous_directory="/usr/local/znode.previous"
     local staging_directory archive current_version extracted_version
     local had_previous=false
+    local explicit_version=false
 
     mkdir -p /usr/local
     staging_directory=$(mktemp -d /usr/local/znode.new.XXXXXX) || exit 1
@@ -1164,6 +1179,7 @@ install_znode() {
         echo -e "${green}Đã tìm thấy phiên bản mới nhất: ${last_version}. Bắt đầu cài đặt...${plain}"
     else
         last_version=$version_param
+        explicit_version=true
     fi
     if ! validate_release_version "$last_version"; then
         echo -e "${red}Phiên bản phát hành không hợp lệ: ${last_version}.${plain}"
@@ -1172,9 +1188,7 @@ install_znode() {
     fi
     if [[ -x "$current_directory/znode" ]]; then
         current_version=$("$current_directory/znode" version 2>/dev/null | awk 'NR==1 {print $2}')
-        if validate_release_version "$current_version" \
-            && [[ "$(semver_key "$last_version")" < "$(semver_key "$current_version")" ]]; then
-            echo -e "${red}Release ${last_version} cũ hơn runtime hiện tại ${current_version}; dùng rollback đã xác minh thay vì hạ cấp tùy ý.${plain}"
+        if ! validate_release_transition "$last_version" "$current_version" "$explicit_version"; then
             rm -rf "$staging_directory"
             exit 1
         fi
@@ -1452,7 +1466,7 @@ EOF
     echo "znode log          - Xem nhật ký znode"
     echo "znode generate     - Hướng dẫn enrollment Agent qua ZBoard"
     echo "znode update       - Cập nhật znode"
-    echo "znode update x.x.x - Cập nhật znode lên phiên bản chỉ định"
+    echo "znode update x.x.x - Cài hoặc rollback tới phiên bản chỉ định (đã xác minh SHA-256)"
     echo "znode rollback     - Quay lại bản znode trước đó"
     echo "znode install      - Cài đặt znode"
     echo "znode uninstall    - Gỡ cài đặt znode"

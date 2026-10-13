@@ -66,6 +66,8 @@ contains "$installer" 'archive_size > 268435456'
 contains "$installer" 'uncompressed_size > 536870912'
 contains "$installer" 'find "$staging_directory" -type l'
 contains "$installer" '(\.[0-9]+)?'
+contains "$installer" 'explicit_version=true'
+contains "$installer" 'validate_release_transition "$last_version" "$current_version" "$explicit_version"'
 contains "$installer" 'staging_directory=$(mktemp -d'
 contains "$installer" 'validate_geodata "$staging_directory"'
 contains "$installer" 'install_geodata "$current_directory"'
@@ -274,6 +276,17 @@ bash "$test_directory/lock-probe.sh" "$ZNODE_OPERATION_LOCK_FILE" >/dev/null 2>&
     || fail 'operation lock was not reusable after release'
 
 eval "$(extract_function_before "$manager" validate_release_version sha256_file)"
+release_transition_functions=$(sed -n '/^validate_release_version() {$/,/^latest_release_version() {$/p' "$installer" | sed '$d')
+eval "$release_transition_functions"
+type -t validate_release_transition >/dev/null \
+    || fail 'installer has no explicit, verified downgrade policy'
+validate_release_transition v1.37.53 v1.37.55 true \
+    || fail 'an explicitly requested older release should be eligible for checksum verification'
+if validate_release_transition v1.37.53 v1.37.55 false; then
+    fail 'the latest-release path must not downgrade implicitly'
+fi
+validate_release_transition v1.37.56 v1.37.55 false \
+    || fail 'a newer release should remain eligible without an explicit version'
 eval "$(extract_function_before "$manager" sha256_file latest_release_version)"
 eval "$(extract_function_before "$manager" latest_release_version download_verified_script_asset)"
 eval "$(extract_function_before "$manager" download_verified_script_asset run_installer)"
@@ -377,6 +390,12 @@ install_geodata_line=$(grep -nF 'if ! install_geodata "$current_directory"' "$in
 migration_line=$(grep -nF '        if ! migrate_legacy_connection_profile; then' "$installer" | tail -n 1 | cut -d: -f1)
 openrc_restart_line=$(grep -nF '            service znode restart' "$installer" | tail -n 1 | cut -d: -f1)
 [[ "$openrc_restart_line" -gt "$migration_line" ]] || fail 'Alpine update must restart, not merely start, the service'
+
+transition_line=$(grep -nF 'validate_release_transition "$last_version" "$current_version" "$explicit_version"' "$installer" | head -n 1 | cut -d: -f1)
+verified_release_line=$(grep -nF 'if ! download_verified_release "$last_version" "$archive"; then' "$installer" | head -n 1 | cut -d: -f1)
+activate_release_line=$(grep -nF 'if ! mv "$staging_directory" "$current_directory"; then' "$installer" | head -n 1 | cut -d: -f1)
+[[ "$transition_line" -lt "$verified_release_line" && "$verified_release_line" -lt "$activate_release_line" ]] \
+    || fail 'an explicit downgrade must pass checksum verification before runtime activation'
 
 contains "$installer" '"DisableUDPContentSniffing": true'
 contains "$installer" '"BufferSize": 128'
