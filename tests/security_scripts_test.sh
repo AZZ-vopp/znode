@@ -5,6 +5,7 @@ set -euo pipefail
 root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 installer="$root/script/install.sh"
 manager="$root/script/znode.sh"
+scanner_shield="$root/script/scanner-shield.sh"
 readme="$root/README.md"
 release_workflow="$root/.github/workflows/publish-release-assets.yml"
 
@@ -36,6 +37,7 @@ extract_function_before() {
 
 bash -n "$installer"
 bash -n "$manager"
+bash -n "$scanner_shield"
 
 for privileged_script in "$installer" "$manager"; do
     contains "$privileged_script" 'PATH=/usr/sbin:/usr/bin:/sbin:/bin'
@@ -115,6 +117,9 @@ contains "$release_workflow" '"${archive}.dgst"'
 contains "$release_workflow" 'script/install.sh'
 contains "$release_workflow" 'script/znode.sh'
 contains "$release_workflow" '--verify-tag'
+contains "$scanner_shield" 'table inet zboard_scanner_shield'
+contains "$scanner_shield" 'policy accept'
+not_contains "$scanner_shield" 'policy drop'
 
 not_contains "$manager" 'bash <(curl'
 not_contains "$manager" '--no-check-certificate'
