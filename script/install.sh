@@ -234,6 +234,39 @@ migrate_legacy_connection_profile() {
     echo -e "${green}Đã nâng giới hạn kết nối cũ cho luồng video.${plain}"
 }
 
+# Config rewrites from the running agent (RuntimeSnapshot persistence in older
+# builds) collapsed /etc/znode/config.json to a single line, which breaks the
+# line-anchored sed/grep parsers below (AgentID/ApiHost/AgentToken extraction
+# and the legacy connection migration) and shows up to operators as an
+# unreadable one-line config. Reformat such a file in place before parsing.
+normalize_znode_config_format() {
+    local config_file="${1:-/etc/znode/config.json}"
+    local temporary line_count
+    [[ -f "$config_file" ]] || return 0
+    line_count=$(wc -l < "$config_file" | tr -d '[:space:]')
+    [[ "$line_count" =~ ^[0-9]+$ ]] || return 0
+    if (( line_count >= 5 )); then
+        return 0
+    fi
+    temporary=$(mktemp "${config_file}.XXXXXX") || return 1
+    if command -v python3 >/dev/null 2>&1 \
+        && python3 -m json.tool "$config_file" > "$temporary" 2>/dev/null; then
+        :
+    elif command -v jq >/dev/null 2>&1 \
+        && jq '.' "$config_file" > "$temporary" 2>/dev/null; then
+        :
+    else
+        rm -f "$temporary"
+        echo -e "${yellow}Không thể định dạng lại config.json một dòng (thiếu python3/jq hoặc JSON hỏng); giữ nguyên file.${plain}"
+        return 0
+    fi
+    if [[ ! -s "$temporary" ]] || ! chmod 600 "$temporary" || ! mv -f "$temporary" "$config_file"; then
+        rm -f "$temporary"
+        return 1
+    fi
+    return 0
+}
+
 # Agent Redis settings are delivered by the signed ZBoard manifest and kept in
 # the root-only runtime snapshot. Older installers wrote a disabled localhost
 # example into config.json; remove any Agent fallback that still points at the
@@ -741,23 +774,23 @@ install_base() {
             echo "Đang cài kho EPEL..."
             yum install -y epel-release >/dev/null 2>&1
         fi
-        need_install_yum wget curl unzip tar cronie socat ca-certificates openssl pv nano
+        need_install_yum wget curl unzip tar cronie socat ca-certificates openssl pv nano jq
         update-ca-trust force-enable >/dev/null 2>&1 || true
     elif [[ x"${release}" == x"alpine" ]]; then
-        need_install_apk wget curl unzip tar socat ca-certificates openssl pv nano
+        need_install_apk wget curl unzip tar socat ca-certificates openssl pv nano jq
         update-ca-certificates >/dev/null 2>&1 || true
     elif [[ x"${release}" == x"debian" ]]; then
-        need_install_apt wget curl unzip tar cron socat ca-certificates openssl pv nano
+        need_install_apt wget curl unzip tar cron socat ca-certificates openssl pv nano jq
         update-ca-certificates >/dev/null 2>&1 || true
     elif [[ x"${release}" == x"ubuntu" ]]; then
-        need_install_apt wget curl unzip tar cron socat ca-certificates openssl pv nano
+        need_install_apt wget curl unzip tar cron socat ca-certificates openssl pv nano jq
         update-ca-certificates >/dev/null 2>&1 || true
     elif [[ x"${release}" == x"arch" ]]; then
         echo "Đang cập nhật cơ sở dữ liệu gói..."
         pacman -Sy --noconfirm >/dev/null 2>&1
         # --needed sẽ bỏ qua các gói đã cài
         echo "Đang cài các gói bắt buộc..."
-        pacman -S --noconfirm --needed wget curl unzip tar cronie socat ca-certificates openssl pv nano >/dev/null 2>&1
+        pacman -S --noconfirm --needed wget curl unzip tar cronie socat ca-certificates openssl pv nano jq >/dev/null 2>&1
     fi
 }
 
@@ -1484,6 +1517,7 @@ trap 'exit 129' HUP
 trap 'exit 130' INT
 trap 'exit 143' TERM
 validate_agent_args
+normalize_znode_config_format || true
 reject_legacy_v2node_config || exit 1
 ensure_zboard_config_type || exit 1
 validate_existing_agent_binding
