@@ -50,6 +50,49 @@ nstat -n; sleep 60; nstat UdpRcvbufErrors   # mong đợi gần 0 drop/phút
 Node nâng cấp từ bản cũ cần `systemctl restart znode` một lần để listener đang
 mở nhận buffer mới; socket outbound tự nhận khi được tạo lại.
 
+## Admission REALITY trước xác thực
+
+Mỗi kết nối TCP tới inbound REALITY phải đi qua handshake trước khi được xác
+thực; trong lúc đó ZNode dial đích giả trang và giữ một slot trong pool toàn
+tiến trình, dùng chung cho mọi logical node trên host. Client không bật mux mở
+một handshake cho mỗi kết nối TCP, nên cơn bão reconnect sau một lần mất mạng
+ngắn dễ vượt pool cũ 128 slot; socket dư khi đó bị reset im lặng và người dùng
+thấy "mất mạng đột ngột" dù node vẫn chạy. Từ v1.37.84 hành vi đổi như sau:
+
+- Pool 1024 slot handshake đang chờ xác thực (trước đây 128).
+- Socket đến khi pool đầy chờ tối đa 2 giây để nhận slot theo thứ tự đến, thay
+  vì bị đóng ngay; hàng chờ tối đa 4096 socket, quá ngưỡng mới đóng tức thì.
+- Khi vẫn phải đóng, ZNode ghi cảnh báo `REALITY pre-auth admission ...` kèm
+  tổng số socket đã đóng, tối đa 10 giây một dòng. Trước đây không có log.
+
+Kiểm tra trên node: `journalctl -u znode --since -1h | grep -c "REALITY pre-auth
+admission"`; con số tăng nghĩa là node đang bị quét hoặc bão reconnect vượt cả
+pool mới, cần xem `REALITY: processed invalid connection` để phân biệt scanner
+với client hợp lệ. Thời gian chờ handshake 15 giây cho dial đích và ClientHello
+không đổi.
+
+## Giới hạn phiên mỗi tài khoản (`MaxConnectionsPerUser`)
+
+Mỗi credential (UUID) chỉ được giữ tối đa `MaxConnectionsPerUser` phiên đang
+quản lý cùng lúc (mặc định 512, tối đa 4096, đặt trong `ConnectionConfig` của
+`/etc/znode/config.json`). Một phiên là một luồng TCP hoặc một association UDP
+và được tính cho đến khi đóng hoặc hết `ConnIdle` (mặc định 300 giây), nên một
+tài khoản dùng chung nhiều thiết bị, torrent hoặc nhiều luồng QUIC có thể chạm
+ngưỡng dù node còn rất rảnh. Khi chạm ngưỡng:
+
+- Giao thức TCP (VLESS, VMess, Trojan, Shadowsocks, AnyTLS, TUIC stream): kết
+  nối mới bị từ chối với `failed to dispatch request ... user session limit
+  reached` ở mức info.
+- Hysteria2: datagram của association mới bị bỏ ngay ở transport, chỉ gộp vào
+  cảnh báo `hysteria UDP datagrams dropped before worker setup`.
+- Cả hai đường giờ ghi thêm cảnh báo `user session cap reached for ...` kèm số
+  phiên đang tính và tổng số lần từ chối, tối đa 10 giây một dòng.
+
+Kiểm tra: `journalctl -u znode --since -1h | grep -c "user session cap
+reached"`. Nếu tài khoản hợp lệ, tăng `MaxConnectionsPerUser` (ví dụ 1024) rồi
+`systemctl restart znode`; giới hạn này bảo vệ node khỏi một tài khoản chiếm
+hết `MaxConnections` (mặc định 32768) nên không nên bỏ hẳn.
+
 ## Giảm bị lập chỉ mục bởi máy quét Internet
 
 Script tùy chọn dưới đây cài một bảng nftables riêng, chỉ chặn các dải quét
