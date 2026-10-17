@@ -159,6 +159,54 @@ install_geodata() (
     echo -e "${green}Đã cài geoip.dat và geosite.dat vào $destination.${plain}"
 )
 
+# A 208 KiB default UDP socket buffer (net.core.rmem_default) overflows under
+# one QUIC video burst. The kernel then drops datagrams silently
+# (UdpRcvbufErrors) and Hysteria2/VLESS customers lose their session for a few
+# seconds at a time. The runtime asks for 4 MiB per UDP socket, which the kernel
+# caps at rmem_max/wmem_max, so raise the ceilings and the defaults together.
+# Values are only ever raised: an operator who tuned higher keeps their setting.
+tune_udp_socket_buffers() {
+    local sysctl_dir='/etc/sysctl.d'
+    local sysctl_file="$sysctl_dir/99-znode-udp.conf"
+    local temporary entry key value current entries=''
+    [[ -d /proc/sys/net/core ]] || return 0
+    command -v sysctl >/dev/null 2>&1 || return 0
+    for entry in \
+        net.core.rmem_default=4194304 \
+        net.core.wmem_default=4194304 \
+        net.core.rmem_max=33554432 \
+        net.core.wmem_max=33554432 \
+        net.core.netdev_max_backlog=16384; do
+        key=${entry%%=*}
+        value=${entry#*=}
+        current=$(sysctl -n "$key" 2>/dev/null) || continue
+        [[ "$current" =~ ^[0-9]+$ ]] || continue
+        if (( current < value )); then
+            entries+="$key = $value"$'\n'
+        fi
+    done
+    if [[ -z "$entries" ]]; then
+        return 0
+    fi
+    mkdir -p "$sysctl_dir" || return 0
+    temporary=$(mktemp "$sysctl_dir/.99-znode-udp.XXXXXX") || return 0
+    {
+        echo '# Managed by the ZNode installer: UDP socket buffers for Hysteria2/QUIC traffic.'
+        printf '%s' "$entries"
+    } > "$temporary"
+    if ! chmod 644 "$temporary" || ! mv -f "$temporary" "$sysctl_file"; then
+        rm -f "$temporary"
+        echo -e "${yellow}Không thể ghi $sysctl_file; giữ buffer UDP mặc định của hệ thống.${plain}"
+        return 0
+    fi
+    if sysctl -q -p "$sysctl_file" >/dev/null 2>&1; then
+        echo -e "${green}Đã nâng buffer UDP của kernel cho Hysteria2/QUIC ($sysctl_file).${plain}"
+    else
+        echo -e "${yellow}Không thể áp dụng $sysctl_file ngay (container hạn chế?); sẽ có hiệu lực sau khi khởi động lại.${plain}"
+    fi
+    return 0
+}
+
 install_log_cleanup() {
     local cleanup_script="/usr/local/znode/cleanup-logs.sh"
     local schedule_dir="/etc/cron.daily"
@@ -1483,6 +1531,7 @@ EOF
     printf '%s\n' "$RELEASE_BRANCH_ARG" > /etc/znode/release-branch
     chmod 644 /etc/znode/release-repo /etc/znode/release-branch
     install_log_cleanup
+    tune_udp_socket_buffers
 
     cd $cur_dir
     rm -f install.sh

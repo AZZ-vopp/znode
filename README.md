@@ -28,6 +28,28 @@ việc tải hoặc xác minh thất bại.
 ZNode chỉ kết nối với ZBoard. Mọi cấu hình hợp lệ đều có `"type": "zboard"`;
 binary cũ hoặc panel V2Board gốc không được chấp nhận.
 
+## Buffer UDP của kernel
+
+Linux cấp cho mỗi socket UDP buffer nhận mặc định `net.core.rmem_default`
+(208 KiB). Một đợt tải video QUIC hoặc một khách Hysteria2 bận là đủ làm đầy
+buffer đó trong vài mili giây; kernel lặng lẽ vứt gói (`UdpRcvbufErrors` tăng
+trong `nstat -az`) và khách thấy phiên "mất ping" vài giây rồi tự có lại.
+
+Runtime tự yêu cầu 4 MiB cho mọi socket UDP nó mở (listener Hysteria2/TUIC/
+Shadowsocks và socket outbound freedom) qua `SO_RCVBUF`/`SO_SNDBUF`. Kernel giới
+hạn yêu cầu đó ở `net.core.rmem_max`/`wmem_max`, nên installer ghi
+`/etc/sysctl.d/99-znode-udp.conf` nâng trần và giá trị mặc định (chỉ nâng, không
+hạ giá trị operator đã đặt cao hơn) rồi áp ngay bằng `sysctl -p`. Kiểm tra sau
+khi cài hoặc cập nhật:
+
+```bash
+sysctl net.core.rmem_default net.core.rmem_max
+nstat -n; sleep 60; nstat UdpRcvbufErrors   # mong đợi gần 0 drop/phút
+```
+
+Node nâng cấp từ bản cũ cần `systemctl restart znode` một lần để listener đang
+mở nhận buffer mới; socket outbound tự nhận khi được tạo lại.
+
 ## Giảm bị lập chỉ mục bởi máy quét Internet
 
 Script tùy chọn dưới đây cài một bảng nftables riêng, chỉ chặn các dải quét
