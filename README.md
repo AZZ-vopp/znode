@@ -93,6 +93,38 @@ reached"`. Nếu tài khoản hợp lệ, tăng `MaxConnectionsPerUser` (ví d�
 `systemctl restart znode`; giới hạn này bảo vệ node khỏi một tài khoản chiếm
 hết `MaxConnections` (mặc định 32768) nên không nên bỏ hẳn.
 
+## Cách ly batch traffic bị panel từ chối vĩnh viễn
+
+Báo cáo traffic là batch bất biến: ZNode giữ nguyên batch và report ID cho đến
+khi panel ACK, nên lỗi mạng hay `5xx` không làm mất hoặc tính trùng byte. Từ
+v1.37.85, khi panel trả `400`, `413` hoặc `422` (payload bị từ chối vì chính
+nội dung batch, ví dụ `Invalid server traffic rate`) ba lần liên tiếp cho cùng
+một report ID, ZNode ghi batch đó ra file cách ly
+`<spool>.rejected-<report_id>.json` (cùng thư mục spool, quyền `0600`, kèm mã
+trạng thái, thông điệp và các cặp `uid/upload/download`) rồi đẩy batch kế tiếp
+lên. Hàng đợi traffic phía sau không còn bị một batch hỏng chặn vô thời hạn.
+Mọi lỗi khác (`401/403`, `409`, `426`, `429`, `5xx`, lỗi mạng) đặt lại bộ đếm và
+tiếp tục retry; nếu không ghi được file cách ly, batch vẫn được giữ và thử lại ở
+tick sau. Log: `Traffic report rejected by the panel; immutable batch retained
+for retry before quarantine` (cảnh báo, kèm `rejections=n/3`) rồi `Traffic
+report was rejected permanently by the panel; immutable batch quarantined`
+(kèm `path`). Operator kiểm tra `ls /var/lib/znode/traffic/*.rejected-*.json`
+và xử lý nguyên nhân phía panel trước khi nhập lại nếu cần.
+
+## Reload runtime: lý do và hoàn tất thu hồi user dở dang
+
+Khi manifest ZBoard thay đổi, ZNode cố gắng thay chỉ inbound bị đổi trên core
+Xray đang chạy. Từ v1.37.85, dòng cảnh báo `Runtime change requires full Xray
+core reload` luôn kèm `reason=` nêu rõ điều kiện ép reload toàn bộ (ví dụ
+`outbound "default-out" changed`, `core app "xray.app.router.Config" changed`,
+`shared connection policy (ConnectionConfig) changed`, `inbound "node-12":
+assignment order or tag changed`, `TLS material changed without per-node
+provenance`). Ngoài ra, nếu một inbound còn user thu hồi dở dang vì lần ghi
+spool trước thất bại, ZNode hoàn tất thu hồi đó (giới hạn 10 giây) trước khi
+chuẩn bị reload thay vì để điều kiện này ép reload toàn bộ và rớt mọi khách
+trên VPS; nếu vẫn thất bại thì log `Could not complete pending user revocation
+before reload` và giữ hành vi cũ.
+
 ## Giảm bị lập chỉ mục bởi máy quét Internet
 
 Script tùy chọn dưới đây cài một bảng nftables riêng, chỉ chặn các dải quét
