@@ -71,27 +71,17 @@ pool mới, cần xem `REALITY: processed invalid connection` để phân biệt
 với client hợp lệ. Thời gian chờ handshake 15 giây cho dial đích và ClientHello
 không đổi.
 
-## Giới hạn phiên mỗi tài khoản (`MaxConnectionsPerUser`)
+## Không giới hạn số phiên (giống v2node)
 
-Mỗi credential (UUID) chỉ được giữ tối đa `MaxConnectionsPerUser` phiên đang
-quản lý cùng lúc (mặc định 512, tối đa 4096, đặt trong `ConnectionConfig` của
-`/etc/znode/config.json`). Một phiên là một luồng TCP hoặc một association UDP
-và được tính cho đến khi đóng hoặc hết `ConnIdle` (mặc định 300 giây), nên một
-tài khoản dùng chung nhiều thiết bị, torrent hoặc nhiều luồng QUIC có thể chạm
-ngưỡng dù node còn rất rảnh. Khi chạm ngưỡng:
+ZNode không còn giới hạn số phiên mỗi tài khoản hay toàn node. Trước đây trần
+mặc định 512 phiên mỗi UUID (tính cả association UDP giữ tới hết `ConnIdle`
+300 giây) làm khách xem video hoặc dùng nhiều luồng QUIC bị rớt giữa chừng:
+VLESS bị từ chối kết nối mới, còn Hysteria2 bị bỏ datagram không báo lỗi.
 
-- Giao thức TCP (VLESS, VMess, Trojan, Shadowsocks, AnyTLS, TUIC stream): kết
-  nối mới bị từ chối với `failed to dispatch request ... user session limit
-  reached` ở mức info.
-- Hysteria2: datagram của association mới bị bỏ ngay ở transport, chỉ gộp vào
-  cảnh báo `hysteria UDP datagrams dropped before worker setup`.
-- Cả hai đường giờ ghi thêm cảnh báo `user session cap reached for ...` kèm số
-  phiên đang tính và tổng số lần từ chối, tối đa 10 giây một dòng.
-
-Kiểm tra: `journalctl -u znode --since -1h | grep -c "user session cap
-reached"`. Nếu tài khoản hợp lệ, tăng `MaxConnectionsPerUser` (ví dụ 1024) rồi
-`systemctl restart znode`; giới hạn này bảo vệ node khỏi một tài khoản chiếm
-hết `MaxConnections` (mặc định 32768) nên không nên bỏ hẳn.
+Các khoá `MaxConnectionsPerUser` và `MaxConnections` trong `ConnectionConfig`
+của `/etc/znode/config.json` vẫn được đọc để file cũ không lỗi nhưng bị bỏ qua.
+Bộ cài mới không ghi hai khoá này. Giới hạn thiết bị/IP của panel và
+`LimitNOFILE=262144` của systemd vẫn áp dụng.
 
 ## Cách ly batch traffic bị panel từ chối vĩnh viễn
 

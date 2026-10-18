@@ -889,9 +889,7 @@ generate_znode_agent_config() {
         "UplinkOnly": 2,
         "DownlinkOnly": 4,
         "BufferSize": 128,
-        "DisableUDPContentSniffing": true,
-        "MaxConnectionsPerUser": 512,
-        "MaxConnections": 32768
+        "DisableUDPContentSniffing": true
     },
     "Agent": {
         "Enable": true,
