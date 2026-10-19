@@ -83,6 +83,16 @@ của `/etc/znode/config.json` vẫn được đọc để file cũ không lỗi
 Bộ cài mới không ghi hai khoá này. Giới hạn thiết bị/IP của panel và
 `LimitNOFILE=262144` của systemd vẫn áp dụng.
 
+## WireGuard `domainStrategy` (giống v2node)
+
+Từ v1.37.87, `settings.domainStrategy` trong outbound WireGuard được áp dụng
+thật: ZNode chuyển nó thành `targetStrategy` của outbound để Xray phân giải tên
+miền đích bằng DNS của node trước khi vào tunnel (trước đây giá trị bị bỏ qua
+và tên miền được phân giải qua `remoteDNS` trong tunnel, gây lỗi
+`lookup ... on 1.0.0.1: i/o timeout`). Bỏ trống thì mặc định `ForceIPv4`; nhận
+`AsIs`, `UseIP`, `UseIPv4`, `UseIPv4v6`, `ForceIP`, `ForceIPv4`, `ForceIPv4v6`.
+Giá trị ưu tiên IPv6 bị từ chối vì tunnel chỉ có IPv4.
+
 ## Cách ly batch traffic bị panel từ chối vĩnh viễn
 
 Báo cáo traffic là batch bất biến: ZNode giữ nguyên batch và report ID cho đến
