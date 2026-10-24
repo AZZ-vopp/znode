@@ -1355,7 +1355,11 @@ command_user="root"
 export XRAY_LOCATION_ASSET="/etc/znode"
 
 pidfile="/run/znode.pid"
-command_background="yes"
+# supervise-daemon restarts znode after any exit, like systemd below; a
+# failed start must not leave every node on the VPS down until someone logs in.
+supervisor="supervise-daemon"
+respawn_delay=30
+respawn_max=0
 
 depend() {
         need net
@@ -1394,10 +1398,11 @@ EOF
         cat <<EOF > /etc/systemd/system/znode.service
 [Unit]
 Description=znode Service
-After=network.target nss-lookup.target
-Wants=network.target
-StartLimitIntervalSec=300
-StartLimitBurst=5
+After=network-online.target nss-lookup.target
+Wants=network-online.target
+# Never stop retrying: a VPS that boots while the panel is unreachable must
+# come back on its own once the panel answers.
+StartLimitIntervalSec=0
 
 [Service]
 User=root
