@@ -1105,6 +1105,55 @@ latest_release_version() {
     printf '%s\n' "$version"
 }
 
+# fetch_release_file URL DEST [mirrors|direct] [progress label]
+# GitHub release downloads can fail with HTTP 5xx for minutes from some
+# networks (an AWS Lightsail VPS got HTTP 500 four times in a row on
+# 2026-10-27). GitHub is retried for up to three minutes with a fixed delay,
+# then each mirror is tried. Mirrors only carry bytes: every caller checks the
+# file against a SHA-256 published by GitHub itself, so a mirror cannot change
+# what runs. "direct" never uses a mirror (for the checksum file itself).
+fetch_release_file() {
+    local url="$1"
+    local destination="$2"
+    local mode="${3:-mirrors}"
+    local label="${4:-}"
+    local mirrors="" source attempt_url
+    local -a retry
+    if [[ "$mode" == mirrors ]]; then
+        mirrors="${ZNODE_RELEASE_MIRRORS-https://gh-proxy.com/ https://ghfast.top/}"
+    fi
+    for source in direct $mirrors; do
+        if [[ "$source" == direct && "$mode" == direct ]]; then
+            # Small file with an API fallback in the caller: fail fast.
+            attempt_url="$url"
+            retry=(--retry 3 --retry-delay 5 --retry-max-time 30)
+        elif [[ "$source" == direct ]]; then
+            attempt_url="$url"
+            retry=(--retry 8 --retry-delay 15 --retry-max-time 180)
+        else
+            case "$source" in
+                https://*/) ;;
+                *) continue ;;
+            esac
+            attempt_url="${source}${url}"
+            retry=(--retry 3 --retry-delay 5 --retry-max-time 90)
+            echo -e "${yellow:-}GitHub không trả được tệp, thử link dự phòng ${source%/}...${plain:-}" >&2
+        fi
+        if [[ -n "$label" ]] && command -v pv >/dev/null 2>&1; then
+            if curl --fail --location --silent --show-error --connect-timeout 15 \
+                --proto '=https' --tlsv1.2 "${retry[@]}" "$attempt_url" \
+                | pv -s 30M -W -N "$label" > "$destination"; then
+                return 0
+            fi
+        elif curl --fail --location --silent --show-error --connect-timeout 15 \
+            --proto '=https' --tlsv1.2 "${retry[@]}" "$attempt_url" -o "$destination"; then
+            return 0
+        fi
+    done
+    rm -f "$destination"
+    return 1
+}
+
 download_verified_script_asset() {
     local repository="$1"
     local version="$2"
@@ -1137,8 +1186,7 @@ download_verified_script_asset() {
     fi
 
     asset_url="https://github.com/${repository}/releases/download/${version}/${asset_name}"
-    if ! curl --fail --location --silent --show-error --retry 3 --connect-timeout 15 \
-        --proto '=https' --tlsv1.2 "$asset_url" -o "$destination"; then
+    if ! fetch_release_file "$asset_url" "$destination"; then
         rm -f "$destination"
         return 1
     fi
@@ -1162,8 +1210,7 @@ download_verified_release() {
     asset_url="https://github.com/${RELEASE_REPO_ARG}/releases/download/${version}/${asset_name}"
     checksum_url="${asset_url}.dgst"
 
-    if ! curl --fail --location --silent --show-error --retry 3 --connect-timeout 15 \
-        --proto '=https' --tlsv1.2 "$asset_url" | pv -s 30M -W -N "Tiến trình tải" > "$archive"; then
+    if ! fetch_release_file "$asset_url" "$archive" mirrors "Tiến trình tải"; then
         echo -e "${red}Tải gói phát hành ZNode thất bại.${plain}"
         return 1
     fi
@@ -1173,8 +1220,8 @@ download_verified_release() {
         return 1
     fi
     expected=""
-    if curl --fail --location --silent --show-error --retry 3 --connect-timeout 15 \
-        --proto '=https' --tlsv1.2 "$checksum_url" -o "${archive}.dgst" 2>/dev/null; then
+    # The checksum must come from GitHub, never from a mirror.
+    if fetch_release_file "$checksum_url" "${archive}.dgst" direct 2>/dev/null; then
         digest_size=$(wc -c < "${archive}.dgst")
         if [[ ! "$digest_size" =~ ^[0-9]+$ ]] || (( digest_size < 64 || digest_size > 65536 )); then
             echo -e "${red}Tệp checksum của release có kích thước bất thường.${plain}"
