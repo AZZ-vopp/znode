@@ -282,6 +282,29 @@ migrate_legacy_connection_profile() {
     echo -e "${green}Đã nâng giới hạn kết nối cũ cho luồng video.${plain}"
 }
 
+# A one-line config can only be reformatted with python3 or jq. This runs
+# before install_base, so a minimal VPS without either used to fail here and
+# its agent config was then reported as a "manual" one.
+install_json_tool() {
+    if command -v python3 >/dev/null 2>&1 || command -v jq >/dev/null 2>&1; then
+        return 0
+    fi
+    echo "Đang cài jq để đọc config.json..."
+    case "${release}" in
+        debian|ubuntu)
+            apt-get update -y >/dev/null 2>&1
+            DEBIAN_FRONTEND=noninteractive apt-get install -y jq >/dev/null 2>&1
+            ;;
+        centos)
+            rpm -q epel-release >/dev/null 2>&1 || yum install -y epel-release >/dev/null 2>&1
+            yum install -y jq >/dev/null 2>&1
+            ;;
+        alpine) apk add --no-cache jq >/dev/null 2>&1 ;;
+        arch) pacman -Sy --noconfirm --needed jq >/dev/null 2>&1 ;;
+    esac
+    command -v jq >/dev/null 2>&1
+}
+
 # Config rewrites from the running agent (RuntimeSnapshot persistence in older
 # builds) collapsed /etc/znode/config.json to a single line, which breaks the
 # line-anchored sed/grep parsers below (AgentID/ApiHost/AgentToken extraction
@@ -296,6 +319,7 @@ normalize_znode_config_format() {
     if (( line_count >= 5 )); then
         return 0
     fi
+    install_json_tool
     temporary=$(mktemp "${config_file}.XXXXXX") || return 1
     if command -v python3 >/dev/null 2>&1 \
         && python3 -m json.tool "$config_file" > "$temporary" 2>/dev/null; then
@@ -658,6 +682,12 @@ validate_existing_agent_binding() {
     local existing_agent_id existing_api_host normalized_existing_host normalized_supplied_host
     existing_agent_id=$(sed -n 's/^[[:space:]]*"AgentID"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' /etc/znode/config.json | head -n 1)
     if [[ -z "$existing_agent_id" ]]; then
+        if grep -Eq '"AgentID"[[:space:]]*:[[:space:]]*"[^"]+"' /etc/znode/config.json; then
+            # An agent config the line parser cannot read (still one line).
+            # Never tell the operator to delete it: that unenrolls the VPS.
+            echo -e "${red}/etc/znode/config.json của Agent đang nằm trên một dòng và chưa định dạng lại được. Cài jq (apt-get install -y jq hoặc yum install -y jq) rồi chạy lại; KHÔNG xoá file này.${plain}"
+            exit 1
+        fi
         echo -e "${red}This VPS already has a manual znode config. Back it up and remove /etc/znode/config.json before enrolling an agent.${plain}"
         exit 1
     fi
