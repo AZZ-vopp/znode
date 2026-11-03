@@ -1494,7 +1494,9 @@ WorkingDirectory=/usr/local/znode/
 ExecStart=/usr/local/znode/znode server
 TimeoutStopSec=45s
 Restart=on-failure
-RestartSec=30
+# Clients of this VPS are offline until ZNode is back: restart quickly after
+# a crash or a loadguard/memguard restart (was 30 s).
+RestartSec=5
 
 [Install]
 WantedBy=multi-user.target
