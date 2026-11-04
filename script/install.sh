@@ -207,6 +207,105 @@ tune_udp_socket_buffers() {
     return 0
 }
 
+# A proxy VPS carries hundreds of TCP sessions on 1–2 GB of RAM. The kernel's
+# default tcp_mem ceiling (~9% of RAM) is hit at peak; the kernel then drops
+# out-of-order and queued segments and customers see stalled uploads. Relay
+# scripts installed beside ZNode (nyanpass ny.conf) also set
+# tcp_adv_win_scale=-2, so every byte of window costs four bytes of buffer.
+# The file is named zz- so it is read after those files at boot. The global
+# TCP memory and the shared ceilings only grow; an operator who keeps their own
+# stack creates /etc/znode/no-tcp-tuning.
+tune_tcp_stack() {
+    local sysctl_dir='/etc/sysctl.d'
+    local sysctl_file="$sysctl_dir/zz-znode-tuning.conf"
+    local temporary entry key value current mem_kb page_kb pages socket_max
+    local low pressure high current_low current_pressure current_high congestion
+    local entries=''
+    [[ -d /proc/sys/net/ipv4 ]] || return 0
+    command -v sysctl >/dev/null 2>&1 || return 0
+    if [[ -e /etc/znode/no-tcp-tuning ]]; then
+        rm -f "$sysctl_file"
+        return 0
+    fi
+    mem_kb=$(awk '/^MemTotal:/ {print $2; exit}' /proc/meminfo 2>/dev/null)
+    [[ "$mem_kb" =~ ^[0-9]+$ ]] && (( mem_kb > 0 )) || return 0
+    page_kb=$(( $(getconf PAGESIZE 2>/dev/null || echo 4096) / 1024 ))
+    (( page_kb > 0 )) || page_kb=4
+    pages=$(( mem_kb / page_kb ))
+    low=$(( pages / 10 ))
+    pressure=$(( pages * 2 / 15 ))
+    high=$(( pages / 5 ))
+    read -r current_low current_pressure current_high < <(sysctl -n net.ipv4.tcp_mem 2>/dev/null) || true
+    if [[ "$current_high" =~ ^[0-9]+$ ]] && (( current_high >= high )); then
+        low=$current_low
+        pressure=$current_pressure
+        high=$current_high
+    fi
+    entries+="net.ipv4.tcp_mem = $low $pressure $high"$'\n'
+
+    # Half of each buffer is window (adv_win_scale 1), so 8 MiB still gives a
+    # 4 MiB window: ~650 Mbit/s at 50 ms.
+    socket_max=8388608
+    (( mem_kb > 2621440 )) && socket_max=16777216
+    entries+="net.ipv4.tcp_rmem = 4096 131072 $socket_max"$'\n'
+    entries+="net.ipv4.tcp_wmem = 4096 65536 $socket_max"$'\n'
+    entries+='net.ipv4.tcp_adv_win_scale = 1'$'\n'
+    # Keep at most 128 KiB unsent per socket instead of a whole send buffer.
+    entries+='net.ipv4.tcp_notsent_lowat = 131072'$'\n'
+    # An upload after a quiet moment (posting a story) keeps its window.
+    entries+='net.ipv4.tcp_slow_start_after_idle = 0'$'\n'
+    # Find a smaller MSS when a WireGuard/tunnel path drops large packets.
+    entries+='net.ipv4.tcp_mtu_probing = 1'$'\n'
+    # Kernel default F-RTO: avoids spurious retransmits on mobile links.
+    entries+='net.ipv4.tcp_frto = 2'$'\n'
+    entries+='net.ipv4.tcp_fin_timeout = 30'$'\n'
+
+    # Restated here so a relay's own file read earlier at boot cannot lower
+    # them; only ever raised above the running value.
+    for entry in \
+        net.ipv4.tcp_max_tw_buckets=32768 \
+        net.core.rmem_max=33554432 \
+        net.core.wmem_max=33554432; do
+        key=${entry%%=*}
+        value=${entry#*=}
+        current=$(sysctl -n "$key" 2>/dev/null) || continue
+        [[ "$current" =~ ^[0-9]+$ ]] || continue
+        (( current > value )) && value=$current
+        entries+="$key = $value"$'\n'
+    done
+
+    # BBR only replaces the stock algorithms; any other choice is the operator's.
+    congestion=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null)
+    if [[ "$congestion" == cubic || "$congestion" == reno ]]; then
+        if ! grep -qw bbr /proc/sys/net/ipv4/tcp_available_congestion_control 2>/dev/null; then
+            modprobe tcp_bbr >/dev/null 2>&1 || true
+        fi
+        if grep -qw bbr /proc/sys/net/ipv4/tcp_available_congestion_control 2>/dev/null; then
+            entries+='net.core.default_qdisc = fq'$'\n'
+            entries+='net.ipv4.tcp_congestion_control = bbr'$'\n'
+        fi
+    fi
+
+    mkdir -p "$sysctl_dir" || return 0
+    temporary=$(mktemp "$sysctl_dir/.zz-znode-tuning.XXXXXX") || return 0
+    {
+        echo '# Managed by the ZNode installer: TCP stack for a proxy VPS.'
+        echo '# Opt out: touch /etc/znode/no-tcp-tuning and rerun the installer.'
+        printf '%s' "$entries"
+    } > "$temporary"
+    if ! chmod 644 "$temporary" || ! mv -f "$temporary" "$sysctl_file"; then
+        rm -f "$temporary"
+        echo -e "${yellow}Không thể ghi $sysctl_file; giữ cấu hình TCP hiện tại.${plain}"
+        return 0
+    fi
+    if sysctl -q -e -p "$sysctl_file" >/dev/null 2>&1; then
+        echo -e "${green}Đã tinh chỉnh TCP của kernel cho proxy ($sysctl_file).${plain}"
+    else
+        echo -e "${yellow}Một số giá trị trong $sysctl_file chưa áp dụng được (container hạn chế?).${plain}"
+    fi
+    return 0
+}
+
 install_log_cleanup() {
     local cleanup_script="/usr/local/znode/cleanup-logs.sh"
     local schedule_dir="/etc/cron.daily"
@@ -1614,6 +1713,7 @@ EOF
     chmod 644 /etc/znode/release-repo /etc/znode/release-branch
     install_log_cleanup
     tune_udp_socket_buffers
+    tune_tcp_stack
 
     cd $cur_dir
     rm -f install.sh
