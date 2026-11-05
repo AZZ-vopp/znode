@@ -85,6 +85,11 @@ contains "$installer" 'net.core.rmem_max=33554432'
 contains "$installer" 'if (( current < value )); then'
 contains "$installer" 'temporary=$(mktemp "$sysctl_dir/.99-znode-udp.XXXXXX")'
 contains "$installer" '    tune_udp_socket_buffers'
+contains "$installer" 'zz-znode-tuning.conf'
+contains "$installer" 'net.ipv4.tcp_adv_win_scale = 1'
+contains "$installer" '/etc/znode/no-tcp-tuning'
+contains "$installer" '(( current_high >= high ))'
+contains "$installer" '    tune_tcp_stack'
 contains "$installer" 'TasksMax=8192'
 contains "$installer" 'MemoryMax=90%'
 contains "$installer" 'rollback_activated_runtime "$had_previous"'
@@ -171,16 +176,12 @@ grep -Fq '"BufferSize": 128,' "$migration_directory/legacy-profile.json" \
     || fail 'legacy buffer profile was not migrated to 128 KiB'
 grep -Fq '"ConnIdle": 300,' "$migration_directory/legacy-profile.json" \
     || fail 'legacy idle timeout was not migrated to 300 seconds'
-grep -Fq '"DisableUDPContentSniffing": true' "$migration_directory/legacy-profile.json" \
-    || fail 'legacy UDP sniffing profile was not disabled'
 printf '%s\n' '{"ConnectionConfig":{"Handshake":15,"ConnIdle":120,"BufferSize":64,"DisableUDPContentSniffing":false,"MaxConnectionsPerUser":128,"MaxConnections":32768}}' > "$migration_directory/current-regression-profile.json"
 migrate_legacy_connection_profile "$migration_directory/current-regression-profile.json" >/dev/null
 grep -Fq '"BufferSize": 128,' "$migration_directory/current-regression-profile.json" \
     || fail 'current regression buffer profile was not migrated to 128 KiB'
 grep -Fq '"ConnIdle": 300,' "$migration_directory/current-regression-profile.json" \
     || fail 'current idle timeout was not migrated to 300 seconds'
-grep -Fq '"DisableUDPContentSniffing": true' "$migration_directory/current-regression-profile.json" \
-    || fail 'current regression UDP sniffing profile was not disabled'
 grep -Fq '"MaxConnectionsPerUser":128,' "$migration_directory/legacy-profile.json" \
     || fail 'profile migration changed the explicit per-user session limit'
 printf '%s\n' '{"ConnectionConfig":{"MaxConnectionsPerUser":256,"MaxConnections":32768}}' > "$migration_directory/custom.json"
@@ -413,17 +414,68 @@ activate_release_line=$(grep -nF 'if ! mv "$staging_directory" "$current_directo
 [[ "$transition_line" -lt "$verified_release_line" && "$verified_release_line" -lt "$activate_release_line" ]] \
     || fail 'an explicit downgrade must pass checksum verification before runtime activation'
 
-contains "$installer" '"DisableUDPContentSniffing": true'
+# UDP content sniffing is always on; the retired key is no longer written.
+not_contains "$installer" '"DisableUDPContentSniffing": true'
 contains "$installer" '"BufferSize": 128'
 # New installs carry no session caps; ZNode ignores the keys like v2node.
 not_contains "$installer" '"MaxConnectionsPerUser"'
 not_contains "$installer" 's/"MaxConnectionsPerUser"[[:space:]]*:[[:space:]]*128[[:space:]]*,/"MaxConnectionsPerUser": 512,/'
-contains "$installer" 's/"DisableUDPContentSniffing"[[:space:]]*:[[:space:]]*false/"DisableUDPContentSniffing": true/'
+not_contains "$installer" 's/"DisableUDPContentSniffing"[[:space:]]*:[[:space:]]*false/"DisableUDPContentSniffing": true/'
 not_contains "$installer" '"RedisAddr": "127.0.0.1:6379"'
 contains "$installer" 'migrate_legacy_agent_redis_placeholder'
 
 rollback_geodata_line=$(grep -nF 'if ! install_runtime_geodata /usr/local/znode; then' "$manager" | head -n 1 | cut -d: -f1)
 rollback_start_line=$(grep -nF '    start_znode_service || true' "$manager" | head -n 1 | cut -d: -f1)
 [[ "$rollback_geodata_line" -lt "$rollback_start_line" ]] || fail 'rollback geodata must be activated before service start'
+
+# GitHub 5xx: release files fall back to a mirror after GitHub retries; the
+# checksum file never does. Both scripts carry the same helper.
+for script in "$installer" "$manager"; do
+    eval "$(extract_function_before "$script" fetch_release_file download_verified_script_asset)"
+    mkdir -p "$test_directory/mirror-bin"
+    cat > "$test_directory/mirror-bin/curl" <<'MIRROR_CURL'
+#!/usr/bin/env bash
+output=""
+url=""
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -o) output="$2"; shift 2 ;;
+    https://*) url="$1"; shift ;;
+    *) shift ;;
+  esac
+done
+printf '%s\n' "$url" >> "$MIRROR_CURL_LOG"
+case "$url" in
+  https://github.com/*) echo 'curl: (22) The requested URL returned error: 500' >&2; exit 22 ;;
+esac
+if [[ -n "$output" ]]; then printf 'payload\n' > "$output"; else printf 'payload\n'; fi
+MIRROR_CURL
+    chmod 0755 "$test_directory/mirror-bin/curl"
+    export MIRROR_CURL_LOG="$test_directory/mirror-urls"
+    asset='https://github.com/example/znode/releases/download/v9.9/znode-linux-64.zip'
+
+    : > "$MIRROR_CURL_LOG"
+    ZNODE_RELEASE_MIRRORS='https://mirror-a.example/ https://mirror-b.example/' \
+        PATH="$test_directory/mirror-bin:$PATH" \
+        fetch_release_file "$asset" "$test_directory/fetched" 2>/dev/null \
+        || fail "$(basename "$script") did not fall back to a mirror after GitHub 5xx"
+    [[ "$(sed -n '1p' "$MIRROR_CURL_LOG")" == "$asset" ]] \
+        || fail "$(basename "$script") did not try GitHub first"
+    [[ "$(sed -n '2p' "$MIRROR_CURL_LOG")" == "https://mirror-a.example/$asset" ]] \
+        || fail "$(basename "$script") did not use the first mirror next"
+    [[ "$(wc -l < "$MIRROR_CURL_LOG" | tr -d '[:space:]')" == 2 ]] \
+        || fail "$(basename "$script") kept downloading after a mirror succeeded"
+
+    : > "$MIRROR_CURL_LOG"
+    if ZNODE_RELEASE_MIRRORS='https://mirror-a.example/' \
+        PATH="$test_directory/mirror-bin:$PATH" \
+        fetch_release_file "$asset.dgst" "$test_directory/fetched.dgst" direct 2>/dev/null; then
+        fail "$(basename "$script") fetched a checksum through a mirror"
+    fi
+    grep -q 'mirror-a' "$MIRROR_CURL_LOG" && fail "$(basename "$script") sent a checksum request to a mirror"
+    [[ ! -e "$test_directory/fetched.dgst" ]] || fail "$(basename "$script") left a failed download behind"
+done
+contains "$installer" 'fetch_release_file "$checksum_url" "${archive}.dgst" direct'
+contains "$installer" 'fetch_release_file "$asset_url" "$archive" mirrors'
 
 echo 'security_scripts_test: ok'
