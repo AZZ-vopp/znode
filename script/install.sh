@@ -368,7 +368,6 @@ migrate_legacy_connection_profile() {
         -e 's/"ConnIdle"[[:space:]]*:[[:space:]]*(30|120)[[:space:]]*,/"ConnIdle": 300,/' \
         -e 's/"BufferSize"[[:space:]]*:[[:space:]]*16[[:space:]]*,/"BufferSize": 128,/' \
 		-e 's/"BufferSize"[[:space:]]*:[[:space:]]*64[[:space:]]*,/"BufferSize": 128,/' \
-		-e 's/"DisableUDPContentSniffing"[[:space:]]*:[[:space:]]*false/"DisableUDPContentSniffing": true/' \
         "$config_file" > "$temporary"; then
         rm -f "$temporary"
         return 1
@@ -1017,8 +1016,7 @@ generate_znode_agent_config() {
         "ConnIdle": 300,
         "UplinkOnly": 2,
         "DownlinkOnly": 4,
-        "BufferSize": 128,
-        "DisableUDPContentSniffing": true
+        "BufferSize": 128
     },
     "Agent": {
         "Enable": true,
