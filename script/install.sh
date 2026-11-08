@@ -1235,28 +1235,37 @@ latest_release_version() {
 # fetch_release_file URL DEST [mirrors|direct] [progress label]
 # GitHub release downloads can fail with HTTP 5xx for minutes from some
 # networks (an AWS Lightsail VPS got HTTP 500 four times in a row on
-# 2026-10-27). GitHub is retried for up to three minutes with a fixed delay,
-# then each mirror is tried. Mirrors only carry bytes: every caller checks the
-# file against a SHA-256 published by GitHub itself, so a mirror cannot change
-# what runs. "direct" never uses a mirror (for the checksum file itself).
+# 2026-10-27), and github.com's release download links themselves returned
+# HTTP 504 for every repository on 2026-11-08 while GitHub's API still served
+# the same files. GitHub is retried for a minute, then the file is fetched
+# through GitHub's API, then each mirror is tried. Mirrors only carry bytes:
+# every caller checks the file against a SHA-256 published by GitHub itself,
+# so a mirror cannot change what runs. "direct" never uses a mirror (for the
+# checksum file itself); the API route is GitHub, so it is used in both modes.
 fetch_release_file() {
     local url="$1"
     local destination="$2"
     local mode="${3:-mirrors}"
     local label="${4:-}"
     local mirrors="" source attempt_url
-    local -a retry
+    local -a retry headers
     if [[ "$mode" == mirrors ]]; then
         mirrors="${ZNODE_RELEASE_MIRRORS-https://gh-proxy.com/ https://ghfast.top/}"
     fi
-    for source in direct $mirrors; do
+    for source in direct api $mirrors; do
+        headers=()
         if [[ "$source" == direct && "$mode" == direct ]]; then
             # Small file with an API fallback in the caller: fail fast.
             attempt_url="$url"
             retry=(--retry 3 --retry-delay 5 --retry-max-time 30)
         elif [[ "$source" == direct ]]; then
             attempt_url="$url"
-            retry=(--retry 8 --retry-delay 15 --retry-max-time 180)
+            retry=(--retry 4 --retry-delay 10 --retry-max-time 60)
+        elif [[ "$source" == api ]]; then
+            attempt_url=$(github_api_asset_url "$url") || continue
+            headers=(-H 'Accept: application/octet-stream')
+            retry=(--retry 3 --retry-delay 5 --retry-max-time 60)
+            echo -e "${yellow:-}Link tải GitHub lỗi, thử tải qua GitHub API...${plain:-}" >&2
         else
             case "$source" in
                 https://*/) ;;
@@ -1268,17 +1277,49 @@ fetch_release_file() {
         fi
         if [[ -n "$label" ]] && command -v pv >/dev/null 2>&1; then
             if curl --fail --location --silent --show-error --connect-timeout 15 \
-                --proto '=https' --tlsv1.2 "${retry[@]}" "$attempt_url" \
+                --proto '=https' --tlsv1.2 "${retry[@]}" ${headers[@]+"${headers[@]}"} "$attempt_url" \
                 | pv -s 30M -W -N "$label" > "$destination"; then
                 return 0
             fi
         elif curl --fail --location --silent --show-error --connect-timeout 15 \
-            --proto '=https' --tlsv1.2 "${retry[@]}" "$attempt_url" -o "$destination"; then
+            --proto '=https' --tlsv1.2 "${retry[@]}" ${headers[@]+"${headers[@]}"} "$attempt_url" -o "$destination"; then
             return 0
         fi
     done
     rm -f "$destination"
     return 1
+}
+
+# github_api_asset_url URL prints the GitHub API download address of the
+# release asset a github.com release link names, or fails. Only GitHub's own
+# API is asked, and only an asset address on api.github.com is printed.
+github_api_asset_url() {
+    local url="$1" repository="" name="" endpoint metadata asset_url
+    if [[ "$url" =~ ^https://github\.com/([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)/releases/download/([A-Za-z0-9_.+-]+)/([A-Za-z0-9_.+-]+)$ ]]; then
+        repository="${BASH_REMATCH[1]}"
+        name="${BASH_REMATCH[3]}"
+        endpoint="https://api.github.com/repos/${repository}/releases/tags/${BASH_REMATCH[2]}"
+    elif [[ "$url" =~ ^https://github\.com/([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)/releases/latest/download/([A-Za-z0-9_.+-]+)$ ]]; then
+        repository="${BASH_REMATCH[1]}"
+        name="${BASH_REMATCH[2]}"
+        endpoint="https://api.github.com/repos/${repository}/releases/latest"
+    else
+        return 1
+    fi
+    metadata=$(curl --fail --location --silent --show-error --retry 2 --connect-timeout 15 \
+        --proto '=https' --tlsv1.2 "$endpoint") || return 1
+    # Each asset object lists its API "url" just before its "name".
+    asset_url=$(printf '%s\n' "$metadata" | awk -v asset="$name" '
+        /"url": "https:\/\/api\.github\.com\/repos\/[^"]*\/releases\/assets\/[0-9]+"/ {
+            last=$0
+            sub(/^.*"url": "/, "", last)
+            sub(/".*$/, "", last)
+        }
+        /"name":/ && index($0, "\"name\": \"" asset "\"") > 0 && last != "" { print last; exit }
+    ')
+    [[ "$asset_url" == "https://api.github.com/repos/${repository}/releases/assets/"* ]] || return 1
+    [[ "${asset_url##*/}" =~ ^[0-9]+$ ]] || return 1
+    printf '%s\n' "$asset_url"
 }
 
 download_verified_script_asset() {

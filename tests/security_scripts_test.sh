@@ -447,6 +447,13 @@ done
 printf '%s\n' "$url" >> "$MIRROR_CURL_LOG"
 case "$url" in
   https://github.com/*) echo 'curl: (22) The requested URL returned error: 500' >&2; exit 22 ;;
+  https://api.github.com/repos/example/znode/releases/tags/*)
+    printf '%s\n' '{' '  "url": "https://api.github.com/repos/example/znode/releases/1",' '  "assets": [' \
+      '    {' '      "url": "https://api.github.com/repos/example/znode/releases/assets/41",' '      "name": "znode-linux-64.zip.dgst",' '    },' \
+      '    {' '      "url": "https://api.github.com/repos/example/znode/releases/assets/42",' '      "name": "znode-linux-64.zip",' '    }' '  ]' '}'
+    exit 0 ;;
+  https://api.github.com/repos/example/znode/releases/assets/*)
+    if [[ "${MIRROR_API_OK:-0}" != 1 ]]; then echo 'curl: (22) The requested URL returned error: 504' >&2; exit 22; fi ;;
 esac
 if [[ -n "$output" ]]; then printf 'payload\n' > "$output"; else printf 'payload\n'; fi
 MIRROR_CURL
@@ -461,10 +468,26 @@ MIRROR_CURL
         || fail "$(basename "$script") did not fall back to a mirror after GitHub 5xx"
     [[ "$(sed -n '1p' "$MIRROR_CURL_LOG")" == "$asset" ]] \
         || fail "$(basename "$script") did not try GitHub first"
-    [[ "$(sed -n '2p' "$MIRROR_CURL_LOG")" == "https://mirror-a.example/$asset" ]] \
-        || fail "$(basename "$script") did not use the first mirror next"
-    [[ "$(wc -l < "$MIRROR_CURL_LOG" | tr -d '[:space:]')" == 2 ]] \
+    [[ "$(sed -n '2p' "$MIRROR_CURL_LOG")" == 'https://api.github.com/repos/example/znode/releases/tags/v9.9' ]] \
+        || fail "$(basename "$script") did not look the asset up in GitHub's API next"
+    [[ "$(sed -n '3p' "$MIRROR_CURL_LOG")" == 'https://api.github.com/repos/example/znode/releases/assets/42' ]] \
+        || fail "$(basename "$script") did not download the matching asset through GitHub's API"
+    [[ "$(sed -n '4p' "$MIRROR_CURL_LOG")" == "https://mirror-a.example/$asset" ]] \
+        || fail "$(basename "$script") did not use the first mirror after GitHub's API"
+    [[ "$(wc -l < "$MIRROR_CURL_LOG" | tr -d '[:space:]')" == 4 ]] \
         || fail "$(basename "$script") kept downloading after a mirror succeeded"
+
+    # GitHub's API serves the file while its release links fail: no mirror.
+    : > "$MIRROR_CURL_LOG"
+    MIRROR_API_OK=1 ZNODE_RELEASE_MIRRORS='https://mirror-a.example/' \
+        PATH="$test_directory/mirror-bin:$PATH" \
+        fetch_release_file "$asset" "$test_directory/fetched-api" 2>/dev/null \
+        || fail "$(basename "$script") did not fall back to GitHub's API"
+    grep -q 'mirror-a' "$MIRROR_CURL_LOG" && fail "$(basename "$script") used a mirror although GitHub's API answered"
+    MIRROR_API_OK=1 PATH="$test_directory/mirror-bin:$PATH" \
+        fetch_release_file "$asset.dgst" "$test_directory/fetched-api.dgst" direct 2>/dev/null \
+        || fail "$(basename "$script") did not fetch a checksum through GitHub's API"
+    grep -q 'releases/assets/41' "$MIRROR_CURL_LOG" || fail "$(basename "$script") fetched the wrong asset for the checksum"
 
     : > "$MIRROR_CURL_LOG"
     if ZNODE_RELEASE_MIRRORS='https://mirror-a.example/' \
