@@ -893,7 +893,7 @@ generate_znode_agent_config() {
     "ConnectionConfig": {
         "Handshake": 15,
         "ConnIdle": 300,
-        "UplinkOnly": 2,
+        "UplinkOnly": 1,
         "DownlinkOnly": 4,
         "BufferSize": 128
     },
