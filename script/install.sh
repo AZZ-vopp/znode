@@ -890,13 +890,6 @@ generate_znode_agent_config() {
         "Output": "",
         "Access": "none"
     },
-    "ConnectionConfig": {
-        "Handshake": 15,
-        "ConnIdle": 300,
-        "UplinkOnly": 1,
-        "DownlinkOnly": 4,
-        "BufferSize": 128
-    },
     "Agent": {
         "Enable": true,
         "ApiHost": "${api_host}",
